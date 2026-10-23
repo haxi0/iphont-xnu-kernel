@@ -21,7 +21,7 @@ be found out by trying. The second framebuffer at `0x9ca00000`, inside the firmw
   the panel's TE, and PINGPONG_0's done interrupt (MDP INTR bit 8, MDSS SPI 83) frees the other buffer.
   `fb_push=1` keeps one buffer and waits for each transfer before the next copy. `fb_push=0` gives back the
   firmware's autorefresh. On return to the loader, and on a panic, the boot framebuffer and autorefresh come
-  back (`redwood_display_quiesce`).
+  back (`hk_display_quiesce`).
 - **90 Hz.** The panel's own switch, as Android's device tree has it for `timing@1` of the ANA6705: 9 DCS long
   writes through DSI0's command DMA, at the same DSI clock. The packets sit past the last pixel of the boot
   framebuffer, in memory the display SMMU already maps. `fb_hz=60` switches the panel back, since it keeps its
@@ -56,6 +56,16 @@ be found out by trying. The second framebuffer at `0x9ca00000`, inside the firmw
   for the GPU went from 0.48 / 2.49 ms to 0.35 / 0.42 ms (median / p95), SwapEnd → panel RAM p95 to 17.8 ms, and
   1.3% of swaps came a refresh late. A GPU hang resets the 3D core's half and goes on (`gpu_recover`, now the
   default here: 3 hangs of 3 recovered in `rc.jobs.metalrecover`, logs `185937`, `190442`, `191115`).
+- **The GPU's speed follows its load** (`gpu_dcvs=1`, the default here; `gpu_dcvs=0`: 525 MHz throughout). Every
+  50 ms the core's own busy time decides: above 50% straight to 525 MHz, and one level down (400, 305) only after
+  four periods in a row under 25% -- only the three levels the GMU was given at its start, at the supply levels the
+  phone's device tree names for them; a change is one HFI message, 120-143 us. From `gpu_hot` (85.0 C by default;
+  the phone's own GPU trip is 95 C) it is held at 305 MHz, by the GPU's own sensors as the thermal service reads
+  them (`board_thermal_gpuss_0/1`, which the loader passes: SM8250 has them at tsens0 15 and tsens1 8). The
+  scripted gestures of `rc.jobs.fps`, each mode run first and second in a session (logs `213413`/`213951`,
+  `214949`/`215528`): at the same place in a session the gestures' frame rates and late frames are the same either
+  way (the first run of a session is the slower one, in both modes); with it the GPU spent 75-83% of the time at
+  305 MHz, its sensors read some 4-5 C less, and the presenter's median wait for the GPU went from 0.37 to 0.47 ms.
 - **The copy**, where there still is one, is shared out in 48-row pieces taken in turn, not fixed thirds. A
   copying thread on a small core, or one preempted, no longer holds up the frame.
 - **Touch.** S6SY761 reports arrive by the TLMM summary interrupt (`touch_irq=0`: 10 ms polling). The worker
@@ -98,7 +108,7 @@ python3 tools/pipeline-latency.py logs/HHMMSS-run.log logs/HHMMSS-run.log.live.*
 
 `gpu=1` works from a cold start (logs `180011`, `180356`). It used to send the phone to CrashDump mode there: this
 TrustZone crashes when asked to give up the zap shader (image 13) before it has been handed that image's header in
-this boot, and step 19 asked exactly that first. The header now goes first (`step_zap_load`, `redwood_adreno.c`).
+this boot, and step 19 asked exactly that first. The header now goes first (`step_zap_load`, `hk_adreno.c`).
 
 Host checks: `CC=clang python3 tools/instantnoodle-input-test.py`, `python3 tools/pipeline-latency.py --self-test`.
 

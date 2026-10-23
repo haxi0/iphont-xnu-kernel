@@ -545,6 +545,8 @@ struct platform {
 	const char *store;
 	efi_guid store_type, store_uniq;
 	uint64_t store_first, store_last;
+	/* board_ arguments for this device's kernel (bsd/sys/hk_board.h): where its SoC differs from redwood's */
+	const char *board_args;
 };
 
 static const struct platform platform_qemu_virt = {
@@ -594,6 +596,8 @@ static const struct platform platform_instantnoodle = {
 	 */
 	.store = "userdata", .store_type = INSTANTNOODLE_USERDATA_TYPE, .store_uniq = INSTANTNOODLE_USERDATA_UNIQ,
 	.store_first = 4133800, .store_last = 30513146,
+	/* SM8250's GPU sensors, by its thermal-zones: gpuss-0 sensor 15 of tsens0, gpuss-1 sensor 8 of tsens1 */
+	.board_args = "board_thermal_gpuss_0=0xf board_thermal_gpuss_1=0x108",
 };
 
 /*
@@ -3110,6 +3114,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * userdata) tells the kernel's UFS driver which one, and where (bsd/dev/hk_ufs.c); darwin itself is the
 	 * kernel's default, or the installer's darwin_lba= (common/flash/install.sh).
 	 */
+	if (PLAT->board_args != NULL) {
+		for (const char *c = PLAT->board_args; *c && n < BOOT_LINE_LENGTH - 2; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		ba->commandLine[n++] = ' ';
+	}
 	if (PLAT->store != NULL && !str_eq(PLAT->store, "darwin")) {
 		char digits[2][24];
 		uint64_t value[2] = { PLAT->store_first, PLAT->store_last - PLAT->store_first + 1 };

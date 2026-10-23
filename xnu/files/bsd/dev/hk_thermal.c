@@ -61,6 +61,13 @@ extern void loader_log_putc(char c);
 static vm_offset_t tsens[2];
 static struct thermal_gov gov;
 static int16_t readings[THERMAL_ZONES];
+/*
+ * Where each zone's sensor is: the table's, unless board_thermal_<zone>=0xBSS says otherwise (B the TSENS
+ * block, SS the sensor; 0xffff: none), with '_' for the '-' of the zone's name. A phone whose SoC numbers its
+ * sensors otherwise passes them so (the OnePlus 8, SM8250: gpuss-0 is sensor 15 of block 0, gpuss-1 sensor 8
+ * of block 1 -- its device tree's thermal-zones -- where the POCO X5 Pro has them at 1 and 2 of block 1).
+ */
+static uint16_t zone_where[THERMAL_ZONES];
 static bool thermal_caps_on;                    /* cpufreq raised a group: there are caps to set */
 
 /* what the sysctls show, kept by the service's thread and read by anyone */
@@ -137,6 +144,26 @@ read_sensor(unsigned block, unsigned sensor)
 	return THERMAL_INVALID;
 }
 
+static int16_t
+read_zone(int z)
+{
+	return zone_where[z] == 0xffff ? THERMAL_INVALID : read_sensor(zone_where[z] >> 8 & 1, zone_where[z] & 0xff);
+}
+
+/* The GPU's sensors at the last tick (the hotter of the gpuss zones), tenths of a degree; THERMAL_INVALID: none. */
+int
+hk_thermal_gpu_tenths(void)
+{
+	int hottest = THERMAL_INVALID;
+
+	for (int z = 0; thermal_running && z < THERMAL_ZONES; z++) {
+		if (strncmp(hk_thermal_zones[z].name, "gpuss-", 6) == 0 && readings[z] != THERMAL_INVALID && readings[z] > hottest) {
+			hottest = readings[z];
+		}
+	}
+	return hottest;
+}
+
 /* the table of kern.hackios.thermal, from this tick's readings and decisions */
 static void
 write_text(int battery)
@@ -188,7 +215,7 @@ thermal_thread(__unused void *arg, __unused wait_result_t wr)
 
 		battery = battery <= -273 ? -2730 : battery * 10;
 		for (int z = 0; z < THERMAL_ZONES; z++) {
-			readings[z] = read_sensor(hk_thermal_zones[z].block, hk_thermal_zones[z].sensor);
+			readings[z] = read_zone(z);
 		}
 		flags = thermal_gov_step(&gov, readings, battery);
 
@@ -244,7 +271,19 @@ hk_thermal_init(void)
 	tsens[1] = ml_io_map(TSENS1_TM, TSENS_TM_SIZE);
 	thermal_gov_init(&gov, top);
 	for (int z = 0; z < THERMAL_ZONES; z++) {
-		readings[z] = read_sensor(hk_thermal_zones[z].block, hk_thermal_zones[z].sensor);
+		char name[40] = "thermal_";
+		uint16_t table = (uint16_t)(hk_thermal_zones[z].block << 8 | hk_thermal_zones[z].sensor);
+
+		strlcat(name, hk_thermal_zones[z].name, sizeof(name));
+		for (char *c = name; *c != 0; c++) {
+			*c = *c == '-' ? '_' : *c;
+		}
+		zone_where[z] = (uint16_t)hk_board_number(name, table);
+		if (zone_where[z] != table) {
+			tell("thermal: %s is sensor %u of block %u here (board_%s)\n", hk_thermal_zones[z].name, zone_where[z] & 0xff,
+			    zone_where[z] >> 8, name);
+		}
+		readings[z] = read_zone(z);
 	}
 	/* one reading of the prime core's sensor to the log: whether TSENS answers at all is the first thing to know */
 	tell("thermal: %d sensors; the prime core reads %s C; caps %s; every %d ms\n", THERMAL_ZONES,
