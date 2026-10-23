@@ -5,4 +5,8 @@ set -e
 cd "$(dirname "$0")"
 clang --target=aarch64-linux-gnu -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static \
 	-fuse-ld=lld -O1 -Wall -Wl,-e,_start -o f2fs-resize f2fs-resize.c
-ls -la f2fs-resize
+for tool in fiemap mkpinned; do
+	clang --target=aarch64-linux-gnu -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static \
+		-fuse-ld=lld -O1 -Wall -Wl,-e,_start -o $tool $tool.c
+done
+ls -la f2fs-resize fiemap mkpinned

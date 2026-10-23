@@ -799,7 +799,7 @@ MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat)
 MiniIOSurface *
 MiniIOSurfaceCreateScanout(uint64_t phys, uint32_t width, uint32_t height, uint32_t bytesPerRow)
 {
-	/* (whole pages: the GPU maps it by the page, RedwoodGPU.cpp) */
+	/* (whole pages: the GPU maps it by the page, HKGPU.cpp) */
 	IOMemoryDescriptor * pixels = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) phys,
 	    round_page_64((uint64_t) bytesPerRow * height), kIODirectionInOut);
 	IOMemoryMap * map = pixels != NULL ? pixels->map(kIOMapWriteCombineCache) : NULL;
@@ -1052,7 +1052,7 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 		fRefCapacity = capacity;
 	}
 	if (surface->scanout != NULL) {
-		return NULL;            /* (a panel buffer: only the GPU of its owner draws into it, see RedwoodGPU.cpp) */
+		return NULL;            /* (a panel buffer: only the GPU of its owner draws into it, see HKGPU.cpp) */
 	}
 	map = surface->memory->createMappingInTask(fTask, 0, kIOMapAnywhere);
 	if (map == NULL) {

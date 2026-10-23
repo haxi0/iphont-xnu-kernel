@@ -44,21 +44,21 @@ extern void gic_v3_irq_cpu_shutdown(void);
 
 void loader_log_putc(char c);
 void loader_return(void);
-extern void redwood_adreno_quiesce(void);
-extern void redwood_adreno_stop(void);
-extern void redwood_adreno_minute(void);
-extern void redwood_wifi_stop(void);
-extern void redwood_wifi_quiesce(void);
-extern void redwood_adsp_stop(void);
-extern void redwood_adsp_quiesce(void);
-extern void redwood_ddr_quiesce(void);
-extern void redwood_haptic_quiesce(void);
-extern void redwood_torch_quiesce(void);
-extern void redwood_camera_quiesce(void);
-extern void redwood_mic_quiesce(void);
-extern void redwood_display_quiesce(void);
-extern void redwood_ufs_quiesce(void);
-extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
+extern void hk_adreno_quiesce(void);
+extern void hk_adreno_stop(void);
+extern void hk_adreno_minute(void);
+extern void hk_wifi_stop(void);
+extern void hk_wifi_quiesce(void);
+extern void hk_adsp_stop(void);
+extern void hk_adsp_quiesce(void);
+extern void hk_ddr_quiesce(void);
+extern void hk_haptic_quiesce(void);
+extern void hk_torch_quiesce(void);
+extern void hk_camera_quiesce(void);
+extern void hk_mic_quiesce(void);
+extern void hk_ufs_quiesce(void);
+extern void hk_var_save_on_return(void);   /* bsd/dev/hk_ufs.c: the data volume into the flash */
+extern void hk_display_quiesce(void);   /* iokit/Kernel/MiniIOMobileFramebuffer.cpp: the boot framebuffer again */
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -208,7 +208,7 @@ struct loader_live {
  * loader to hand to the host once the kernel is back. { physical address, bytes, kernel address }.
  */
 uint64_t loader_recording[3];
-/* ... and of the sound (/dev/redwood-audio makes one with boot-arg rec_sound). */
+/* ... and of the sound (/dev/hk-audio makes one with boot-arg rec_sound). */
 uint64_t loader_sound[3];
 /*
  * The frame the panel shows, for "oem screenshot" during a run: { physical address, bytes a row }; 0: the boot
@@ -378,16 +378,16 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
-	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
-	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
-	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
-	redwood_adsp_quiesce();         /* nor the audio DSP */
-	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
-	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
-	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
-	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
-	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
-	redwood_display_quiesce();      /* the panel refreshing from the boot framebuffer again, for the loader's text */
+	hk_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
+	hk_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	hk_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
+	hk_adsp_quiesce();         /* nor the audio DSP */
+	hk_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
+	hk_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+	hk_torch_quiesce();        /* the flashlight off, if it was lit */
+	hk_camera_quiesce();       /* the camera powered down, if it was powered up */
+	hk_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+	hk_display_quiesce();      /* the panel refreshing from the boot framebuffer again, for the loader's text */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that
@@ -446,10 +446,10 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	}
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
 	if (!as_panic) {
-		redwood_var_save_on_return();   /* the data volume kept, while the system is still whole */
-		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
-		redwood_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
-		redwood_adsp_stop();            /* and the audio DSP */
+		hk_var_save_on_return();   /* the data volume kept, while the system is still whole */
+		hk_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
+		hk_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
+		hk_adsp_stop();            /* and the audio DSP */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
@@ -492,10 +492,10 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}
-		redwood_var_save_on_return();
-		redwood_adreno_stop();
-		redwood_wifi_stop();
-		redwood_adsp_stop();
+		hk_var_save_on_return();
+		hk_adreno_stop();
+		hk_wifi_stop();
+		hk_adsp_stop();
 		loader_return();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
@@ -537,11 +537,11 @@ extern void MiniIOSurfaceUsage(uint32_t *count, uint64_t *bytes);
  * daemons, and once none is left and it is below the second, whatever is next in line -- the
  * window server included.
  */
-void redwood_memory_line(char *buf, size_t len);
+void hk_memory_line(char *buf, size_t len);
 
-/* The line itself (also kern.redwood_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
+/* The line itself (also kern.hk_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
 void
-redwood_memory_line(char *buf, size_t len)
+hk_memory_line(char *buf, size_t len)
 {
 #define MB(pages)       ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
 	uint32_t surfaces = 0;
@@ -564,9 +564,9 @@ memory_report(void)
 {
 	char line[256];
 
-	redwood_memory_line(line, sizeof(line));
+	hk_memory_line(line, sizeof(line));
 	printf("%s", line);
-	redwood_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
+	hk_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
 /* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */

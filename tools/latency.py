@@ -6,9 +6,9 @@ latency.py RUN.log [MORE.log ...] [RECORDING.raw]: how far behind the finger the
 A run with boot-arg touch_lat=1 writes a line at every stage a touch passes on its way to the panel,
 all in microseconds of mach_absolute_time (the kernel's clock, which user space reads too):
 
-  tl: p TYPE FINGER X Y at US              the kernel posts a sample (bsd/dev/redwood_input.c)
+  tl: p TYPE FINGER X Y at US              the kernel posts a sample (bsd/dev/hk_input.c)
   tl: c before US seen US read US          the touch driver finds the interrupt line low and reads the
-                                           report (bsd/dev/redwood_goodix.c; only for a real finger)
+                                           report (bsd/dev/hk_goodix.c; only for a real finger)
   tl: i TYPE posted US read US sent US     the window server reads it and hands it to the event system
                                            (userland/src/inject.c)
   tl: g FRAME began US ended US DRAWS      the window server draws a frame (userland/src/eagl.c)

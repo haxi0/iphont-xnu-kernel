@@ -4,8 +4,8 @@
 usage: sound.py RECORDING OUT.wav
 
 RECORDING is the piece of memory as the loader hands it over ("xl sound"; under QEMU, the
-monitor's pmemsave at the address in the kernel's line "redwood-audio: recording ... at 0x..."):
-a header { "RWSND001", rate, channels, blocks }, then for every write to /dev/redwood-audio the
+monitor's pmemsave at the address in the kernel's line "hk-audio: recording ... at 0x..."):
+a header { "RWSND001", rate, channels, blocks }, then for every write to /dev/hk-audio the
 time it was made (nanoseconds since the kernel started), the number of frames and the frames
 themselves, 16-bit samples. iOS writes only while something plays, so the recording holds no
 silence: here the blocks are put back where they were in time, with silence in between

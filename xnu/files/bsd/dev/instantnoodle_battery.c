@@ -1,6 +1,6 @@
 /*
  * The battery of the OnePlus 8 (instantnoodle, SM8250), for the power source iOS reads
- * (redwood_battery_report() in redwood_battery.c, then iokit/Kernel/RedwoodBattery.cpp).
+ * (hk_battery_report() in hk_battery.c, then iokit/Kernel/HKBattery.cpp).
  *
  * On redwood the numbers come from the audio DSP's battery manager. This phone has none: its
  * Android reads a TI fuel gauge of OnePlus's own choosing, "ti,bq27541-battery" at I2C address
@@ -27,7 +27,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/instantnoodle.h>
-#include <sys/redwood_input.h>
+#include <sys/hk_input.h>
 #include <sys/systm.h>
 
 
@@ -83,7 +83,7 @@ device_type(void)
 
 /* one reading; false when the gauge did not answer */
 static bool
-sample(struct redwood_battery_state *b, int *flags_out, uint8_t *charger_state)
+sample(struct hk_battery_state *b, int *flags_out, uint8_t *charger_state)
 {
 	int soc, mv, ma, temp_dk, flags = 0, rm = 0, fcc = 0, cycles = 0, design = 0;
 	uint8_t usbin = 0, chgr = 0xff;
@@ -113,12 +113,12 @@ sample(struct redwood_battery_state *b, int *flags_out, uint8_t *charger_state)
 	b->design_uah = design > 1000 && design < 10000 ? design * 1000 : 0;
 	b->cycles = cycles < 10000 ? cycles : 0;
 
-	if (redwood_spmi_read(PM8150B_USBIN, USBIN_RT_STS, &usbin, 1) == 0) {
+	if (hk_spmi_read(PM8150B_USBIN, USBIN_RT_STS, &usbin, 1) == 0) {
 		b->external = (usbin & USBIN_PLUGIN) != 0;
 	} else {
 		b->external = ma > 0;                   /* the charger cannot be asked: taking charge says it is there */
 	}
-	if (redwood_spmi_read(PM8150B_CHGR, CHGR_STATUS_1, &chgr, 1) == 0) {
+	if (hk_spmi_read(PM8150B_CHGR, CHGR_STATUS_1, &chgr, 1) == 0) {
 		chgr &= 7;
 	}
 	/* Linux POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
@@ -139,7 +139,7 @@ sample(struct redwood_battery_state *b, int *flags_out, uint8_t *charger_state)
 static void
 battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	struct redwood_battery_state b;
+	struct hk_battery_state b;
 	unsigned failed = 0;
 	int type, flags;
 	uint8_t chgr;
@@ -170,7 +170,7 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned tick = 0;; tick++) {
 		if (sample(&b, &flags, &chgr)) {
 			failed = 0;
-			redwood_battery_report(&b);
+			hk_battery_report(&b);
 			if (tick % 12 == 0) {
 				printf("battery: %d%%, %d mV, %d mA, %d.%02d C, %d/%d mAh (design %d), %d cycles, flags %#x; "
 				    "USB %s, charger state %u, status %d (%u bus errors)\n", b.percent_hundredths / 100,

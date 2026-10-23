@@ -1,6 +1,6 @@
 /*
  * The touch screen of the OnePlus 8 (instantnoodle, SM8250): a Samsung S6SY761 ("SY771") at
- * I2C address 0x48, as a source of touch records for /dev/redwood-touch (sys/redwood_input.h).
+ * I2C address 0x48, as a source of touch records for /dev/hk-touch (sys/hk_input.h).
  * On with boot-arg board=instantnoodle (xnuloader passes it); touchscreen=0 turns it off.
  *
  * Its bus is serial engine 13 (i2c@a94000, pins gpio36/gpio37 with external pull-ups); this
@@ -27,7 +27,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/instantnoodle.h>
-#include <sys/redwood_input.h>
+#include <sys/hk_input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -78,7 +78,7 @@ extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge,
 extern void gic_v3_spi_mask(uint32_t intid);
 extern void gic_v3_spi_unmask(uint32_t intid);
 extern void gic_v3_spi_detach(uint32_t intid);
-extern void redwood_tl(const char *format, ...) __printflike(1, 2);
+extern void hk_tl(const char *format, ...) __printflike(1, 2);
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
     thread_t *new_thread);              /* (osfmk/kern/thread.h, private to osfmk's headers) */
 
@@ -136,7 +136,7 @@ ts_read(uint8_t reg, uint8_t *buf, unsigned n)
 	return instantnoodle_i2c_read(&bus, TS_ADDR, reg, buf, n);
 }
 
-/* ---- the supplies (RPMh), as bsd/dev/redwood_goodix.c --------------------------------------------- */
+/* ---- the supplies (RPMh), as bsd/dev/hk_goodix.c --------------------------------------------- */
 
 #define CMD_DB_PHYS             0x80860000UL
 #define CMD_DB_SIZE             0x20000UL
@@ -346,7 +346,7 @@ handle_event(const uint8_t *ev)
 	case 2:                                         /* move */
 		finger[id].x = scale(x, PANEL_W);
 		finger[id].y = scale(y, PANEL_H);
-		redwood_touch_post(finger[id].down ? REDWOOD_TOUCH_MOVE : REDWOOD_TOUCH_DOWN, id, finger[id].x, finger[id].y);
+		hk_touch_post(finger[id].down ? HK_TOUCH_MOVE : HK_TOUCH_DOWN, id, finger[id].x, finger[id].y);
 		if (!finger[id].down) {
 			printf("touch: finger %u down at %u,%u\n", id, x, y);
 		}
@@ -356,7 +356,7 @@ handle_event(const uint8_t *ev)
 	case 3:                                         /* release */
 		if (finger[id].down) {
 			finger[id].down = false;
-			redwood_touch_post(REDWOOD_TOUCH_UP, id, finger[id].x, finger[id].y);
+			hk_touch_post(HK_TOUCH_UP, id, finger[id].x, finger[id].y);
 			events++;
 		}
 		break;
@@ -401,7 +401,7 @@ release_all(void)
 	for (unsigned i = 0; i < MAX_FINGERS; i++) {
 		if (finger[i].down) {
 			finger[i].down = false;
-			redwood_touch_post(REDWOOD_TOUCH_UP, i, finger[i].x, finger[i].y);
+			hk_touch_post(HK_TOUCH_UP, i, finger[i].x, finger[i].y);
 		}
 	}
 }
@@ -481,10 +481,10 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 		err = poll_events();
 		done = mach_absolute_time();
 		if (trace_latency && (events != before || err)) {
-			redwood_tl("tl: t irq %llu worker %llu done %llu events %u error %d\n",
+			hk_tl("tl: t irq %llu worker %llu done %llu events %u error %d\n",
 			    use_irq ? micros(detected) : 0, micros(began), micros(done), events - before, err);
 			if (!use_irq) {
-				redwood_tl("tl: c before %llu seen %llu read %llu\n", micros(previous), micros(began), micros(done));
+				hk_tl("tl: c before %llu seen %llu read %llu\n", micros(previous), micros(began), micros(done));
 			}
 		}
 		previous = began;

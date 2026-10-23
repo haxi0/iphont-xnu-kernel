@@ -164,7 +164,7 @@ stage2() {
 		return 0
 	fi
 	log "exporting the kernel's headers (xnu-build.sh exporthdrs)"
-	"$DARWIN_REDWOOD/xnu-build.sh" -j$JOBS exporthdrs > exporthdrs.log 2>&1 && [ -d "$hdrs/osfmk" ] ||
+	"$HACKIOS_ROOT/xnu-build.sh" -j$JOBS exporthdrs > exporthdrs.log 2>&1 && [ -d "$hdrs/osfmk" ] ||
 		die "the kernel headers were not exported, see xnu-deps/exporthdrs.log"
 	if [ ! -f $lib/libfirehose_kernel.a ]; then
 		log "building libfirehose_kernel.a"

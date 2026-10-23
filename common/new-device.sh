@@ -15,7 +15,7 @@ CODE=$1; DTB=$2
 CONF=common/devices/$CODE.conf PLATC=common/devices/$CODE.platform.c
 [ -e "$CONF" ] && die "$CONF exists already"
 
-sed -e "s/^NAME=.*/NAME=\"TODO vendor model ($CODE)\"/" -e "s/^UEFI_TARGET=.*/UEFI_TARGET=$CODE/" \
+sed -e "s/^CODENAMES=\"codename\"/CODENAMES=\"$CODE\"/" -e "s/^NAME=.*/NAME=\"TODO vendor model ($CODE)\"/" -e "s/^UEFI_TARGET=.*/UEFI_TARGET=$CODE/" \
 	common/devices/_template.conf > "$CONF"
 [ -n "$DTB" ] && sed -i "s|^DTB=.*|DTB=$(readlink -f "$DTB")|" "$CONF"
 
@@ -48,6 +48,10 @@ print(gic[0], gic[1], len(cpus) or 8, shift, hex(small))
 PY
 )
 	echo "new-device: from $DTB: GIC $GIC_DIST / $GIC_REDIST, $CORES cores, MPIDR shift $SHIFT, small cores $SMALL"
+	# where the SoC's blocks are, for the kernel's drivers (bsd/sys/hk_board.h)
+	BOARD=$(python3 tools/board-from-dt.py "$DTB")
+	sed -i "s|^BOARD_ARGS=.*|BOARD_ARGS=\"$BOARD\"|" "$CONF"
+	echo "new-device: the SoC's blocks: ${BOARD:-none found, the kernel keeps the defaults of the POCO X5 Pro}"
 fi
 
 cat > "$PLATC" <<EOF

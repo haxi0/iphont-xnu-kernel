@@ -16,7 +16,7 @@ cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/hackios-phone
 out=${1:-logs/buttons-$(date +%H%M%S)}
 mkdir -p "$out"
-pattern='^buttons: |\[Button\] [A-Za-z]+ page|^\$ /redwood/bin/rwtouch .*button |Set Blanked'
+pattern='^buttons: |\[Button\] [A-Za-z]+ page|^\$ /hackios/bin/rwtouch .*button |Set Blanked'
 press='PRESSED|rwtouch .*button '
 shots=0 started= again=0 last=
 running() { ! flock -n "$PHONE.run" true 2>/dev/null; }

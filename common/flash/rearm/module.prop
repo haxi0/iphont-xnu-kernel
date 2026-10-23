@@ -1,0 +1,6 @@
+id=hackios-rearm
+name=HackiOS boot menu
+version=1
+versionCode=1
+author=OOSEX GANG
+description=After Android has started, makes the HackiOS slot active again, so that every power-on shows the HackiOS boot menu (HackiOS / Android). Disable this module to start Android directly.

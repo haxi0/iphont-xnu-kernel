@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared by common/*.sh: find the workspace and load a device profile.
 #   . "$(dirname "$(readlink -f "$0")")/lib.sh"; load_device "$1"
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)

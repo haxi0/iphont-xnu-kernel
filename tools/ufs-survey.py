@@ -11,7 +11,7 @@ of in the ROM's firmware-update/ it prints an FNV-1a hash of exactly as many byt
 has. This computes the same hash from the images and says, partition by partition, whether the
 two agree: where they do, reading through that driver gives the bytes that are on the flash.
 With ufs=2 ufs_check=1 the kernel then reads the same partitions through the loader's page
-(bsd/dev/redwood_ufs.c) and prints the same hashes: those are shown as kernel:NAME.
+(bsd/dev/hk_ufs.c) and prints the same hashes: those are shown as kernel:NAME.
 Nothing is read from the phone here; it only reads the log.
 """
 import re

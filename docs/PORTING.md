@@ -54,18 +54,18 @@ the processor's copy; a command-mode panel's can be pushed once per frame instea
 `fb_probe=1` shows how the firmware left the pipeline, [instantnoodle latency](instantnoodle-latency.md) the rest.)
 What is redwood-specific and needs looking at:
 
-- **touch**: `bsd/dev/redwood_goodix.c` (Goodix GT9916 over bit-banged SPI) — another panel needs its own driver
-  feeding `/dev/redwood-touch` (`bsd/dev/redwood_input.c`); the OnePlus 8's `instantnoodle_touch.c` is one, on the
+- **touch**: `bsd/dev/hk_goodix.c` (Goodix GT9916 over bit-banged SPI) — another panel needs its own driver
+  feeding `/dev/hk-touch` (`bsd/dev/hk_input.c`); the OnePlus 8's `instantnoodle_touch.c` is one, on the
   bit-banged I2C of `instantnoodle_i2c.c`, which its fuel gauge (`instantnoodle_battery.c`) shares. Gate a new
   phone's drivers on a `board=` boot-arg the loader passes, so redwood's keep running unchanged;
-- **buttons, CPU frequency, watchdog**: GPIO/PMIC numbers and the EPSS block in `redwood_input.c`,
-  `redwood_cpufreq.c`, `osfmk/arm64/loader_return.c`;
-- **flash LED, vibration motor**: `redwood_torch.c` and `redwood_haptic.c` take a table per board (PMIC block,
+- **buttons, CPU frequency, watchdog**: GPIO/PMIC numbers and the EPSS block in `hk_input.c`,
+  `hk_cpufreq.c`, `osfmk/arm64/loader_return.c`;
+- **flash LED, vibration motor**: `hk_torch.c` and `hk_haptic.c` take a table per board (PMIC block,
   pins, chip); the OnePlus 8's PM8150L and AW8697 are the second entries;
-- **GPU / Wi-Fi / sound**: `redwood_adreno.c` (Adreno 642L, and the Adreno 650 as its `kona` variant: the clock
+- **GPU / Wi-Fi / sound**: `hk_adreno.c` (Adreno 642L, and the Adreno 650 as its `kona` variant: the clock
   controller's debug selectors, the SMMU stream the hypervisor accepts, and which CP registers exist differ by
-  chip; the log names the bring-up step that stopped), `redwood_wifi.c` (WCN6750 + ath11k),
-  `redwood_audio.c` — the same Qualcomm subsystems (SMEM, SMP2P, GLINK, QRTR, QMI) are reused, the addresses and
+  chip; the log names the bring-up step that stopped), `hk_wifi.c` (WCN6750 + ath11k),
+  `hk_audio.c` — the same Qualcomm subsystems (SMEM, SMP2P, GLINK, QRTR, QMI) are reused, the addresses and
   firmware differ. The OnePlus 8's Wi-Fi (QCA6390) is on PCIe, which nothing here drives yet.
 
 Start with no extras: the system boots to the lock screen with only the framebuffer, touch and the CPU.
@@ -85,3 +85,12 @@ common/run.sh <codename>
 
 The first useful milestone is the loader's own screen and log over USB (`./xl log`), the next one is the kernel's
 verbose boot text (`-v`), then SpringBoard. Read [checks.md](checks.md) before trusting a "it is not in the log".
+
+## The SoC's blocks: BOARD_ARGS
+
+The kernel's drivers were brought up on the POCO X5 Pro (SM7325), and every block they map -- the CPU frequency
+domains, the temperature sensors, the clock controllers, the display's timing engine, the UFS controller, the
+PMIC arbiter -- defaults to that phone's address. Another phone gives its own on the kernel's command line,
+`board_<block>=0x...` (bsd/sys/hk_board.h lists them). `common/new-device.sh <codename> <dtb>` reads them out
+of the phone's device tree (`tools/board-from-dt.py`) into the profile's `BOARD_ARGS`, which `common/run.sh` and
+`common/flash/install.sh` pass on. On redwood's own device tree the tool reads back exactly the defaults.

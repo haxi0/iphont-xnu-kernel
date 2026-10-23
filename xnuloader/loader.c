@@ -513,11 +513,14 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
-/* The port's partitions (struct platform, store): redwood's darwin, its first and last LBA of unit 0 as the GPT has them */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
+/*
+ * The port's partitions (struct platform, store). darwin: its first and last LBA of unit 0 as the GPT has them, and its
+ * unique GUID: this phone's, from its identity file (phones/<serial>.darwin, made when its darwin was cut:
+ * common/flash/darwinid.py), which xnuloader/build.sh turns into darwin_identity.h (DARWIN_ID=file); without one,
+ * the phone the port was brought up on.
+ */
+#include "darwin_identity.h"
 #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
 /* the OnePlus 8's userdata (sda23, LBA 4133800..30513146), as its GPT has it (sgdisk --info=23 /dev/block/sda) */
 #define INSTANTNOODLE_USERDATA_TYPE  { 0x1b81e7e6, 0xf50d, 0x419b, { 0xa7, 0x39, 0x2a, 0xee, 0xf8, 0xda, 0x33, 0x35 } }
 #define INSTANTNOODLE_USERDATA_UNIQ  { 0x3c8da6a4, 0x5a87, 0x56fb, { 0xc3, 0xf5, 0x7b, 0xf3, 0x73, 0xf8, 0xfd, 0x8f } }
@@ -1500,13 +1503,13 @@ ufs_survey(void)
  * resident, and this loader already serves the kernel from core 0 while the kernel runs on another
  * (the battery). So the kernel asks for blocks through a page both can see, and core 0 reads them
  * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
- * bsd/dev/redwood_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
+ * bsd/dev/hk_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
  * Reads, and -- with ufs_write=1 on the command line -- writes into one partition and nowhere
  * else: the port's own darwin, proved by its GPT entry (name, both GUIDs, first and last LBA, its
  * logical unit), and in it only past everything the build writes from the computer, so that no
  * answer to the kernel can reach Android's partitions, the iOS volume or the cryptexes. The
- * refusals are here, in the kernel (bsd/dev/redwood_ufs.c) and in UEFI's own driver, which gives
+ * refusals are here, in the kernel (bsd/dev/hk_ufs.c) and in UEFI's own driver, which gives
  * out a partition's BlockIo and bounds it: a request has to pass all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
@@ -1521,6 +1524,7 @@ ufs_survey(void)
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
+#define BLOCK_PART_VIRTUAL 2u                          /* darwin as a file of userdata (darwinfile.c): on no unit of its own */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
 
@@ -1533,6 +1537,7 @@ ufs_survey(void)
  * same partition, named the same, of the same size, in the same place, on logical unit 0.
  */
 #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
+/* (darwin's identity: darwin_identity.h, above with struct platform) */
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1851,6 +1856,8 @@ hc_init(void)
  * The firmware's configuration tables, by GUID (an ACPI or device tree table among them would say
  * where the storage controller is).
  */
+#include "darwinfile.c"
+
 static void
 block_tables(void)
 {
@@ -1992,6 +1999,32 @@ block_start(void)
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && PLAT->store != NULL && same_name(bp->name, PLAT->store)) {
 			block_io2_probe(handles[i], bio);
+		}
+	}
+	/* darwin as a file of userdata: a partition of its own blocks, on no unit (the kernel reads it through here) */
+	if (darwin_file_bio() != NULL && block_shared.parts + nunits < BLOCK_MAX_PARTS) {
+		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
+		static const char darwin_name[] = "darwin";
+
+		memcpy(bp->name, darwin_name, sizeof(darwin_name));
+		bp->block_size = 4096;
+		bp->blocks = DARWIN_FILE_BLOCKS;
+		bp->start_lba = 0;
+		bp->unit = 0xffff;
+		bp->lun = 0xff;
+		bp->flags = BLOCK_PART_VIRTUAL;
+		if (block_write_requested) {
+			block_write_part = (int)block_shared.parts;
+			print("ufs: darwin (a file of %s): its blocks from %d on may be written this run\n", DARWIN_FILE_HOST,
+			    BLOCK_WRITE_FIRST);
+		}
+		block_bios[block_shared.parts++] = darwin_file_bio();
+		/* the kernel's copy of the map: the host is userdata's entry in this table */
+		for (uint32_t k = 0; k < block_shared.parts; k++) {
+			if (str_eq(block_shared.part[k].name, DARWIN_FILE_HOST) && !(block_shared.part[k].flags & BLOCK_PART_UNIT)) {
+				darwin_file_publish(k);
+				break;
+			}
 		}
 	}
 	for (uint64_t u = 0; u < nunits; u++) {
@@ -2548,6 +2581,8 @@ struct payload_info {
 	const uint8_t *kernel;
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
+	const uint8_t *resident;        /* "resident": an image to put at the resident address (a bundle of the flash) */
+	uint32_t resident_size;
 	const char *cmdline;
 	uint64_t checkpoint;
 	uint64_t forced_base;
@@ -2590,7 +2625,12 @@ parse_payload(struct payload_info *pi, int verbose)
 		if (verbose) {
 			print("payload entry '%s' size %x\n", e->name, (uint64_t)e->size);
 		}
-		if (str_eq(e->name, "ramdisk")) {
+		if (str_eq(e->name, "resident")) {
+			/* what `xl ramdisk` uploads over USB, carried by the payload instead: an installed phone's boot
+			 * bundle has no computer to upload it (common/flash/mkbundle.py --resident) */
+			pi->resident = p + sizeof(*e);
+			pi->resident_size = e->size;
+		} else if (str_eq(e->name, "ramdisk")) {
 			pi->ramdisk = p + sizeof(*e);             /* becomes /dev/md0, the root device */
 			pi->ramdisk_size = e->size;
 		} else if (str_eq(e->name, "kernel")) {
@@ -2867,6 +2907,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (pi.resident_rd != 0) {
 		resident_rd_size = pi.resident_rd;
 	}
+	if (pi.resident != NULL && pi.resident_size != 0) {
+		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET, n = pi.resident_size;
+
+		/* the payload holding it must not lie where it goes (in QEMU both are ordinary RAM) */
+		if (res_pa < PAYLOAD_BASE + PAYLOAD_MAX_SIZE && PAYLOAD_BASE < res_pa + n) {
+			print("the resident image's place overlaps the payload: not booted\n");
+			return 0;
+		}
+		memcpy((void *)res_pa, pi.resident, n);
+		clean_dcache(res_pa, res_pa + n);
+		resident_rd_size = n;
+		print("resident image from the payload: %d bytes at pa %x\n", n, res_pa);
+	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
 		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
@@ -2921,9 +2974,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
 	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
-	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
+	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/hk_torch.c) */
 	int torch_requested = 0;
-	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
+	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/hk_camera.c) */
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
@@ -3044,7 +3097,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	for (const char *c = base_cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;
 	}
-	/* board=NAME: which device this is, for the kernel's drivers of one device (redwood_buttons.c...) */
+	/* board=NAME: which device this is, for the kernel's drivers of one device (hk_buttons.c...) */
 	for (const char *c = "board="; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;
 	}
@@ -3052,6 +3105,35 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		ba->commandLine[n++] = *c;
 	}
 	ba->commandLine[n++] = ' ';
+	/*
+	 * darwin_part= darwin_lba= darwin_blocks=: a port that took over another partition whole (the OnePlus 8's
+	 * userdata) tells the kernel's UFS driver which one, and where (bsd/dev/hk_ufs.c); darwin itself is the
+	 * kernel's default, or the installer's darwin_lba= (common/flash/install.sh).
+	 */
+	if (PLAT->store != NULL && !str_eq(PLAT->store, "darwin")) {
+		char digits[2][24];
+		uint64_t value[2] = { PLAT->store_first, PLAT->store_last - PLAT->store_first + 1 };
+		const char *part[] = { "darwin_part=", PLAT->store, " darwin_lba=", digits[0], " darwin_blocks=", digits[1], " " };
+
+		for (int d = 0; d < 2; d++) {
+			char rev[24];
+			int k = 0, j = 0;
+
+			do {
+				rev[k++] = (char)('0' + value[d] % 10);
+				value[d] /= 10;
+			} while (value[d] != 0 && k < 23);
+			while (k > 0) {
+				digits[d][j++] = rev[--k];
+			}
+			digits[d][j] = 0;
+		}
+		for (unsigned i = 0; i < sizeof(part) / sizeof(part[0]); i++) {
+			for (const char *c = part[i]; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+				ba->commandLine[n++] = *c;
+			}
+		}
+	}
 	/* one processor unless the payload asks for more (of two "cpus=" the kernel takes the first) */
 	if (!more_cores) {
 		for (const char *c = "cpus=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
@@ -3077,6 +3159,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		static const char prefix[] = "ufs_shared_pa=0x";
 		static const char hex[] = "0123456789abcdef";
 		uint64_t address = (uint64_t)(uintptr_t)&block_shared;
+
+		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
+			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		}
+		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+	}
+	if (block_enabled && df_state > 0 && df_map.magic != 0) {
+		/* darwin as a file: where its map is, for the kernel's own UFS driver (darwinfile.c) */
+		static const char prefix[] = "darwin_map_pa=0x";
+		static const char hex[] = "0123456789abcdef";
+		uint64_t address = (uint64_t)(uintptr_t)&df_map;
 
 		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 			ba->commandLine[n++] = *c;
@@ -4011,6 +4107,8 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+#include "flashboot.c"
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -4053,10 +4151,16 @@ efi_main(efi_handle image, efi_system_table *st)
 		usb_command_loop();
 	}
 
-	/* One-shot mode: run the kernel that came with the image, then reset. */
-	if (have_payload) {
+	/*
+	 * One-shot mode: run the kernel that came with the image, then reset. A payload with the loader alone
+	 * (an installed device's boot partition: common/flash/install.sh) has no kernel: that is the menu's.
+	 */
+	if (have_payload && pi.kernel != NULL) {
 		run_kernel(0, 0);
+		reboot();
 	}
+	/* No kernel: an installed device booting on its own -- the menu, the bundle from darwin, Android */
+	fb_standalone();
 	reboot();
 	return 0;
 }

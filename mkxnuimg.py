@@ -69,8 +69,10 @@ dtb = open(parts['dtb'], 'rb').read()
 kernel = args.output + '.kernel~'
 open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
 try:
+    # board "HACKiOS": how the loader of an installed phone tells which A/B slot's boot partition is its own
+    # (xnuloader/flashboot.c, ab_switch_back) -- an Android boot image never has that name
     subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', '1', '-o', args.output])
+                           '--header_version', '1', '--board', 'HACKiOS', '-o', args.output])
 finally:
     os.unlink(kernel)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')

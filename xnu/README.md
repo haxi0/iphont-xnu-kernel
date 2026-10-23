@@ -2,7 +2,7 @@
 
 Our changes to XNU `xnu-8796.121.2` (the iOS 16.5 kernel, Darwin 22.5.0):
 
-- `redwood.patch` -- changes to Apple's files;
+- `hackios.patch` -- changes to Apple's files;
 - `files/` -- new files, at their paths in the XNU tree;
 - `apply.sh` -- takes Apple's sources and applies all of this; `export.sh` -- the reverse.
 
@@ -60,7 +60,7 @@ the ready-made kernel in `prebuilt/`, `tools/update-prebuilt.sh`.
 `export.sh` regenerates the patch **from your whole tree**, not from your changes. If the tree has fallen
 behind the branch -- somebody changed the kernel after you set yours up -- the export silently rolls back
 their work: the patch comes out without their files. Before exporting, bring the tree to the current patch
-(`git checkout -- .` in `xnu-src`, then `git apply xnu/redwood.patch` and `cp -a xnu/files/. .`); if the change
+(`git checkout -- .` in `xnu-src`, then `git apply xnu/hackios.patch` and `cp -a xnu/files/. .`); if the change
 is a single one, it is more honest to paste its diff into the patch by hand and say so in the commit. The sign
 of a tree that fell behind is a kernel that builds and **crashes at boot** right after `Stackshot Succeeded`.
 
@@ -81,16 +81,16 @@ The error was there before any of our changes.
 | `iokit/Kernel/MiniIOSurface.*`, `MiniIOMobileFramebuffer.cpp`, `MiniAppleKeyStore.cpp` | replacements for closed drivers: surfaces, the display (scaled to the panel, with screen recording; on the OnePlus 8 pushed by the SM8250's MDP on the panel's TE, double-buffered, at 90 Hz: [instantnoodle latency](../docs/instantnoodle-latency.md)), the key store |
 | `bsd/miscfs/apfs/`, `bsd/miscfs/ramfs/` | our file systems: APFS (the root on flash and the images in memory) and a writable file system in memory |
 | `bsd/kern/kern_minimac.c`, `libkern/amfi/` | AMFI and Sandbox stand-ins (MAC policies), entitlements from the program's signature |
-| `bsd/dev/redwood_input.c`, `redwood_goodix.c`, `redwood_virtio_input.c` | input: `/dev/redwood-touch`, the Goodix GT9916 driver (SPI bit-banged over GPIO), virtio-input for QEMU |
-| `bsd/dev/redwood_cpufreq.c` | CPU frequency (Qualcomm EPSS) |
+| `bsd/dev/hk_input.c`, `hk_goodix.c`, `hk_virtio_input.c` | input: `/dev/hk-touch`, the Goodix GT9916 driver (SPI bit-banged over GPIO), virtio-input for QEMU |
+| `bsd/dev/hk_cpufreq.c` | CPU frequency (Qualcomm EPSS) |
 | `bsd/dev/instantnoodle_i2c.c`, `bsd/sys/instantnoodle.h`, `instantnoodle_touch.c`, `instantnoodle_battery.c` | the OnePlus 8 (`board=instantnoodle`): its TLMM pins and bit-banged I2C with clock stretching, shared by the Samsung S6SY761 touch driver and the TI bq27541 fuel gauge (with the PM8150B's USB-input state) that feeds iOS's power source |
-| `bsd/dev/redwood_torch.c`, `redwood_haptic.c` | the flash LED (PM8350C on redwood, PM8150L on the OnePlus 8; `torch=N`) and the vibration motor (Awinic AW86927 on redwood, AW8697 on the OnePlus 8, with the waveforms from the phone's vendor firmware; `haptic=N`), both driven by iOS |
-| `bsd/dev/redwood_net.c`, `bsd/sys/redwood_net.h`, `redwood_virtio_net.c` | the network interface `en0` on the kernel's network KPI (without IONetworkingFamily) and the boundary between it and whatever carries the frames (a "link": three functions in `redwood_net.h`); the first link is virtio-net for QEMU |
-| `bsd/dev/redwood_adreno.c`, `iokit/Kernel/RedwoodGPU.cpp` | the phone's GPU (Adreno 642L on redwood, Adreno 650 on the OnePlus 8 -- the `kona` variant: its clocks, debug selectors, SMMU stream and no A660-only CP registers): step-by-step bring-up (`adreno=N`: power, GMU, the zap shader, microcode), buffers and the command queue; an IOKit client with a subset of msm DRM for Mesa |
-| `bsd/dev/redwood_wifi.c`, `bsd/sys/redwood_qrtr.h` | the phone's Wi-Fi (WCN6750): Qualcomm shared memory (SMEM), the signalling bits between us and the Wi-Fi processor (SMP2P), the power processor's mailbox, loading the Wi-Fi processor's firmware, starting it through TrustZone, GLINK and QRTR on top of it; `redwood_qrtr.h` is a datagram port for the rest of the kernel |
-| `bsd/dev/redwood_qmi.c`, `bsd/sys/redwood_qmi.h` | QMI, the message protocol of the services on Qualcomm processors: table-driven encoding, requests and replies, indications; the interface is Linux's (`qmi_*`) so that ath11k's `qmi.c` builds unchanged; tested on the computer (`tools/qmi-test/run.sh`) |
-| `bsd/dev/redwood_wlfw.c` | the conversation with the Wi-Fi firmware service; the message descriptions are taken from the ath11k sources at build time (`tools/mk-wlfw.sh`) and are not in git |
-| `bsd/dev/redwood_audio.c`, `redwood_virtio_sound.c`, `redwood_speaker.c` | sound: `/dev/redwood-audio` (where our output device in mediaserverd writes what iOS plays), recording it to memory, virtio-sound for QEMU; a first look at the phone's speaker amplifiers |
+| `bsd/dev/hk_torch.c`, `hk_haptic.c` | the flash LED (PM8350C on redwood, PM8150L on the OnePlus 8; `torch=N`) and the vibration motor (Awinic AW86927 on redwood, AW8697 on the OnePlus 8, with the waveforms from the phone's vendor firmware; `haptic=N`), both driven by iOS |
+| `bsd/dev/hk_net.c`, `bsd/sys/hk_net.h`, `hk_virtio_net.c` | the network interface `en0` on the kernel's network KPI (without IONetworkingFamily) and the boundary between it and whatever carries the frames (a "link": three functions in `hk_net.h`); the first link is virtio-net for QEMU |
+| `bsd/dev/hk_adreno.c`, `iokit/Kernel/HKGPU.cpp` | the phone's GPU (Adreno 642L on redwood, Adreno 650 on the OnePlus 8 -- the `kona` variant: its clocks, debug selectors, SMMU stream and no A660-only CP registers): step-by-step bring-up (`adreno=N`: power, GMU, the zap shader, microcode), buffers and the command queue; an IOKit client with a subset of msm DRM for Mesa |
+| `bsd/dev/hk_wifi.c`, `bsd/sys/hk_qrtr.h` | the phone's Wi-Fi (WCN6750): Qualcomm shared memory (SMEM), the signalling bits between us and the Wi-Fi processor (SMP2P), the power processor's mailbox, loading the Wi-Fi processor's firmware, starting it through TrustZone, GLINK and QRTR on top of it; `hk_qrtr.h` is a datagram port for the rest of the kernel |
+| `bsd/dev/hk_qmi.c`, `bsd/sys/hk_qmi.h` | QMI, the message protocol of the services on Qualcomm processors: table-driven encoding, requests and replies, indications; the interface is Linux's (`qmi_*`) so that ath11k's `qmi.c` builds unchanged; tested on the computer (`tools/qmi-test/run.sh`) |
+| `bsd/dev/hk_wlfw.c` | the conversation with the Wi-Fi firmware service; the message descriptions are taken from the ath11k sources at build time (`tools/mk-wlfw.sh`) and are not in git |
+| `bsd/dev/hk_audio.c`, `hk_virtio_sound.c`, `hk_speaker.c` | sound: `/dev/hk-audio` (where our output device in mediaserverd writes what iOS plays), recording it to memory, virtio-sound for QEMU; a first look at the phone's speaker amplifiers |
 | `bsd/pthread/pthread_kext_static.c` | the pthread kext, linked into the kernel |
 
 Besides the hooks for all of this, the patch fixes what stops the open XNU from building and running outside

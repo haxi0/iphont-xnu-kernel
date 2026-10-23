@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cut a partition of this port's own off the end of Android's userdata: the new GPT, made and checked here.
 
-usage: userdata-carve.py DIR GIB [NAME]
+usage: userdata-carve.py [--move] DIR GIB [NAME]
   DIR   what was saved from the phone under Android (adb's root shell), all read only:
           gpt-head.bin             the first 8 blocks of LUN 0 (dd if=/dev/block/sda bs=4096 count=8)
           gpt-tail.bin             its last 8 blocks (... skip=BLOCKS-8 count=8)
@@ -10,6 +10,11 @@ usage: userdata-carve.py DIR GIB [NAME]
           sb-after.bin             (once the f2fs is shrunk) the first block of userdata again
   GIB   how much to take off the end of userdata, in GiB (a whole number of f2fs segments)
   NAME  the new partition's name (default darwin)
+  --move  the segments past the new end may hold data: the kernel's resize moves it into the rest of
+          the filesystem itself (F2FS_IOC_RESIZE_FS runs the garbage collector over that range inside one
+          checkpoint, and gives up -- changing nothing -- if it cannot). Without --move such a tail is
+          refused. With it, the table is still only made once sb-after.bin shows the filesystem shrunk to
+          exactly the size asked for: that is the kernel saying everything was moved.
 
 Android's userdata on this phone is a plain f2fs (no metadata encryption: its superblock lies on the
 flash as it is) that fills its partition, the last of LUN 0. Taking GIB off its end takes two steps
@@ -108,10 +113,13 @@ def check(name, head, tail, disk):
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
+    argv = sys.argv[1:]
+    move = '--move' in argv
+    argv = [a for a in argv if a != '--move']
+    if len(argv) not in (2, 3):
         sys.exit(__doc__)
-    d, gib = sys.argv[1], int(sys.argv[2])
-    name = sys.argv[3] if len(sys.argv) > 3 else 'darwin'
+    d, gib = argv[0], int(argv[1])
+    name = argv[2] if len(argv) > 2 else 'darwin'
     head = open(f'{d}/gpt-head.bin', 'rb').read()
     tail = open(f'{d}/gpt-tail.bin', 'rb').read()
     sb = open(f'{d}/userdata-meta-before.bin', 'rb').read(BS)[1024:2048]
@@ -177,9 +185,18 @@ def main():
     last_used = max(s for s in valid if valid[s])
     print(f'f2fs: {block_count} blocks, main area from block {main_blkaddr}, {segs_main} segments of {per_seg} blocks; '
           f'the last segment holding data is {last_used}')
-    if in_tail:
+    if in_tail and not move:
         sys.exit(f'userdata-carve.py: {len(in_tail)} segments past the new end hold data; shrink with less, '
-                 f'or let the kernel move it first')
+                 f'or let the kernel move it first (--move)')
+    if in_tail:
+        moved = sum(valid[s] for s in in_tail)
+        print(f'f2fs: {len(in_tail)} segments past the new end hold {moved} blocks ({moved * BS / 2**20:.0f} MiB): '
+              f'the resize moves them (--move)')
+        if after is None:
+            print(f'\nnothing made yet: on the phone, first')
+            print(f'  /data/local/tmp/f2fs-resize /data {new_blocks}')
+            print(f'then save the first block of userdata as {d}/sb-after.bin and run this again')
+            return 0
 
     new_first = new_start
     new_last = ph['last_usable']

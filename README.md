@@ -36,7 +36,7 @@ Photographed on the phone, the Adreno GPU drawing (`gpu=1`). More in [Screenshot
 | Works | Does not work (yet) |
 |---|---|
 | Lock screen, swipe to unlock, home screen with all icons (two pages), stock iOS 16 wallpapers | Cellular, Bluetooth |
-| System gestures: swipe up (home, app switcher), edge swipe (back), Control Center | Charging under our kernel (the phone only discharges) |
+| System gestures: swipe up (home, app switcher), edge swipe (back), Control Center | Fast charging (PD/PPS); the charger is read, not yet driven |
 | Apps: Settings, Clock, Calendar, Photos, Notes, Safari and more; widgets (Weather, Calendar) on the phone | Metal for apps (in progress: 293 of 456 system shaders already run on the Adreno, see `docs/air.md` in hackios-xnu-userland) |
 | Phone touchscreen (Goodix GT9916), multitouch, wake on touch; real power and volume keys | App Store content and Apple ID sign-in (no Secure Enclave; FairPlay daemon exits) |
 | Up to 8 CPU cores (`cpus=8`), big core at 2.4 GHz, ~20 s to the lock screen | Video and Live Photo recording |
@@ -44,6 +44,8 @@ Photographed on the phone, the Adreno GPU drawing (`gpu=1`). More in [Screenshot
 | Wi-Fi (WCN6750, ath11k): join from Settings, Safari over Wi-Fi, 55–90 Mbit/s | |
 | Sound (speakers, main microphone), camera in Camera.app (front/rear, preview, focus, HEIC photos) | |
 | Data that iOS writes survives a reboot (`var_store=1 ufs_write=1`); iOS root volume on the phone's flash | |
+| Charging with `adsp=1`: the audio DSP's charger takes current from USB (seen: +0.4 A from a computer's port), battery health and charger type in `sysctl kern.hackios.charger` | |
+| Frames follow the panel's own scan (`fb_scan=1`): 120 Hz, each frame lands whole in one refresh -- no tearing | |
 | Sileo + Procursus (dpkg, apt), tweaks, SSH | |
 
 It is a research bench, not a ROM: a session lasts a given number of seconds, then the kernel returns to the
@@ -166,6 +168,31 @@ and CoreAnimation's frame clock follows that TE (`fb_hz=60`, `fb_push=1` or `fb_
 buffer, or the firmware's autorefresh). Touch is interrupt-driven (`touch_irq=0`: 10 ms polling). Measurements,
 fallbacks and the RAM-only procedure: [instantnoodle latency](docs/instantnoodle-latency.md).
 
+## Install as a dual boot (no computer needed afterwards)
+
+HackiOS can live on the phone next to Android: the UEFI with our loader in the spare A/B slot, the kernel and the
+boot volume in darwin, a boot menu at power-on, sessions with no time limit. Android is never written, and fastboot
+always brings it back. See [docs/INSTALL.md](docs/INSTALL.md).
+
+| | |
+|---|---|
+| **Boots from the flash** | no `fastboot boot`, no computer, no RAM-only session: power on, menu, HackiOS |
+| **Two versions installed** | updates go into the other slot; "HackiOS, previous version" is always in the menu |
+| **Boot guard** | a version that does not come up 3 times is skipped by itself -- the previous one boots, then Android |
+| **Verified boot, your key** | SHA-256 of every bundle; with an owner key pinned, Ed25519-signed bundles only |
+| **A/B switch in the loader** | back to Android from the menu: backup GPT first, CRCs, both tables read back |
+| **Device identity checks** | nothing is written to a phone that is not the profile's `CODENAMES` |
+| **Tested on every push** | eight QEMU scenarios of the boot menu and the guard, crypto checked against Python |
+
+```sh
+common/hackios detect                # which profile is the phone on adb? (writes nothing)
+common/hackios doctor redwood        # every precondition, checked (writes nothing)
+common/hackios install redwood
+common/hackios switch redwood hackios
+common/hackios health redwood        # the boot guard's view
+common/hackios test                  # the whole dual boot in QEMU, no phone
+```
+
 ## Prebuilt boot image
 
 Every release has `hackios-redwood-boot.img` attached: the redwood UEFI with our loader inside, ready for
@@ -206,13 +233,13 @@ fastboot boot ──► UEFI (Mu-Silicium) ──► xnuloader (EFI application)
               ├─ APFS (images in RAM, iOS volume on flash), ramfs (/private/var, /tmp)
               ├─ minicrypto instead of corecrypto, AMFI and Sandbox stand-ins (MAC policies)
               ├─ driver replacements: IOSurface, IOMobileFramebuffer, AppleKeyStore, network stack
-              ├─ input: /dev/redwood-touch ◄─ Goodix GT9916 (phone) / virtio-input (QEMU)
+              ├─ input: /dev/hk-touch ◄─ Goodix GT9916 (phone) / virtio-input (QEMU)
               ├─ GPU: Adreno 642L, Wi-Fi: WCN6750 (ath11k via LinuxKPI), sound: ADSP / virtio-sound
               ▼
    iOS 16.5 launchd → logd, notifyd, cfprefsd, runningboardd, backboardd, SpringBoard, apps
               ├─ our libraries are injected into backboardd, SpringBoard and mediaserverd
               │  (virtual HID services, a few ObjC method swaps — in memory only)
-              └─ mediaserverd gets our CoreAudio output device (RedwoodAudio.driver)
+              └─ mediaserverd gets our CoreAudio output device (HKAudio.driver)
 ```
 
 The iOS programs, frameworks and dyld shared cache are not changed by a single byte: what they miss is done by the

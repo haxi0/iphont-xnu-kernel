@@ -32,7 +32,7 @@
 #               the small one the firmware starts on (the loader then watches from the first core, and a
 #               kernel that hangs still gets its log out); cpufreq=1 sets that core to its top speed;
 #               touchscreen=1 turns the touch screen on.
-#   XL_RAMDISK  the image sent with the kernel: the small one that is mounted on /redwood
+#   XL_RAMDISK  the image sent with the kernel: the small one that is mounted on /hackios
 #               (default userland/root.apfs; "none" sends none). Without a system image in the
 #               phone's RAM it is the root itself (e.g. XL_RAMDISK=userland/hello).
 # One phone, several working copies: a run holds a lock, and `stop` and `reboot` from another working
@@ -45,7 +45,7 @@
 # this change leaves none -- and `run` says so rather than assuming.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # the kernel and the loader built here, or else the ones that come with the repository
-K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+K=${XL_KERNEL:-xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837}   # XL_KERNEL=file: another kernel for this run
 [ -f $K ] || K=prebuilt/mach.development.bcm2837
 L=xnuloader/loader.efi
 [ -f $L ] || L=prebuilt/loader.efi
@@ -63,7 +63,7 @@ is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
 state() {
 	if is_loader; then echo loader
 	elif in_fastboot; then echo fastboot
-	elif [ "$(adb get-state 2>/dev/null)" = device ]; then echo android
+	elif [ "$(adb get-state 2>/dev/null | tr -d '\r')" = device ]; then echo android   # (adb.exe through WSL ends lines with \r)
 	else echo absent; fi
 }
 wait_for() { # wait_for <state> <seconds>

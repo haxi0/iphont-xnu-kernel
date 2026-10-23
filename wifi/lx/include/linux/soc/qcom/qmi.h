@@ -1,6 +1,6 @@
 /*
  * QMI, the protocol in which the driver talks to the radio's firmware before the radio's own
- * registers exist. The helpers are the kernel's (bsd/sys/redwood_qmi.h, bsd/dev/redwood_qmi.c),
+ * registers exist. The helpers are the kernel's (bsd/sys/hk_qmi.h, bsd/dev/hk_qmi.c),
  * under Linux's names; a kernel tree that does not have them yet gets LinuxKPI's header, in
  * which every call fails.
  */
@@ -9,7 +9,7 @@
 
 #ifdef LX_REDWOOD_QMI_H
 #include <linux/jiffies.h>
-#define REDWOOD_QMI_JIFFIES_TO_MS(j)	jiffies_to_msecs(j)
+#define HK_QMI_JIFFIES_TO_MS(j)	jiffies_to_msecs(j)
 #include LX_REDWOOD_QMI_H
 /*
  * What the driver sends goes past the radio's bus first (src/lx_bus.c), which has to know of one

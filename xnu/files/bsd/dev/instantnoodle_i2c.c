@@ -21,7 +21,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 static LCK_GRP_DECLARE(i2c_lck_grp, "instantnoodle-i2c");
 static LCK_MTX_DECLARE(map_lock, &i2c_lck_grp);           /* a transfer may map a tile */
 
-extern void redwood_tl(const char *format, ...) __printflike(1, 2);
+extern void hk_tl(const char *format, ...) __printflike(1, 2);
 
 static uint64_t
 micros(uint64_t absolute)
@@ -302,7 +302,7 @@ instantnoodle_i2c_read(struct instantnoodle_i2c *b, uint8_t addr, uint8_t reg, u
 		b->errors++;
 	}
 	if (b->trace) {
-		redwood_tl("tl: b %s begin %llu locked %llu done %llu bytes %u error %d\n", b->name,
+		hk_tl("tl: b %s begin %llu locked %llu done %llu bytes %u error %d\n", b->name,
 		    micros(began), micros(locked), micros(done), n, err);
 	}
 	return err;

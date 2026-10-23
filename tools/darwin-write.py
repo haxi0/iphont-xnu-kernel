@@ -51,6 +51,31 @@ TMP = '/data/local/tmp/darwin-write.img'
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = os.path.join(ROOT, 'logs', 'darwin-write.log')
 
+# This phone's darwin instead of the constants above (which are the phone the port was brought up on): the
+# identity file made when its darwin was cut (common/flash/darwinid.py), named by DARWIN_ID or found by the
+# phone's adb serial in phones/. Every check below is then made against this phone's own values.
+def _identity():
+    path = os.environ.get('DARWIN_ID')
+    if not path:
+        try:
+            serial = subprocess.run(['adb', 'get-serialno'], capture_output=True, text=True, timeout=20).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            serial = ''
+        path = os.path.join(ROOT, 'phones', serial + '.darwin') if serial else ''
+    if path and os.path.exists(path):
+        import json
+        return json.load(open(path))
+    return None
+
+
+_ID = _identity()
+if _ID is not None:
+    UNIQUE = _ID['unique'].upper()
+    PARTN = _ID['partn']
+    FIRST, LAST = _ID['first'], _ID['last']
+    BLOCKS = LAST - FIRST + 1
+    NODE = '/dev/block/sda%d' % PARTN
+
 
 class Refused(Exception):
     pass

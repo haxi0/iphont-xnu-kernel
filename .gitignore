@@ -3,6 +3,7 @@
 # in this repository. Nothing is tracked unless it is named here.
 /*
 !/.gitignore
+!/.github/
 !/README.md
 !/LICENSE
 !/common/
@@ -43,6 +44,9 @@ __pycache__/
 /xnuloader/*
 !/xnuloader/build.sh
 !/xnuloader/efi.h
+!/xnuloader/flashboot.c
+!/xnuloader/crypto.c
+!/xnuloader/darwinfile.c
 !/xnuloader/identity.h
 !/xnuloader/loader.c
 !/xnuloader/mkidentity.py
