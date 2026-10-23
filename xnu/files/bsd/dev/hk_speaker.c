@@ -59,6 +59,9 @@
  * kHz at most. For each register read or written the two pins are taken from the serial engine
  * (function qup03) as GPIOs and given back as they were found right after.
  *
+ * The OnePlus 8 has two NXP TFA9874 instead: with board=instantnoodle every hk_speaker_*() call below
+ * goes to bsd/dev/instantnoodle_speaker.c, and nothing of this phone's is touched.
+ *
  * Register layouts: the files above, and Linux's sound/soc/codecs/aw88261.c; pins:
  * drivers/pinctrl/qcom/pinctrl-yupik.c of the same kernel and the phone's own device tree.
  */
@@ -69,6 +72,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/hk_audio.h>
+#include <sys/instantnoodle.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -729,6 +733,9 @@ faulty(struct amplifier *a, uint16_t *status)
 bool
 hk_speaker_prepare(const uint8_t *acf, uint64_t size)
 {
+	if (instantnoodle_board()) {
+		return instantnoodle_speaker_prepare(acf, size);
+	}
 	if (tlmm == 0) {
 		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
@@ -819,6 +826,9 @@ hk_speaker_prepare(const uint8_t *acf, uint64_t size)
 bool
 hk_speaker_start(void)
 {
+	if (instantnoodle_board()) {
+		return instantnoodle_speaker_start();
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t status = 0, interrupts = 0;
@@ -892,6 +902,10 @@ hk_speaker_volume(uint32_t below, uint32_t step_ms)
 {
 	uint16_t status;
 
+	if (instantnoodle_board()) {
+		return instantnoodle_speaker_volume(below, step_ms);
+	}
+
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint32_t target = a->volume_at + below;
@@ -945,6 +959,9 @@ hk_speaker_volume(uint32_t below, uint32_t step_ms)
 bool
 hk_speaker_healthy(void)
 {
+	if (instantnoodle_board()) {
+		return instantnoodle_speaker_healthy();
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t status;
@@ -991,6 +1008,10 @@ hk_speaker_monitor(bool tell)
 {
 	uint32_t wanted = 0;
 
+	if (instantnoodle_board()) {
+		return instantnoodle_speaker_monitor(tell);
+	}
+
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t vbat = 0, temp = 0, pvdd = 0, isn = 0, vsn = 0;
@@ -1032,6 +1053,10 @@ hk_speaker_monitor(bool tell)
 void
 hk_speaker_stop(void)
 {
+	if (instantnoodle_board()) {
+		instantnoodle_speaker_stop();
+		return;
+	}
 	if (broken) {
 		return;                 /* (already powered down) */
 	}
@@ -1068,6 +1093,11 @@ void
 hk_speaker_quiesce(void)
 {
 	bool any = false;
+
+	if (instantnoodle_board()) {
+		instantnoodle_speaker_quiesce();
+		return;
+	}
 
 	for (unsigned i = 0; i < 2; i++) {
 		any |= amplifiers[i].started;
@@ -1182,6 +1212,10 @@ show_power(void)
 static void
 probe_thread(__unused void *parameter, __unused wait_result_t result)
 {
+	if (instantnoodle_board()) {
+		instantnoodle_speaker_probe(probe_level);
+		thread_terminate(current_thread());
+	}
 	if (tlmm == 0) {
 		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}

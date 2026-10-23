@@ -40,6 +40,11 @@
  * back only that much later. Everything is integer arithmetic (the kernel's threads do no
  * floating point); fractions are in Q30 unless said otherwise.
  *
+ * Amplifiers without a volume of their own (the OnePlus 8's TFA9874s, hk_guard_digital()) play at
+ * Android's level always: then the guard also puts the amplifiers' level on the samples, last, as
+ * Android's DSP does -- falling to a new level (or to silence, when they are off) within a block, rising
+ * to one 6 dB a block (20 ms) from -90 dB, so that the speakers never get a step up.
+ *
  * One caller at a time (the feeder); hk_guard_attenuation() and hk_guard_monitor() may
  * be called from another thread.
  */
@@ -81,6 +86,8 @@ static struct {
 	uint64_t gain;                          /* the gain before everything, Q30 (1 to 4) */
 	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; HK_GUARD_SILENT: off */
 	volatile uint32_t monitor;              /* the monitor's reduction, eighths of a dB */
+	bool digital;                           /* the attenuation is put on the samples (hk_guard_digital()) */
+	uint64_t digital_level;                 /* ... and was this at the end of the last block, Q30 */
 	int64_t x1[2], x2[2], y1[2], y2[2];     /* the filter's past, in 1/256 of a sample */
 	uint64_t rms[2], fast[2], slow[2];      /* average powers at each speaker, Q30 of a full-scale square wave at Android's level */
 	uint64_t level;                         /* the power guard's and the monitor's gain at the end of the last block */
@@ -141,6 +148,13 @@ hk_guard_configure(bool hpf, uint32_t gain)
 }
 
 void
+hk_guard_digital(bool on)
+{
+	guard.digital = on;
+	guard.digital_level = 0;                /* (from silence) */
+}
+
+void
 hk_guard_attenuation(uint32_t below)
 {
 	guard.attenuation = below;
@@ -159,7 +173,16 @@ block(int16_t *frames, uint32_t count)
 	struct hk_guard_report *r = &guard.report;
 	uint64_t to_speaker = attenuation == HK_GUARD_SILENT ? 0 : amplitude(2 * attenuation);
 	uint64_t sum[2] = { 0, 0 }, g2 = ONE, g, start = guard.level, ceiling;
+	uint64_t digital = !guard.digital ? ONE : attenuation == HK_GUARD_SILENT ? 0 : amplitude(attenuation);
+	uint64_t digital_start = guard.digital ? guard.digital_level : ONE;
 	uint32_t binding = 0;
+
+	/* a level that rises climbs 6 dB a block (20 ms) from -90 dB, from silence too; one that falls falls at once */
+	if (guard.digital && digital > digital_start) {
+		uint64_t climb = digital_start * 2 > amplitude(720) ? digital_start * 2 : amplitude(720);
+
+		digital = digital < climb ? digital : climb;
+	}
 
 	/* the high-pass filter, and what comes out of it: its power, per channel */
 	for (uint32_t i = 0; i < 2 * count; i++) {
@@ -228,6 +251,8 @@ block(int16_t *frames, uint32_t count)
 	for (uint32_t f = 0; f < count; f++) {
 		/* (the power guard's gain moves from the last block's to this one's across the block) */
 		uint64_t gain = (uint64_t)((int64_t)start + ((int64_t)g - (int64_t)start) * (int64_t)(f + 1) / (int64_t)count);
+		uint64_t level_out = (uint64_t)((int64_t)digital_start + ((int64_t)digital - (int64_t)digital_start) * (int64_t)(f + 1) /
+		    (int64_t)count);
 		int64_t y[2];
 		uint64_t level, peak_gain = 65536;
 
@@ -250,7 +275,7 @@ block(int16_t *frames, uint32_t count)
 			}
 		}
 		for (unsigned c = 0; c < 2; c++) {
-			int64_t out = y[c] * (int64_t)peak_gain >> 16;
+			int64_t out = (y[c] * (int64_t)peak_gain >> 16) * (int64_t)level_out >> 30;
 			uint32_t magnitude;
 
 			out = out > FULL_SCALE - 1 ? FULL_SCALE - 1 : out < -FULL_SCALE ? -FULL_SCALE : out;
@@ -262,6 +287,7 @@ block(int16_t *frames, uint32_t count)
 		}
 	}
 	guard.level = g;
+	guard.digital_level = digital;
 	r->gain = g;
 	r->rms = guard.rms[0] > guard.rms[1] ? guard.rms[0] : guard.rms[1];
 	r->fast = guard.fast[0] > guard.fast[1] ? guard.fast[0] : guard.fast[1];

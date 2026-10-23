@@ -66,7 +66,7 @@
  * More boot-args: adsp_new=K (steps K on have not been seen to work, and wait adsp_pause=MS after
  * each announcement, default 2200: what the loader needs to note the end of the log), adsp_wait=S
  * (how long step 7 watches for "up", default 10), adsp_keep=1, adsp_again=1, adsp_return=1 (back
- * to the loader when the steps are over).
+ * to the loader when the steps are over), adsp_loud=1 (adsp=1 says every step to the loader's log too).
  *
  * Nothing here writes a clock or changes a pin. One request goes to RPMh, as Linux makes it: the
  * DSP's two rails, LCX and LMX, at level 384 while it boots, given back when it says it has asked
@@ -96,6 +96,7 @@
 #include <vm/vm_kern.h>
 #include <sys/hk_audio.h>
 #include <sys/hk_input.h>
+#include <sys/instantnoodle.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -326,6 +327,9 @@ struct smem_item {
 #define ITEM_SMP2P_OURS         429
 #define ITEM_SMP2P_THEIRS       443
 #define ITEM_CRASH_REASON       423
+#define ITEM_GLINK_DESCRIPTOR   478
+#define ITEM_GLINK_OUR_QUEUE    479
+#define ITEM_GLINK_THEIR_QUEUE  480
 
 static const volatile uint8_t *smem;
 
@@ -962,8 +966,14 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+/*
+ * dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000. The OnePlus 8 (SM8250) has everything
+ * else of this file where redwood has it (SMEM, its items, the mutex, IPCC, the AOP's mailbox, RPMh) but its DSP's
+ * memory: pil_adsp_region@8fe00000, 0x2500000 bytes, of qcom,lpass@17300000 (set in hk_adsp_init()).
+ */
+static uint32_t adsp_memory = 0x86700000u, adsp_memory_size = 0x04000000u;
+#define ADSP_MEMORY             adsp_memory
+#define ADSP_MEMORY_SIZE        adsp_memory_size
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -1058,6 +1068,7 @@ image_file(const char *name, uint64_t *size)
 
 
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
+#define MDT_RELOCATABLE(flags)  (((flags) >> 27 & 1) != 0)     /* placed wherever the memory is: Linux's mdt_loader.c */
 #define MAX_SEGMENTS            48
 
 struct elf_segment {
@@ -1105,7 +1116,7 @@ step_firmware(void)
 	struct elf_segment segment;
 	const uint8_t *header;
 	uint64_t size = 0, files = 0;
-	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	uint32_t count, hashes = 0, lowest = ~0u, highest = 0, base = ADSP_MEMORY;
 
 	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
 	image_forget();
@@ -1122,6 +1133,19 @@ step_firmware(void)
 		    header[1], header[2], header[3], count, size);
 		goto fail;
 	}
+	/* a relocatable image (the OnePlus 8's is linked at 0x89500000) goes to the start of the memory, as Linux puts it */
+	for (uint32_t i = 0; i < count; i++) {
+		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
+		if (segment.type == 1 && !MDT_HASH(segment.flags) && segment.memory_size != 0 && MDT_RELOCATABLE(segment.flags) &&
+		    segment.paddr < lowest) {
+			lowest = segment.paddr;
+		}
+	}
+	if (lowest != ~0u) {
+		printf("adsp: %u: the image is relocatable, linked at %#x: put at %#x\n", step, lowest, ADSP_MEMORY);
+		base = lowest;
+		lowest = ~0u;
+	}
 	for (uint32_t i = 0; i < count; i++) {
 		char name[16];
 
@@ -1132,13 +1156,13 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
+		if (segment.paddr < base || segment.file_size > segment.memory_size ||
+		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)base + ADSP_MEMORY_SIZE) {
 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
+		image.segment[image.segments].at = segment.paddr - base;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -1161,14 +1185,14 @@ step_firmware(void)
 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments == 0 || lowest != base || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
+	image.size = ((highest + 0xfff) & ~0xfffu) - base;
 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
 	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
 	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
@@ -1451,20 +1475,25 @@ step_image(void)
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
+	announce("put the image's segments into the audio DSP's memory (memory of nobody's until TrustZone starts the DSP), with "
+	    "zeroes where a segment is longer than its file, and read them back");
 	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
+		uint32_t whole = image.segment[s].memory_size & ~7u;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		if (image.segment[s].at & 7) {
+			printf("adsp: %u: a segment that does not begin at a multiple of eight bytes: not written\n", step);
 			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
 			return false;
 		}
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		for (uint32_t i = 0; i < whole; i += 8) {
 			to[i / 8] = segment_word(s, i);
+		}
+		/* (the OnePlus 8's last two end in the middle of a word: the rest byte by byte, nothing past the segment) */
+		for (uint32_t i = whole; i < image.segment[s].memory_size; i++) {
+			((volatile uint8_t *)to)[i] = (uint8_t)(segment_word(s, i & ~7u) >> (8 * (i & 7)));
 		}
 		written += image.segment[s].file_size;
 		cleared += image.segment[s].memory_size - image.segment[s].file_size;
@@ -1473,8 +1502,13 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
 
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		uint32_t whole = image.segment[s].memory_size & ~7u;
+
+		for (uint32_t i = 0; i < whole; i += 8) {
 			wrong += from[i / 8] != segment_word(s, i);
+		}
+		for (uint32_t i = whole; i < image.segment[s].memory_size; i++) {
+			wrong += ((volatile uint8_t *)from)[i] != (uint8_t)(segment_word(s, i & ~7u) >> (8 * (i & 7)));
 		}
 	}
 	printf("adsp: %u: %u segments, %llu bytes written and %llu cleared; read back, %llu words of eight bytes differ\n", step,
@@ -1492,20 +1526,24 @@ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
 #define LOCK_OWNER              0x000
 #define LOCK_US                 1u
 
-/* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one (hk_wifi.c: our_item_make()). */
+/*
+ * An item of ours made in the partition, as Linux's qcom_smem_alloc_private() makes one (hk_wifi.c: our_item_make()):
+ * our SMP2P item, and GLINK's descriptor and our queue where nobody has made them since the phone started (the OnePlus 8,
+ * which has no Android: Linux's qcom_glink_smem_register() makes those two, the DSP its own queue).
+ */
 static bool
-our_item_make(uint32_t partition)
+item_make(uint32_t partition, uint16_t item, uint32_t bytes)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
+	const uint32_t item_size = (bytes + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
 	uint32_t owner = ~0u, at;
 	bool made = false;
 
 	lck_mtx_lock(&hk_smem_alloc_lock);         /* (the Wi-Fi's start allocates under the same hardware lock) */
 	need(&smem_lock);
 	printf("adsp: %u: about to take the lock (%#x), write an entry for item %u with %u bytes behind it at the partition's mark, "
-	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, ITEM_SMP2P_OURS, item_size, need_bytes);
+	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, item, item_size, need_bytes);
 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
 	for (uint32_t ms = 0; ms <= 1000; ms++) {
 		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
@@ -1526,7 +1564,7 @@ our_item_make(uint32_t partition)
 		goto out;
 	}
 	for (at = sizeof(header); at < header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
 		    entry.size > header.size) {
 			break;
 		}
@@ -1541,9 +1579,9 @@ our_item_make(uint32_t partition)
 		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
 		goto out;
 	}
-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at, SMEM_CANARY | (uint32_t)item << 16);
 	smem_poke(partition + at + 4, item_size);
-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));
+	smem_poke(partition + at + 8, item_size - bytes);
 	smem_poke(partition + at + 12, 0);
 	settle();
 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
@@ -1576,7 +1614,7 @@ step_our_item(void)
 		printf("adsp: %u: item %u is there, at %#lx: a kernel before this one made it, and it is used again\n", step,
 		    ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
 	} else {
-		if (!our_item_make(partition)) {
+		if (!item_make(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p))) {
 			return false;
 		}
 		our_item = our_item_find();
@@ -1611,6 +1649,33 @@ step_our_item(void)
 		return false;
 	}
 	show_words("our item reads back", &ours);
+	/* GLINK's descriptor (zeroes: the four marks) and our queue, as qcom_glink_smem_register() makes them */
+	{
+		static const struct {
+			uint16_t item;
+			uint32_t bytes;
+		} glink_items[] = { { ITEM_GLINK_DESCRIPTOR, 32 }, { ITEM_GLINK_OUR_QUEUE, 16384 } };
+
+		for (unsigned i = 0; i < 2; i++) {
+			uint32_t item_size = 0, at = smem_item(glink_items[i].item, &item_size);
+
+			if (at != 0) {
+				continue;
+			}
+			if (!item_make(partition, glink_items[i].item, glink_items[i].bytes) ||
+			    (at = smem_item(glink_items[i].item, &item_size)) == 0) {
+				printf("adsp: %u: GLINK's item %u could not be made\n", step, glink_items[i].item);
+				return false;
+			}
+			if (glink_items[i].item == ITEM_GLINK_DESCRIPTOR) {
+				for (uint32_t w = 0; w < 32; w += 4) {
+					smem_poke(at + w, 0);
+				}
+				settle();
+			}
+			printf("adsp: %u: GLINK's item %u made (%u bytes), at %#lx\n", step, glink_items[i].item, item_size, SMEM_PHYS + at);
+		}
+	}
 	glink_reset();
 	return true;
 }
@@ -1763,9 +1828,6 @@ step_start(void)
 
 /* ---- GLINK (hk_wifi.c; items 478 to 480 of our partition with the audio DSP) ------------------- */
 
-#define ITEM_GLINK_DESCRIPTOR   478
-#define ITEM_GLINK_OUR_QUEUE    479
-#define ITEM_GLINK_THEIR_QUEUE  480
 #define GLINK_OUR_TAIL          0
 #define GLINK_OUR_HEAD          4
 #define GLINK_THEIR_TAIL        8
@@ -3359,7 +3421,9 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 		hk_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, hk_sound.c) */
 		hk_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, hk_mic.c) */
-		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
+		if (!instantnoodle_board()) {
+			battmgr_start();        /* (how the battery is, from the DSP; battmgr=0: not asked; SM8250 has no battmgr) */
+		}
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
@@ -3382,11 +3446,15 @@ hk_adsp_init(void)
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
 		return;
 	}
+	if (instantnoodle_board()) {
+		adsp_memory = 0x8fe00000u;      /* dt: pil_adsp_region@8fe00000 (in the UEFI's "PIL Reserved") */
+		adsp_memory_size = 0x02500000u;
+	}
 	if (last_step == 0) {
 		/* all of it, on a thread of its own, and left up */
 		last_step = STEPS;
 		keep = true;
-		quiet = true;
+		quiet = !option("adsp_loud");   /* (adsp_loud=1: every step's lines to the loader's log as well) */
 		pause_ms = 0;
 		listen_seconds = 1;
 		new_from = STEPS + 1;

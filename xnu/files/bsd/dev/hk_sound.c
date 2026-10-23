@@ -62,6 +62,20 @@
  *     (topology 0x10312), two channels, 24 bits, 48 kHz; the stream: ASM session 1, stream 1,
  *     opened for writing linear PCM of 16 bits, no processing (0x10c68), routed to that path
  *
+ * The OnePlus 8 (board=instantnoodle) has its two amplifiers (NXP TFA9874, instantnoodle_speaker.c) on
+ * the tertiary MI2S interface instead: Android's TERT_MI2S_RX, AFE port 0x1004 (msm-dai-q6-mi2s.2,
+ * qcom,msm-mi2s-rx-lines 2: data line 1; the SoC the master), two channels of S24_LE at 48 kHz (its mixer
+ * paths), the bit clock 0x104 ("TER_MI2S_IBIT", attribute "couple no") at 48000 x 2 x 32 = 3.072 MHz
+ * (kona.c), no group; the pins of msm_cdc_pinctrl_tert's active state: GPIO 133 bit clock, 135 word
+ * select, 134 data in (the amplifiers' sense), 137 data out, functions 1, 1, 1 and 3 (pinctrl-sm8250.c),
+ * 8 mA, no pull. Its amplifiers have no volume of their own, so the speakers' guard puts their level on
+ * the samples (hk_guard_digital()), the test tone's too: silence while they power up, then a fade-in.
+ * sound_guard_as is refused there, since it would make them louder. The SMMU stream, its addresses, ADM
+ * and ASM are redwood's. Unless sound_amps=1 is given (the device profile gives it), the amplifiers are
+ * set up and kept powered down: the whole path runs, the DSP takes the samples, nothing is heard.
+ *
+ * sound_amps=0 (redwood's default is 1): the amplifiers are set up, then never started -- for a silent test.
+ *
  * What is started is stopped, and what is written is put back, when the time is over -- or, if
  * the DSP is to be shut down earlier (the run's end), before that (hk_sound_dsp_down()).
  * The amplifiers are powered down on a panic's way out (hk_sound_quiesce()).
@@ -79,6 +93,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/hk_audio.h>
+#include <sys/instantnoodle.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -94,6 +109,8 @@ static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up
 
 static uint32_t level, seconds = 3, below = 240, pause_ms = 1000, gain = HK_GUARD_MAX_GAIN;
 static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
+static uint32_t amps = 1;               /* boot-arg sound_amps=0: the amplifiers set up but never started (the OnePlus 8's default) */
+static bool mi2s;                       /* the OnePlus 8: tertiary MI2S, TFA9874 amplifiers without a volume */
 static char last_write[96] = "nothing written";
 
 /* ---- what is said: to the loader's log as well, as it happens ---------------------------------------- */
@@ -209,17 +226,28 @@ static struct block tlmm = { "pin controller", 0x0f100000, 0x100000 };
 #define CFG_8MA                 (3u << 6)
 #define CFG_OUTPUT              (1u << 9)
 
-static const struct {
+#define CFG_FUNCTION(n)         ((n) << 2)
+
+struct sound_pin {
 	unsigned pin;
 	const char *name;
 	uint32_t cfg, io;               /* Android's active state */
-} tdm_pins[] = {
+};
+/* the bit clock first, the frame sync second (pin_activity()) */
+static const struct sound_pin redwood_pins[] = {
 	{ 97, "gpio97 (bit clock)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 100, "gpio100 (frame sync)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 98, "gpio98 (data in)", CFG_MI2S0 | CFG_8MA, 0 },
 	{ 99, "gpio99 (data out)", CFG_MI2S0 | CFG_8MA, 0 },
+}, instantnoodle_pins[] = {
+	{ 133, "gpio133 (bit clock)", CFG_FUNCTION(1) | CFG_8MA, 0 },
+	{ 135, "gpio135 (word select)", CFG_FUNCTION(1) | CFG_8MA, 0 },
+	{ 134, "gpio134 (data in)", CFG_FUNCTION(1) | CFG_8MA, 0 },
+	{ 137, "gpio137 (data out)", CFG_FUNCTION(3) | CFG_8MA, 0 },
 };
-#define TDM_PINS                (sizeof(tdm_pins) / sizeof(tdm_pins[0]))
+static const struct sound_pin *tdm_pins = redwood_pins;
+#define TDM_PINS                (sizeof(redwood_pins) / sizeof(redwood_pins[0]))
+_Static_assert(sizeof(redwood_pins) == sizeof(instantnoodle_pins), "one count of pins for both boards");
 static uint32_t found_cfg[TDM_PINS], found_io[TDM_PINS];
 static bool pins_taken;
 
@@ -335,7 +363,15 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 #define AFE_MODULE_CLOCK_SET                    0x0001028fu
 #define AFE_PARAM_ID_CLOCK_SET                  0x00010290u
 
-#define PORT                    0x9000          /* PRI_TDM_RX_0 */
+#define PORT                    port_id         /* PRI_TDM_RX_0, 0x9000; the OnePlus 8: TERT_MI2S_RX, 0x1004 */
+#define PORT_TERT_MI2S_RX       0x1004
+#define AFE_PARAM_ID_I2S_CONFIG 0x0001020du
+#define CLOCK_TER_MI2S_IBIT     0x104
+#define CLOCK_COUPLE_NO         1
+#define I2S_SD1                 2
+#define I2S_STEREO              1
+#define I2S_WS_INTERNAL         1
+#define I2S_BITS                24              /* the mixer path's S24_LE, in 32-bit slots */
 #define GROUP                   0x9100          /* PRI_TDM_RX */
 #define GROUP_OTHER_PORT        0x9002
 #define PORT_INVALID            0xffff
@@ -346,9 +382,18 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 #define SLOT_BITS               32
 #define PORT_BITS               32              /* the mixer path's S32_LE */
 
+static uint16_t port_id = 0x9000;
+
 struct afe_param {
 	uint32_t module, param;
 	uint16_t size, reserved;
+} __attribute__((packed));
+
+struct afe_i2s {
+	uint32_t version;
+	uint16_t bits, channel_mode, mono_stereo, ws_source;
+	uint32_t rate;
+	uint16_t data_format, reserved;
 } __attribute__((packed));
 
 struct afe_clock_set {
@@ -422,10 +467,31 @@ static bool clock_on, group_on, port_on;
 static bool
 afe_clock(bool on)
 {
-	struct afe_clock_set clock = { 1, CLOCK_PRI_TDM_IBIT, RATE * SLOT_BITS * SLOTS, CLOCK_INVERT_COUPLE_NO, 0, on };
+	struct afe_clock_set clock = { 1, mi2s ? CLOCK_TER_MI2S_IBIT : CLOCK_PRI_TDM_IBIT, RATE * SLOT_BITS * SLOTS,
+		                       mi2s ? CLOCK_COUPLE_NO : CLOCK_INVERT_COUPLE_NO, 0, on };
 
-	return afe_service_param(on ? "the TDM bit clock (0x200) at 3.072 MHz, on" : "the TDM bit clock, off", AFE_MODULE_CLOCK_SET,
-	           AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
+	return afe_service_param(!on ? "the bit clock, off" : mi2s ? "the MI2S bit clock (0x104) at 3.072 MHz, on" :
+	           "the TDM bit clock (0x200) at 3.072 MHz, on", AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
+}
+
+/* The OnePlus 8's port: tertiary MI2S, no group (msm-dai-q6-v2.c's I2S configuration for two channels on data line 1). */
+static bool
+afe_on_mi2s(void)
+{
+	struct afe_i2s i2s = { 1, I2S_BITS, I2S_SD1, I2S_STEREO, I2S_WS_INTERNAL, RATE, 0, 0 };
+	uint16_t start[2] = { PORT, 0 };
+
+	announce("the DSP is asked for the MI2S interface's bit clock, the port and its start (AFE)");
+	clock_on = afe_clock(true);
+	if (!clock_on) {
+		return false;
+	}
+	if (!afe_port_param("the port 0x1004: I2S, 2 channels of 24 bits at 48 kHz on data line 1, the SoC the master",
+	    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s))) {
+		return false;
+	}
+	port_on = command("the port 0x1004, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+	return port_on;
 }
 
 static bool
@@ -445,6 +511,9 @@ afe_on(void)
 		                            .offsets = { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
 	uint16_t start[2] = { PORT, 0 };
 
+	if (mi2s) {
+		return afe_on_mi2s();
+	}
 	announce("the DSP is asked for the TDM interface's bit clock, the group, the port and its start (AFE)");
 	clock_on = afe_clock(true);
 	if (!clock_on) {
@@ -474,7 +543,7 @@ afe_off(void)
 	struct afe_group_enable disable = { GROUP, 0 };
 
 	if (port_on) {
-		command("the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		command("the port, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		port_on = false;
 	}
 	if (group_on) {
@@ -953,6 +1022,9 @@ period_fill(unsigned period, bool silent)
 		samples[2 * frame] = sample;
 		samples[2 * frame + 1] = sample;
 	}
+	if (mi2s) {
+		hk_guard_process(samples, PERIOD_FRAMES);       /* (no volume in the amplifiers: the guard sets their level) */
+	}
 	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + PERIOD_BYTES; line += 64) {
 		__asm__ volatile ("dc cvac, %0" : : "r" (line));        /* the DSP reads memory, not our caches */
 	}
@@ -1239,7 +1311,7 @@ guard_off(bool unheard)
 static void
 watch(void)
 {
-	bool on = false, given_up = false, muted = false;
+	bool on = false, given_up = false, muted = false, held_said = false;
 	uint64_t last_look = 0, last_monitor = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
 
@@ -1272,10 +1344,19 @@ watch(void)
 				guard_level(below + extra);
 			}
 		}
-		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
+		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000 && amps == 0) {
+			if (!held_said) {
+				say_when("iOS plays: the amplifiers stay powered down (sound_amps=0): what iOS plays goes to the DSP, unheard");
+				held_said = true;
+			}
+		} else if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
 			starts++;
 			ios_peak = 0;
+			if (mi2s) {
+				/* (no volume in the amplifiers: they power up on silence, and the level fades in once they operate) */
+				hk_guard_attenuation(HK_GUARD_SILENT);
+			}
 			if (!hk_speaker_start() || !hk_speaker_volume(below + extra, 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
 				guard_off(true);
@@ -1283,6 +1364,9 @@ watch(void)
 			} else {
 				on = true;
 				guard_on = true;
+				if (mi2s) {
+					guard_level(below + extra);     /* (from -90 dB, 6 dB every 20 ms: hk_guard.c) */
+				}
 				last_look = now_us();
 				last_monitor = 0;
 				monitor_looks = 0;
@@ -1376,11 +1460,18 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		    "the port and a stream with a test tone, the amplifiers off" :
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
+	if (level == 3 && amps == 0) {
+		say("sound: level 3 plays the tone through the amplifiers, and sound_amps=0 keeps them off: level 2 is that\n");
+		goto out;
+	}
 	if (level >= 3) {
-		acf = hk_adsp_fw_file("aw882xx_acf.bin", &acf_size);
+		/* the amplifiers' configuration: Android's own file (redwood: Awinic's, the OnePlus 8: NXP's container) */
+		const char *file = mi2s ? "tfa98xx.cnt" : "aw882xx_acf.bin", *from = mi2s ? "/vendor/firmware" : "/vendor/etc";
+
+		acf = hk_adsp_fw_file(file, &acf_size);
 		if (acf == NULL) {
-			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
-			    "userland/build.sh\n");
+			say("sound: no /fw/%s: put the phone's %s/%s into fw-audio/ and run SYSTEM=1 userland/build.sh\n", file, from,
+			    file);
 			goto out;
 		}
 	}
@@ -1394,16 +1485,17 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = false;
 		hk_adsp_apr_events(events);
 	}
-	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
+	announce(mi2s ? "the MI2S pins (GPIO 133 to 137) to the interface, as Android's active state has them" :
+	    "the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
 	pins_on();
 	if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
-	pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
-	pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	pin_activity(tdm_pins[0].pin, tdm_pins[0].name, &changes, &ones);
+	pin_activity(tdm_pins[1].pin, tdm_pins[1].name, &sync_changes, &sync_ones);
+	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE BIT CLOCK AND FRAME SYNC RUN at the pins" :
+	    "THE PINS DO NOT SHOW A RUNNING BIT CLOCK");
 	if (level == 1) {
 		sleep_ms(seconds * 1000);
 		ok = true;
@@ -1430,8 +1522,13 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_deallocate(feeder);
 		watcher_runs = true;
 		hk_audio_set_sink("the speakers (the audio DSP, hk_sound.c)", ios_sink);
-		say("sound: WHAT IOS PLAYS GOES TO THE SPEAKERS from here on, %u.%03u dB under Android's level, until the run ends\n",
-		    below / 8, below % 8 * 125);
+		if (amps == 0) {
+			say("sound: WHAT IOS PLAYS GOES TO THE DSP from here on, the amplifiers powered down (sound_amps=0): nothing is "
+			    "heard; the level would be %u.%03u dB under Android's\n", below / 8, below % 8 * 125);
+		} else {
+			say("sound: WHAT IOS PLAYS GOES TO THE SPEAKERS from here on, %u.%03u dB under Android's level, until the run ends\n",
+			    below / 8, below % 8 * 125);
+		}
 		say("sound: through the guard (hk_guard.c): %u.%03u dB of gain first (sound_gain), then high-pass at 200 Hz; peaks "
 		    "3 dB, the 0.2 s/3 s/60 s power 6/9/12 dB under full scale at Android's level\n", gain / 8, gain % 8 * 125);
 		if (guard_as < below) {
@@ -1452,6 +1549,9 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	/* (the amplifiers are faded in before the tone begins: they fade in on silence, and the tone starts at that level) */
 	if (level >= 3 && !hk_speaker_volume(below, 50)) {
 		goto out;
+	}
+	if (level >= 3 && mi2s) {
+		hk_guard_attenuation(below);    /* (the level is the samples', from silence: hk_guard_digital()) */
 	}
 	if (level >= 3) {
 		say("sound: THE TONE PLAYS NOW for %u s: 1 kHz at -20 dBFS, both speakers, %u.%03u dB under Android's level\n",
@@ -1490,7 +1590,20 @@ hk_sound_dsp_up(void)
 	if (gain > HK_GUARD_MAX_GAIN) {
 		gain = HK_GUARD_MAX_GAIN;
 	}
-	hk_guard_configure(true, gain);
+	mi2s = instantnoodle_board();
+	if (mi2s) {
+		tdm_pins = instantnoodle_pins;
+		port_id = PORT_TERT_MI2S_RX;
+		amps = 0;               /* (until a listening test has verified the TFA9874s: sound_amps=1) */
+		hk_guard_digital(true);
+		if (guard_as != UINT32_MAX) {
+			say("sound: sound_guard_as is refused on the OnePlus 8: its amplifiers' level is the samples', and it would raise it\n");
+			guard_as = UINT32_MAX;
+		}
+	}
+	PE_parse_boot_argn("sound_amps", &amps, sizeof(amps));
+	/* (the test tone goes through the guard only on the OnePlus 8, and is not to be lifted there) */
+	hk_guard_configure(true, mi2s && level <= 3 ? 0 : gain);
 	if (level >= 2 && level <= 3 && seconds > 3) {
 		seconds = 3;            /* the test tone: three seconds at most */
 	}

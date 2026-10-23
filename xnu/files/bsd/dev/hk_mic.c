@@ -67,6 +67,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/conf.h>
 #include <sys/hk_audio.h>
+#include <sys/instantnoodle.h>
 #include <sys/hk_input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
@@ -1817,6 +1818,10 @@ hk_mic_dsp_up(void)
 	thread_t thread;
 
 	if (!PE_parse_boot_argn("mic", &level, sizeof(level)) || level == 0) {
+		return;
+	}
+	if (instantnoodle_board()) {
+		printf("mic: mic=N is redwood's microphone path; the OnePlus 8's microphones (WCD938x) are not done\n");
 		return;
 	}
 	level = level > 4 ? 4 : level;

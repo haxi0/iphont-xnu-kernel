@@ -46,4 +46,14 @@ void instantnoodle_i2c_recover(struct instantnoodle_i2c *bus);     /* nine clock
 
 void instantnoodle_battery_init(void);  /* the bq27541 fuel gauge (bsd/dev/instantnoodle_battery.c) */
 
+/* The speakers' two TFA9874 amplifiers (bsd/dev/instantnoodle_speaker.c): hk_speaker.c's hk_speaker_*() on this board */
+bool instantnoodle_speaker_prepare(const uint8_t *container, uint64_t size);
+bool instantnoodle_speaker_start(void);
+bool instantnoodle_speaker_volume(uint32_t below, uint32_t step_ms);
+bool instantnoodle_speaker_healthy(void);
+uint32_t instantnoodle_speaker_monitor(bool tell);
+void instantnoodle_speaker_stop(void);
+void instantnoodle_speaker_quiesce(void);
+void instantnoodle_speaker_probe(uint32_t level);     /* boot-arg speaker_probe=N */
+
 #endif /* _SYS_INSTANTNOODLE_H_ */

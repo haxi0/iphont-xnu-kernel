@@ -90,6 +90,8 @@ struct hk_guard_report {
 void hk_guard_configure(bool hpf, uint32_t gain);         /* the high-pass filter; `gain' before everything */
 void hk_guard_attenuation(uint32_t below);                 /* the amplifiers' level under Android's (or HK_GUARD_SILENT):
                                                                  * what the limits are reckoned from */
+void hk_guard_digital(bool on);                            /* amplifiers without a volume: the guard puts that level
+                                                                 * on the samples as well (from silence) */
 void hk_guard_monitor(uint32_t below);                     /* a reduction asked for by hk_speaker_monitor() */
 void hk_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
 void hk_guard_take_report(struct hk_guard_report *report);   /* what happened since the last call */

@@ -144,5 +144,52 @@ main(void)
 	run("pink noise at -24 dB RMS (loud music as iOS leaves it) with 12 dB of gain", 0, 2, pow(10, -24 / 20.0), 0, 60, 20);
 	run("silence", HK_GUARD_SILENT, 0, 0, 0, 600, 600);
 	run("the same with the amplifiers 90 dB under (sound_below=720)", 720, 2, pow(10, -24 / 20.0), 0, 10, 5);
+
+	/* amplifiers without a volume (hk_guard_digital(), the OnePlus 8): their level on the samples, nothing while off */
+	{
+		double peak = 0;
+
+		hk_guard_configure(true, 0);
+		hk_guard_digital(true);
+		hk_guard_attenuation(HK_GUARD_SILENT);
+		make(frames, 1, 0.5, 1000);
+		hk_guard_process(frames, BLOCK);
+		for (int i = 0; i < 2 * BLOCK; i++) {
+			if (frames[i] != 0) {
+				printf("FAILED: the guard let sound through with the amplifiers off (digital)\n");
+				return 1;
+			}
+		}
+		hk_guard_attenuation(160);
+		for (int b = 0; b < 50; b++) {
+			double block_peak = 0;
+
+			make(frames, 1, 0.5, 1000);
+			hk_guard_process(frames, BLOCK);
+			for (int i = 0; i < 2 * BLOCK; i++) {
+				block_peak = fabs(frames[i] / 32768.0) > block_peak ? fabs(frames[i] / 32768.0) : block_peak;
+			}
+			/* from silence it fades in: -90 dB in the first block, 6 dB more a block */
+			if (b == 0 && block_peak > 2 / 32768.0) {
+				printf("FAILED: the digital level steps up from silence (%.1f dB in the first block)\n",
+				    20 * log10(block_peak / 0.5));
+				return 1;
+			}
+			if (b == 6 && block_peak > 0.5 * pow(10, -48 / 20.0)) {
+				printf("FAILED: the digital level climbs faster than 6 dB a block\n");
+				return 1;
+			}
+			if (b >= 20) {
+				peak = block_peak > peak ? block_peak : peak;
+			}
+		}
+		printf("-- digital: a -6 dB sine with the amplifiers 20 dB under comes out %.2f dB under its level\n",
+		    -20 * log10(peak / 0.5));
+		if (fabs(20 * log10(peak / 0.5) + 20) > 0.5) {
+			printf("FAILED: the digital level is not the amplifiers' level\n");
+			return 1;
+		}
+		hk_guard_digital(false);
+	}
 	return 0;
 }
