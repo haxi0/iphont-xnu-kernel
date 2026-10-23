@@ -34,6 +34,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hk_input.h>
+#include <sys/instantnoodle.h>
 #include <sys/systm.h>
 
 extern void hk_tl(const char *format, ...) __printflike(1, 2);
@@ -1506,6 +1507,13 @@ hk_goodix_init(void)
 	thread_t thread;
 
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
+		return;
+	}
+	/*
+	 * The redwood's pins: on the OnePlus 8 (whose own touch is instantnoodle_touch.c) reading
+	 * GPIO 68 here sent the phone to Qualcomm CrashDump (NOC_ERROR at 0x0f144000, 2026-10-23).
+	 */
+	if (instantnoodle_board()) {
 		return;
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
