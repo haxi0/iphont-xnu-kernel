@@ -2246,6 +2246,7 @@ gmu_post_mortem(void)
 	get(&gmu, "ahb_fence_status", GMU_AHB_FENCE_STATUS);
 }
 
+static bool hfi_quiet;                  /* the speed asked for while the GPU is in use: no line a message */
 /* Send a message whose first word is yet to be made and wait for the GMU's verdict on it. */
 static bool
 hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
@@ -2256,7 +2257,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	bool answered = false;
 
 	message[0] = id | words << 8 | number << 20;
-	printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	if (!hfi_quiet) {
+		printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
 	hold(true);
 	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
@@ -2289,7 +2292,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		}
 		return false;
 	}
-	printf("adreno: %u: the GMU accepts %s\n", step, what);
+	if (!hfi_quiet) {
+		printf("adreno: %u: the GMU accepts %s\n", step, what);
+	}
 	return true;
 }
 
@@ -3283,12 +3288,19 @@ redwood_adreno_quiesce(void)
 #define RBBM_INT_CACHE_FLUSH_TS (1u << 20)
 #define EVENT_IRQ               (1u << 31)              /* of CP_EVENT_WRITE's first word */
 static uint32_t gpu_irq;                                /* the interrupt is ours, and fences raise it */
+/*
+ * Boot-arg gpu_dcvs (1 by default on the OnePlus 8): the 3D core's speed follows its load, among the levels step 17
+ * gave the GMU (iokit/Kernel/RedwoodGPU.cpp, gpuSpeed()); 0: it stays at adreno_speed's. Boot-arg gpu_hot: the
+ * temperature, in tenths of a degree, from which it is held at the lowest level (850 by default).
+ */
+uint32_t gpu_dcvs, gpu_hot = 850;
 static int gpu_fence_event;                             /* (its address) what a waiter sleeps on */
 
 static bool gpu_kept;
 static uint32_t gpu_fence;              /* the number of the last submission */
 static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
 static uint64_t gpu_ticks;              /* how long the core has worked on the submissions added up */
+static uint64_t gpu_load_ticks;         /* ... the same, for the speed's choice (redwood_gpu_load()) */
 static uint32_t gpu_timed_count;
 static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
@@ -3697,6 +3709,7 @@ gpu_times(void)
 			}
 			gpu_timed_by[by]++;
 			gpu_ticks += ticks;
+			gpu_load_ticks += ticks;
 			gpu_timed_count++;
 		}
 	}
@@ -3951,14 +3964,10 @@ static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
 
-void
-redwood_adreno_minute(void)
+/* The two sensors at the GPU, in tenths of a degree (-2730: no reading). */
+static void
+gpu_temperatures(int32_t tenths[2])
 {
-	int32_t tenths[2];
-
-	if (!gpu_kept) {
-		return;
-	}
 	need(&tsens);
 	for (unsigned i = 0; i < 2; i++) {
 		tenths[i] = -2730;
@@ -3970,10 +3979,84 @@ redwood_adreno_minute(void)
 			}
 		}
 	}
-	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz; %llu interrupts\n",
-	    tenths[0] / 10, tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
+}
+
+/*
+ * The 3D core's speed while it is in use (iokit/Kernel/RedwoodGPU.cpp: gpu_dcvs). Only the levels step 17
+ * gave the GMU, at the supply levels the phone's device tree names for them: 1 to 3 are 305, 400 and 525 MHz
+ * on the OnePlus 8 (315, 450, 550 on redwood). With the lock held.
+ */
+uint32_t
+redwood_gpu_level_count(void)
+{
+	return 4;
+}
+
+uint32_t
+redwood_gpu_level_khz(uint32_t level)
+{
+	static const uint32_t sm8250[] = { 0, 305000, 400000, 525000 }, yupik[] = { 0, 315000, 450000, 550000 };
+
+	return level < 4 ? (kona ? sm8250 : yupik)[level] : 0;
+}
+
+bool
+redwood_gpu_set_level(uint32_t level)
+{
+	uint32_t vote[4] = { 0, 1, level, HFI_NO_INDEX };
+	bool ok;
+
+	if (!gpu_kept || level == 0 || level >= redwood_gpu_level_count()) {
+		return false;
+	}
+	hfi_quiet = true;
+	ok = hfi_send("the speed wanted", HFI_GX_BW_PERF_VOTE, vote, 4);
+	hfi_quiet = false;
+	if (ok) {
+		core_khz = redwood_gpu_level_khz(level);
+	}
+	return ok;
+}
+
+/* How long the core has worked since the last call, in ticks of the 19.2 MHz crystal. With the lock held. */
+uint64_t
+redwood_gpu_load(void)
+{
+	uint64_t ticks;
+
+	gpu_times();
+	ticks = gpu_load_ticks;
+	gpu_load_ticks = 0;
+	return ticks;
+}
+
+/* The hotter of the GPU's two sensors, in tenths of a degree. */
+int32_t
+redwood_gpu_temperature(void)
+{
+	int32_t tenths[2];
+
+	gpu_temperatures(tenths);
+	return tenths[0] > tenths[1] ? tenths[0] : tenths[1];
+}
+
+void
+redwood_adreno_minute(void)
+{
+	int32_t tenths[2];
+
+	if (!gpu_kept) {
+		return;
+	}
+	gpu_temperatures(tenths);
+	bool was = quiet;
+	uint32_t hz = measure_quietly(GPUCC_DEBUG_GX_GFX3D);
+
+	quiet = was;                    /* (a GPU kept for the system says nothing of its registers) */
+	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz and measures %u MHz; "
+	    "%llu interrupts\n", tenths[0] / 10, tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
 	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000,
-	    gpu_irq ? gic_v3_spi_count(GPU_INTID) : 0ull);
+	    hz == MEASURE_FAILED ? 0 : hz / 1000000, gpu_irq ? gic_v3_spi_count(GPU_INTID) : 0ull);
 }
 
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
@@ -4236,6 +4319,9 @@ redwood_adreno_init(void)
 			PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
 			gpu_irq = kona;
 			PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
+			gpu_dcvs = kona;
+			PE_parse_boot_argn("gpu_dcvs", &gpu_dcvs, sizeof(gpu_dcvs));
+			PE_parse_boot_argn("gpu_hot", &gpu_hot, sizeof(gpu_hot));
 			if (gpu_irq) {
 				gpu_interrupt_on();
 				if (gic_v3_spi_attach(GPU_INTID, false, gpu_interrupt, NULL) != KERN_SUCCESS) {

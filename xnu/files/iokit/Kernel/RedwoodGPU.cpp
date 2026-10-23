@@ -65,6 +65,12 @@ uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, 
 extern uint32_t gpu_log;
 bool redwood_gpu_done(uint32_t fence);
 bool redwood_gpu_interrupts(void);
+uint32_t redwood_gpu_level_count(void);
+uint32_t redwood_gpu_level_khz(uint32_t level);
+bool redwood_gpu_set_level(uint32_t level);
+uint64_t redwood_gpu_load(void);
+int32_t redwood_gpu_temperature(void);
+extern uint32_t gpu_dcvs, gpu_hot;
 void redwood_gpu_sleep(uint32_t fence, uint64_t until);
 uint32_t redwood_gpu_last(void);
 void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
@@ -209,7 +215,6 @@ struct redwood_worked {
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
-static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 static bool gGPUSaidSetIova;                    /* MSM_INFO_SET_IOVA has been refused out loud once */
 
@@ -221,6 +226,82 @@ static struct {
 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
 	uint64_t making;                        /* ... and the time it took to make the others */
 } gGPUStat;
+
+/*
+ * gpu_dcvs: every GPU_SPEED_MS the core's speed follows what it has worked in that time (the core's own clock
+ * at each end of every submission, redwood_gpu_load()): straight to the top above GPU_SPEED_UP percent, and
+ * one level down only after GPU_SPEED_CALM periods in a row under GPU_SPEED_DOWN -- a frame that waits for a
+ * slow GPU is seen at once, a GPU kept fast a moment too long is not (one step at a time each way, every 100
+ * ms, cost 9% of the frames of a busy second their refresh, log 192913). Never above the lowest level while
+ * the hotter of its sensors reads gpu_hot or more, and until it is 5 degrees under it again. Only the levels
+ * the GMU was given at its start (redwood_adreno.c: 305, 400, 525 MHz on the OnePlus 8).
+ */
+#define GPU_SPEED_MS            50
+#define GPU_SPEED_UP            50
+#define GPU_SPEED_DOWN          25
+#define GPU_SPEED_CALM          4
+static thread_call_t gSpeedCall;
+static uint32_t gSpeedLevel;            /* (gGPULock) the level asked for last */
+static bool gSpeedHot;                  /* (gGPULock) held at the lowest for the heat */
+static uint32_t gSpeedTime[4];          /* (gGPULock) GPU_SPEED_MS periods at each level, since the last five-second line */
+static uint32_t gSpeedChanges;
+static uint32_t gSpeedCalm;             /* (gGPULock) periods in a row under GPU_SPEED_DOWN */
+static uint64_t gSpeedSlowest;          /* (gGPULock) the longest a change took, since the last five-second line */
+static bool gGPUReported;
+
+static void
+gpuSpeed(thread_call_param_t, thread_call_param_t)
+{
+	uint64_t deadline;
+	bool again = true;
+
+	IOLockLock(gGPULock);
+	if (!redwood_gpu_ready()) {
+		again = false;
+	} else if (!gGPUReported) {
+		uint32_t busy = (uint32_t) (redwood_gpu_load() * 100 / (19200ull * GPU_SPEED_MS)), want = gSpeedLevel;
+		int32_t tenths = redwood_gpu_temperature();
+		uint32_t top = redwood_gpu_level_count() - 1;
+
+		if (!gSpeedHot && tenths >= (int32_t) gpu_hot) {
+			gSpeedHot = true;
+			IOLog("RedwoodGPU: the GPU reads %d.%d degrees: held at %u MHz\n", tenths / 10, tenths % 10,
+			    redwood_gpu_level_khz(1) / 1000);
+		} else if (gSpeedHot && tenths < (int32_t) gpu_hot - 50) {
+			gSpeedHot = false;
+			IOLog("RedwoodGPU: the GPU reads %d.%d degrees: its speed follows its load again\n", tenths / 10, tenths % 10);
+		}
+		gSpeedCalm = busy < GPU_SPEED_DOWN ? gSpeedCalm + 1 : 0;
+		if (busy > GPU_SPEED_UP) {
+			want = top;
+		} else if (gSpeedCalm >= GPU_SPEED_CALM && want > 1) {
+			want--;
+			gSpeedCalm = 0;
+		}
+		if (gSpeedHot) {
+			want = 1;
+		}
+		if (want != gSpeedLevel) {
+			uint64_t began = mach_absolute_time();
+
+			if (redwood_gpu_set_level(want)) {
+				gSpeedLevel = want;
+				gSpeedChanges++;
+				gSpeedSlowest = mach_absolute_time() - began > gSpeedSlowest ? mach_absolute_time() - began : gSpeedSlowest;
+			} else {
+				IOLog("RedwoodGPU: the GMU does not take speed %u (%u MHz): the speed stays where it is\n", want,
+				    redwood_gpu_level_khz(want) / 1000);
+				again = false;
+			}
+		}
+		gSpeedTime[gSpeedLevel < 4 ? gSpeedLevel : 0]++;
+	}
+	IOLockUnlock(gGPULock);
+	if (again) {
+		clock_interval_to_deadline(GPU_SPEED_MS, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gSpeedCall, deadline);
+	}
+}
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
@@ -380,12 +461,19 @@ RedwoodGPUStart(void)
 		IOLog("RedwoodGPU: the service did not start\n");
 	}
 	gpu->release();
+	if (gpu_dcvs && (gSpeedCall = thread_call_allocate(gpuSpeed, NULL)) != NULL) {
+		gSpeedLevel = redwood_gpu_level_count() - 1;    /* (where step 17 left it) */
+		gpuSpeed(NULL, NULL);
+	}
 }
 
 /* The run is ending (redwood_adreno.c): nobody is in the middle of anything when the GPU goes. */
 void
 RedwoodGPUStop(void)
 {
+	if (gSpeedCall != NULL) {
+		thread_call_cancel_wait(gSpeedCall);   /* (before the lock: it takes it) */
+	}
 	IOLockLock(gGPULock);
 	redwood_gpu_stop();
 	IOLockUnlock(gGPULock);
@@ -1107,6 +1195,21 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
 		    fBufferBytes >> 20);
+		if (gSpeedCall != NULL) {
+			uint32_t periods = gSpeedTime[1] + gSpeedTime[2] + gSpeedTime[3];
+
+			uint64_t slowest;
+
+			absolutetime_to_nanoseconds(gSpeedSlowest, &slowest);
+			IOLog("RedwoodGPU: speed (gpu_dcvs): %u%% of the time at %u MHz, %u%% at %u, %u%% at %u; %u changes, the "
+			    "longest %llu us%s\n", periods ? gSpeedTime[1] * 100 / periods : 0, redwood_gpu_level_khz(1) / 1000,
+			    periods ? gSpeedTime[2] * 100 / periods : 0, redwood_gpu_level_khz(2) / 1000,
+			    periods ? gSpeedTime[3] * 100 / periods : 0, redwood_gpu_level_khz(3) / 1000, gSpeedChanges,
+			    slowest / 1000, gSpeedHot ? "; held low for the heat" : "");
+			bzero(gSpeedTime, sizeof(gSpeedTime));
+			gSpeedChanges = 0;
+			gSpeedSlowest = 0;
+		}
 		if (gpu_va != 0) {
 			/*
 			 * The address space itself, because nothing else said anything about it: what
