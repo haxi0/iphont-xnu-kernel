@@ -63,6 +63,12 @@ need python3 "everywhere"
 need git "everywhere"
 need curl "to fetch iOS, XNU and dependencies"
 need 7z "by ios165/fetch.sh (7-Zip 23+, reads APFS)"
+# 7-Zip before 23 does not read APFS: it lists the image as raw partitions and fetch.sh finds no files
+if command -v 7z >/dev/null 2>&1; then
+	v=$(7z 2>&1 | grep -m1 -oE '[0-9]+\.[0-9]+' || true)
+	[ "${v%%.*}" -ge 23 ] 2>/dev/null ||
+		{ printf '  %-22s %s -- needed 23 or newer by ios165/fetch.sh (reads APFS)\n' 7z "${v:-unknown version}"; MISSING=1; }
+fi
 need gcc "by ios165/fetch.sh (builds the LZBITMAP decoder)"
 need qemu-system-aarch64 "to run in QEMU (DEVICE=qemu-virt)"
 need fastboot "to boot a phone"

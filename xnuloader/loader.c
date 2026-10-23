@@ -3933,6 +3933,10 @@ usb_command_loop(void)
  */
 #define PHONE_WIDTH     1125            /* the screen of the iPhone X, whose identity we carry */
 #define PHONE_HEIGHT    2436
+/* HACKIOS_RAMFB_HEIGHT: QEMU's ramfb refuses a mode taller than 2048 (bochs-vbe's
+ * VBE_DISPI_MAX_YRES), so the panel is asked for 2048 rows and the kernel scales the
+ * 1125x2436 display into it -- the same thing it does on a real phone. */
+#define RAMFB_HEIGHT    2048
 #define FW_CFG_BASE     0x09020000ULL   /* QEMU virt: data at +0, selector at +8, DMA address at +16 */
 #define FW_CFG_FILE_DIR 0x19
 #define FW_CFG_DMA_SELECT 0x08
@@ -3969,7 +3973,7 @@ ramfb_phone_screen(void)
 		char name[56];
 	} file;
 	uint32_t count, select = 0;
-	uint64_t fb = 0, bytes = (uint64_t)PHONE_WIDTH * 4 * PHONE_HEIGHT;
+	uint64_t fb = 0, bytes = (uint64_t)PHONE_WIDTH * 4 * RAMFB_HEIGHT;
 
 	*(volatile uint16_t *)(FW_CFG_BASE + 8) = __builtin_bswap16(FW_CFG_FILE_DIR);
 	fw_cfg_read(&count, sizeof(count));
@@ -3988,19 +3992,22 @@ ramfb_phone_screen(void)
 	cfg.fourcc = be32(0x34325258);          /* 'XR24': blue, green, red, unused */
 	cfg.flags = 0;
 	cfg.width = be32(PHONE_WIDTH);
-	cfg.height = be32(PHONE_HEIGHT);
+	cfg.height = be32(RAMFB_HEIGHT);
 	cfg.stride = be32(PHONE_WIDTH * 4);
 	dma.control = be32(select << 16 | FW_CFG_DMA_SELECT | FW_CFG_DMA_WRITE);
 	dma.length = be32(sizeof(cfg));
 	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
 	*(volatile uint64_t *)(FW_CFG_BASE + 16) = __builtin_bswap64((uint64_t)(uintptr_t)&dma);
 	if (dma.control != 0) {
-		print("ramfb: control %x after the request\n", (uint64_t)be32(dma.control));
-		return;
+		/* HACKIOS: this is the value we wrote ourselves; nothing writes back into it, so it
+		 * says nothing about whether the request worked. QEMU's ramfb refuses a mode taller
+		 * than 2048 (VBE_DISPI_MAX_YRES), and the mode it takes is the one in the panel. */
+		print("ramfb: control %x after the request (the mode is taken as it stands)\n",
+		    (uint64_t)be32(dma.control));
 	}
 	SCREEN.base = fb;
 	SCREEN.width = PHONE_WIDTH;
-	SCREEN.height = PHONE_HEIGHT;
+	SCREEN.height = RAMFB_HEIGHT;
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
