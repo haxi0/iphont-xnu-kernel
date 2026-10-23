@@ -3,8 +3,9 @@
  * IOMobileFramebuffer.framework (and through it by CoreAnimation's window server).
  *
  * The display is the framebuffer the boot loader left us (the one the kernel's text console
- * draws on). There is no hardware behind it that we drive: a "swap" copies the pixels of the
- * surfaces of its layers into that memory, and "vsync" is a timer.
+ * draws on). A "swap" copies the pixels of the surfaces of its layers into that memory, and
+ * "vsync" is a timer. On the OnePlus 8 the copy is then pushed to the panel by its MDP on the
+ * panel's TE (fb_push, below); elsewhere the hardware rereads the memory on its own.
  *
  * The protocol (selectors and the layout of the swap request) was worked out from the
  * user-space side of iOS 16.5. Everything not implemented is logged once.
@@ -83,7 +84,7 @@ enum {
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
-#define SWAP_GPU_MS             500                     /* a frame the GPU has not drawn by then is shown as it is */
+#define SWAP_GPU_MS             500                     /* discard a frame whose GPU fence does not complete */
 #define SWAP_HELD_MS            700                     /* a swap that cannot be taken by then is not shown at all */
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
@@ -186,15 +187,543 @@ micros(uint64_t absolute)
 	return ns / 1000;
 }
 
+static uint32_t gPanelHz;               /* the OnePlus 8 without fb_hz=: its panel's 90 (start()) */
+
 static inline uint32_t
 refreshHz(void)
 {
+	if (gPanelHz != 0) {
+		return gPanelHz;
+	}
 	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
 }
+
+/* SM8250 handoff capture (fb_probe=1). Offsets: live DTS and Linux dpu_6_0_sm8250,
+ * whose MDP-relative offsets start at MDSS + 0x1000. No scanout/DSC/TE writes. */
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern "C" void gic_v3_spi_mask(uint32_t intid);
+static vm_offset_t gDPU;
+
+static uint32_t
+displayReg(vm_offset_t base, unsigned offset)
+{
+	return *(volatile uint32_t *)(base + offset);
+}
+
+extern "C" void loader_log_line(const char *line);
+
+/* The loader's log keeps these; the kernel's own ring is overwritten by iOS long before the run ends. */
+static void
+displayLog(const char * format, ...)
+{
+	char line[512];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	loader_log_line(line);
+}
+
+static bool
+instantnoodle(void)
+{
+	char board[32] = "";
+
+	PE_parse_boot_argn("board", board, sizeof(board));
+	return strcmp(board, "instantnoodle") == 0;
+}
+
+/* The MDSS registers (gDPU), once: only on a display the firmware left powered, with its register clock on. */
+static bool
+mapDisplay(void)
+{
+	if (gDPU != 0) {
+		return true;
+	}
+	vm_offset_t gcc = ml_io_map(0x00100000, 0x10000);
+	uint32_t bus = displayReg(gcc, 0xb00c);
+
+	if (!(bus & 1)) {
+		displayLog("display: GCC_DISP_AHB_CLK %#x disabled\n", bus);
+		return false;
+	}
+	vm_offset_t cc = ml_io_map(0x0af00000, 0x4000);
+	uint32_t power = displayReg(cc, 0x3000), ahb = displayReg(cc, 0x2080);
+
+	displayLog("display: SM8250 GCC_DISP_AHB %#x GDSCR %#x MDSS_AHB %#x\n", bus, power, ahb);
+	if (!(power & (1u << 31))) {
+		displayLog("display: MDSS power off\n");
+		return false;
+	}
+	/* Enable only the register-access clock; never power up an inactive display. */
+	*(volatile uint32_t *)(cc + 0x2080) = ahb | 1;
+	__asm__ volatile ("dsb osh" ::: "memory");
+	unsigned retry;
+	for (retry = 0; retry < 1000 && (displayReg(cc, 0x2080) & (1u << 31)); retry++) {
+		IODelay(1);
+	}
+	if (retry == 1000) {
+		displayLog("display: MDSS register clock did not start\n");
+		return false;
+	}
+	gDPU = ml_io_map(0x0ae00000, 0x90000);
+	return true;
+}
+
+static void
+probeDisplay(void)
+{
+	uint32_t probe = 0;
+
+	PE_parse_boot_argn("fb_probe", &probe, sizeof(probe));
+	if (!probe || !instantnoodle() || !mapDisplay()) {
+		return;
+	}
+	displayLog("display: boot framebuffer pa %#llx %ux%u rowbytes %u\n", vinfo.v_physaddr, vinfo.v_width, vinfo.v_height,
+	    vinfo.v_rowbytes);
+	/* MDP top (MDSS + 0x1000): INTF_SEL, INTR_EN/STATUS, INTR2_EN/STATUS, VSYNC_SEL */
+	displayLog("display: HW %#x mdss-intr %#x INTF_SEL %#x INTR en %#x st %#x INTR2 en %#x st %#x VSYNC_SEL %#x\n",
+	    displayReg(gDPU, 0), displayReg(gDPU, 0x10), displayReg(gDPU, 0x1004), displayReg(gDPU, 0x1010),
+	    displayReg(gDPU, 0x1014), displayReg(gDPU, 0x1008), displayReg(gDPU, 0x100c), displayReg(gDPU, 0x1414));
+	for (unsigned i = 0; i < 6; i++) {
+		unsigned c = 0x2000 + i * 0x200;
+
+		displayLog("display: CTL%u top %#x flush %#x start %#x prep %#x intf %#x dsc %#x m3d %#x fetch %#x intf-flush %#x "
+		    "layers %#x %#x %#x %#x %#x %#x ext %#x %#x\n", i,
+		    displayReg(gDPU, c + 0x14), displayReg(gDPU, c + 0x18), displayReg(gDPU, c + 0x1c), displayReg(gDPU, c + 0xd0),
+		    displayReg(gDPU, c + 0xf4), displayReg(gDPU, c + 0xe8), displayReg(gDPU, c + 0xe4), displayReg(gDPU, c + 0xfc),
+		    displayReg(gDPU, c + 0x110), displayReg(gDPU, c), displayReg(gDPU, c + 4), displayReg(gDPU, c + 8),
+		    displayReg(gDPU, c + 12), displayReg(gDPU, c + 16), displayReg(gDPU, c + 0x24), displayReg(gDPU, c + 0x40),
+		    displayReg(gDPU, c + 0x44));
+	}
+	static const unsigned pipes[] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
+	for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
+		unsigned p = pipes[i];
+
+		displayLog("display: SSPP@%#x size %#x img %#x xy %#x out %#x oxy %#x addr %#x %#x stride %#x fmt %#x unpack %#x op %#x "
+		    "fetch %#x sw-status %#x\n", p,
+		    displayReg(gDPU, p), displayReg(gDPU, p + 4), displayReg(gDPU, p + 8), displayReg(gDPU, p + 0xc),
+		    displayReg(gDPU, p + 0x10), displayReg(gDPU, p + 0x14), displayReg(gDPU, p + 0x18), displayReg(gDPU, p + 0x24),
+		    displayReg(gDPU, p + 0x30), displayReg(gDPU, p + 0x34), displayReg(gDPU, p + 0x38), displayReg(gDPU, p + 0x48),
+		    displayReg(gDPU, p + 0x70));
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		unsigned l = 0x45000 + i * 0x1000, p = 0x71000 + i * 0x800;
+
+		displayLog("display: LM%u op %#x out %#x border %#x; PP%u te %#x dsc %#x autorefresh %#x line %#x\n", i,
+		    displayReg(gDPU, l), displayReg(gDPU, l + 4), displayReg(gDPU, l + 8), i, displayReg(gDPU, p),
+		    displayReg(gDPU, p + 0xa0), displayReg(gDPU, p + 0x30), displayReg(gDPU, p + 0x2c));
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned d = 0x81000 + i * 0x400;
+
+		displayLog("display: DSC%u common %#x enc %#x size %#x\n", i, displayReg(gDPU, d), displayReg(gDPU, d + 4),
+		    displayReg(gDPU, d + 0x14));
+	}
+	for (unsigned i = 1; i <= 2; i++) {
+		unsigned p = 0x6b000 + i * 0x800, t = 0x6e700 + i * 0x100;
+
+		displayLog("display: INTF%u engine %#x config %#x config2 %#x cmd-trigger %#x mux %#x status %#x intr en %#x st %#x "
+		    "tear-intr en %#x st %#x\n", i,
+		    displayReg(gDPU, p), displayReg(gDPU, p + 4), displayReg(gDPU, p + 0x60), displayReg(gDPU, p + 0x84),
+		    displayReg(gDPU, p + 0x25c), displayReg(gDPU, p + 0x26c), displayReg(gDPU, p + 0x1c0),
+		    displayReg(gDPU, p + 0x1c4), displayReg(gDPU, t), displayReg(gDPU, t + 4));
+		displayLog("display: INTF%u TE vsync-sel %#x en %#x vsync %#x height %#x wrcount %#x init %#x thresh %#x start %#x "
+		    "rd-irq %#x wr-irq %#x out %#x line %#x autorefresh %#x frame %u\n", i,
+		    displayReg(gDPU, p + 0x280), displayReg(gDPU, p + 0x284), displayReg(gDPU, p + 0x288), displayReg(gDPU, p + 0x28c),
+		    displayReg(gDPU, p + 0x290), displayReg(gDPU, p + 0x294), displayReg(gDPU, p + 0x29c), displayReg(gDPU, p + 0x2a0),
+		    displayReg(gDPU, p + 0x2a4), displayReg(gDPU, p + 0x2a8), displayReg(gDPU, p + 0x2ac), displayReg(gDPU, p + 0x2b0),
+		    displayReg(gDPU, p + 0x2b4), displayReg(gDPU, p + 0xac));
+	}
+	/* Is anything still moving on its own? Sample the INTF1 counters over 100 ms. */
+	for (unsigned i = 0; i < 5; i++) {
+		displayLog("display: t+%ums INTF1 frame %u line %u te-out %#x te-line %#x intr-st %#x tear-st %#x top-st %#x\n", i * 25,
+		    displayReg(gDPU, 0x6b8ac), displayReg(gDPU, 0x6b8b0), displayReg(gDPU, 0x6baac), displayReg(gDPU, 0x6bab0),
+		    displayReg(gDPU, 0x6b9c4), displayReg(gDPU, 0x6e804), displayReg(gDPU, 0x1014));
+		IODelay(25000);
+	}
+	/* Which address space the MDP fetches in: apps SMMU stream matches for its streams (0x820/0x821, mask 0x402).
+	 * Global registers only: reading the display's context bank or its tables sends the phone to CrashDump. */
+	vm_offset_t smmu = ml_io_map(0x15000000, 0x2000);
+	uint32_t scr0 = displayReg(smmu, 0), matches = displayReg(smmu, 0x20) & 0xff, wide = scr0 & (1u << 3);
+	displayLog("display: apps SMMU scr0 %#x, %u stream matches\n", scr0, matches);
+	for (uint32_t n = 0; n < matches && n < 256; n++) {
+		uint32_t smr = displayReg(smmu, 0x800 + 4 * n), s2cr = displayReg(smmu, 0xc00 + 4 * n);
+		uint32_t id = smr & (wide ? 0xffff : 0x7fff), mask = (smr >> 16) & (wide ? 0xffff : 0x7fff);
+		bool valid = wide ? (s2cr & (1u << 10)) : (smr >> 31);
+
+		if (valid && (((id ^ 0x820) & ~(mask | 0x403)) == 0)) {
+			displayLog("display: SMR%u id %#x mask %#x s2cr %#x (type %u cb %u)\n", n, id, mask, s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
+		}
+	}
+}
+
+/*
+ * SM8250 command-mode presentation (instantnoodle; boot-arg fb_push=0: the old way).
+ * The firmware leaves CTL0 -> VIG0/VIG1 -> LM0/LM1 -> dual DSC -> INTF1 in command mode, with INTF1's
+ * tear check on and autorefresh fetching the boot framebuffer on every TE (fb_probe=1 shows it), so a
+ * CPU copy into that memory is sent to the panel half written. Instead autorefresh goes off and each
+ * frame is pushed once, after its copy (CTL0 flush + start): the tear check holds the transfer to the
+ * panel's TE, and PINGPONG_0's done interrupt says when the memory may be written again. The panel
+ * keeps showing its own RAM in between. Offsets are MDSS-relative (Linux dpu_6_0_sm8250 + 0x1000).
+ */
+#define MDP_INTR_EN             0x1010
+#define MDP_INTR_STATUS         0x1014
+#define MDP_INTR_CLEAR          0x1018
+#define MDP_INTR_PP0_DONE       (1u << 8)
+#define CTL0_TOP                0x2014
+#define CTL0_FLUSH              0x2018
+#define CTL0_START              0x201c
+#define CTL0_INTF_ACTIVE        0x20f4
+#define CTL_TOP_CMD_MODE        (1u << 17)
+#define CTL_FLUSH_FRAME         (1u << 0 | 1u << 1 | 1u << 17)  /* VIG0, VIG1, the CTL itself */
+#define VIG0_SRC0_ADDR          0x5014
+#define VIG1_SRC0_ADDR          0x7014
+#define INTF1_TE_EN             0x6ba84
+#define INTF1_TE_VSYNC          0x6ba88
+#define INTF1_TE_EXTERNAL       (1u << 20)
+#define INTF1_TE_LINE           0x6bab0
+#define INTF1_AUTOREFRESH       0x6bab4
+#define MDSS_INTID              (83 + 32)
+#define INTF1_TEAR_INTR_EN      0x6e800         /* (MDP_INTF_TEAR_OFF(1)) */
+#define INTF1_TEAR_INTR_STATUS  0x6e804
+#define INTF1_TEAR_INTR_CLEAR   0x6e808
+#define TEAR_RD_PTR             (1u << 2)       /* the panel's read pointer at rd_ptr_irq: once a TE */
+#define PUSH_TIMEOUT_MS         100                     /* six refreshes: the panel or the MDP has stopped */
+
+static TUNABLE(uint32_t, gPush, "fb_push", 2);   /* 2: two framebuffers, 1: one, 0: the firmware's autorefresh */
+static TUNABLE(uint32_t, gPushIrq, "fb_push_irq", 1);   /* 0: PINGPONG_0's done bit polled, the MDSS interrupt left alone */
+static uint32_t gAutorefresh;           /* the firmware's setting, back for the loader (redwood_display_quiesce) */
+/*
+ * fb_push=2: a second framebuffer at DOUBLE_PHYS (in the firmware's display region, below the DFPS data at
+ * 0x9e300000; the display SMMU maps it, seen on the phone): a frame is copied into the one the panel is not
+ * being sent while the other is, and the pipes are pointed at it with the push.
+ */
+#define DOUBLE_PHYS             0x9ca00000ull
+static bool gDouble;
+static uint32_t gTeVsync;               /* INTF1's TE counter setting from the firmware; 0: not changed */
+static bool gPushing;                   /* autorefresh off: frames are pushed */
+static uint64_t gPushed;                /* when the last push was started; 0: none in flight */
+static uint64_t gPushDone;              /* when PINGPONG_0 finished it (interrupt); 0: not yet */
+static uint32_t gPushId;                /* the swap it carries (touch_lat=1 lines) */
+static bool gPushIrqLive;               /* the interrupt owns the done bit; false: pushWait() polls and clears it */
+static uint32_t gPushIrqEmpty;          /* interrupts in a row with nothing of ours pending */
+/*
+ * The panel's TE as it happens (the tear check's read-pointer interrupt): the last one and the measured
+ * period, for the window server's frame clock to follow the panel instead of a timer of its own, which
+ * drifts against it and every so often lets a frame miss its refresh (IOMobileFramebufferUserClient::armVSync()).
+ */
+static uint64_t gTeTime, gTePeriod;
+
+static void
+displayWrite(unsigned offset, uint32_t value)
+{
+	*(volatile uint32_t *)(gDPU + offset) = value;
+}
+
+/* Interrupt context: take PINGPONG_0's done, wake the presenter. Anything else of the MDSS is not ours. */
+static void
+pushInterrupt(void * context __unused, uint32_t intid)
+{
+	uint32_t status = displayReg(gDPU, MDP_INTR_STATUS) & displayReg(gDPU, MDP_INTR_EN);
+	uint32_t tear = displayReg(gDPU, INTF1_TEAR_INTR_STATUS) & displayReg(gDPU, INTF1_TEAR_INTR_EN);
+
+	if (tear != 0) {
+		uint64_t now = mach_absolute_time(), last = gTeTime, period = gTePeriod;
+
+		displayWrite(INTF1_TEAR_INTR_CLEAR, tear);
+		if (last != 0 && now - last > period / 2 && now - last < period * 3 / 2) {
+			__atomic_store_n(&gTePeriod, (period * 7 + (now - last)) / 8, __ATOMIC_RELAXED);
+		}
+		__atomic_store_n(&gTeTime, now, __ATOMIC_RELEASE);
+		gPushIrqEmpty = 0;
+		if (status == 0) {
+			return;
+		}
+	}
+	if (status == 0) {
+		/* a source of the MDSS that is not ours holds the line: give the interrupt up, the presenter polls */
+		if (++gPushIrqEmpty == 64) {
+			gic_v3_spi_mask(intid);
+			__atomic_store_n(&gPushIrqLive, false, __ATOMIC_RELEASE);
+		}
+		return;
+	}
+	gPushIrqEmpty = 0;
+	displayWrite(MDP_INTR_CLEAR, status);
+	if (status & MDP_INTR_PP0_DONE) {
+		__atomic_store_n(&gPushDone, mach_absolute_time(), __ATOMIC_RELEASE);
+		thread_wakeup((event_t) &gPushDone);
+	}
+}
+
+/* The panel shows the boot framebuffer again on its own (to give the display back, or after a failure). */
+static void
+pushStop(void)
+{
+	displayWrite(MDP_INTR_EN, displayReg(gDPU, MDP_INTR_EN) & ~MDP_INTR_PP0_DONE);
+	displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) & ~TEAR_RD_PTR);
+	gTeTime = 0;
+	if (gTeVsync != 0) {
+		displayWrite(INTF1_TE_VSYNC, gTeVsync);         /* (the panel stays at 90 Hz: TE resynchronizes the count) */
+	}
+	if (gDouble) {
+		/* the boot framebuffer again, latched by the first autorefresh frame */
+		displayWrite(VIG0_SRC0_ADDR, (uint32_t) vinfo.v_physaddr);
+		displayWrite(VIG1_SRC0_ADDR, (uint32_t) vinfo.v_physaddr);
+		displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME);
+		gDouble = false;
+	}
+	displayWrite(INTF1_AUTOREFRESH, gAutorefresh);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gPushing = false;
+}
+
+/*
+ * 90 Hz (boot-arg fb_hz=90): the panel's own switch, as Android's device tree sends it for timing@1 of
+ * "samsung ana6705 fhd cmd mode dsc dsi panel" (timing@0 is 60 Hz: 60 00 and e6 02). The DSI clock is
+ * the same for both; the panel paces TE. DCS long writes through DSI0's command DMA (Linux dsi_host.c,
+ * 6G registers 4 bytes in). The DMA reads through the display SMMU, so the packets go in the boot
+ * framebuffer's last page past its last pixel, mapped with it.
+ */
+#define DSI0_PHYS               0x0ae94000
+#define DSI_REG(offset)         ((offset) + 4)
+#define DSI_CTRL                DSI_REG(0x000)
+#define DSI_CMD_DMA_CTRL        DSI_REG(0x038)
+#define DSI_CMD_DMA_LOW_POWER   (1u << 26)
+#define DSI_DMA_BASE            DSI_REG(0x044)
+#define DSI_DMA_LEN             DSI_REG(0x048)
+#define DSI_TRIG_CTRL           DSI_REG(0x080)
+#define DSI_TRIG_DMA            DSI_REG(0x08c)
+#define DSI_INTR_CTRL           DSI_REG(0x10c)
+#define DSI_CMD_DMA_DONE        (1u << 0)
+#define INTF1_TE_COUNT          0x6ba98         /* [31:16] TEs seen (INTF_TEAR_INT_COUNT_VAL) */
+
+static const uint8_t k90Hz[] = {                /* length, then the bytes: one DCS long write each */
+	3, 0xf0, 0x5a, 0x5a, 2, 0x60, 0x10, 3, 0xf0, 0xa5, 0xa5, 3, 0xf0, 0x5a, 0x5a, 2, 0xb0, 0x69,
+	2, 0xe6, 0x00, 2, 0xb0, 0x77, 2, 0xe6, 0xb3, 3, 0xf0, 0xa5, 0xa5, 0,
+};
+static const uint8_t k60Hz[] = {                /* timing@0: back to the firmware's rate (the panel keeps 90 across runs) */
+	3, 0xf0, 0x5a, 0x5a, 2, 0x60, 0x00, 3, 0xf0, 0xa5, 0xa5, 3, 0xf0, 0x5a, 0x5a, 2, 0xb0, 0x69,
+	2, 0xe6, 0x02, 2, 0xb0, 0x77, 2, 0xe6, 0xb3, 3, 0xf0, 0xa5, 0xa5, 0,
+};
+
+/* TEs in 100 ms, from INTF1's read pointer counter (it counts the panel's TE pulses). */
+static unsigned
+teRate(void)
+{
+	uint32_t before = displayReg(gDPU, INTF1_TE_COUNT) >> 16;
+
+	IODelay(100000);
+	return (((displayReg(gDPU, INTF1_TE_COUNT) >> 16) - before) & 0xffff) * 10;
+}
+
+static bool
+dsiSend(vm_offset_t dsi, const uint8_t * bytes, unsigned n)
+{
+	size_t frame = (size_t) vinfo.v_rowbytes * vinfo.v_height;
+	volatile uint8_t * buffer = (volatile uint8_t *) (vinfo.v_baseaddr + frame);
+	unsigned length = (4 + n + 3) & ~3u, waited;
+
+	if (round_page(frame) - frame < 64) {
+		return false;
+	}
+	buffer[0] = (uint8_t) n;                /* MSM order: word count, then the data type; last packet, long */
+	buffer[1] = 0;
+	buffer[2] = 0x39;
+	buffer[3] = 0xc0;
+	for (unsigned i = 0; i < length - 4; i++) {
+		buffer[4 + i] = i < n ? bytes[i] : 0xff;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(dsi + DSI_INTR_CTRL) = displayReg(dsi, DSI_INTR_CTRL);      /* pending status written back: cleared */
+	*(volatile uint32_t *)(dsi + DSI_DMA_BASE) = (uint32_t) (vinfo.v_physaddr + frame);
+	*(volatile uint32_t *)(dsi + DSI_DMA_LEN) = length;
+	*(volatile uint32_t *)(dsi + DSI_TRIG_DMA) = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (waited = 0; waited < 2000 && !(displayReg(dsi, DSI_INTR_CTRL) & DSI_CMD_DMA_DONE); waited++) {
+		IODelay(10);
+	}
+	*(volatile uint32_t *)(dsi + DSI_INTR_CTRL) = displayReg(dsi, DSI_INTR_CTRL);
+	return waited < 2000;
+}
+
+/*
+ * No transfer in flight (pushStart()): the panel to `hz` (60 or 90) if it is not there already, INTF1's TE
+ * counter to match (the firmware's setting is for 60).
+ */
+static void
+panelRate(unsigned hz)
+{
+	vm_offset_t dsi = ml_io_map(DSI0_PHYS, 0x1000);
+	uint32_t ctrl = displayReg(dsi, DSI_CTRL), trig = displayReg(dsi, DSI_TRIG_CTRL), dma = displayReg(dsi, DSI_CMD_DMA_CTRL);
+	unsigned before = teRate(), sent = 0;
+	uint32_t vsync = displayReg(gDPU, INTF1_TE_VSYNC), count = vsync & 0x7ffff;
+
+	if (hz == 90) {
+		gTeVsync = vsync;
+		displayWrite(INTF1_TE_VSYNC, (vsync & ~0x7ffffu) | (count * 60 / 90));
+	}
+	if (before + 10 > hz && before < hz + 10) {
+		return;                 /* (already: the panel keeps its rate from the run before) */
+	}
+	if (!(ctrl & 1) || !(ctrl & (1u << 2)) || (trig & 7) != 4) {
+		displayLog("display: DSI0 not in command mode with software-triggered DMA (ctrl %#x trig %#x); the panel stays at %u Hz\n",
+		    ctrl, trig, before);
+		return;
+	}
+	*(volatile uint32_t *)(dsi + DSI_CMD_DMA_CTRL) = dma & ~DSI_CMD_DMA_LOW_POWER;     /* "dsi_hs_mode" */
+	for (const uint8_t * c = hz == 90 ? k90Hz : k60Hz; *c != 0 && dsiSend(dsi, c + 1, *c); c += 1 + *c) {
+		sent++;
+	}
+	*(volatile uint32_t *)(dsi + DSI_CMD_DMA_CTRL) = dma;
+	displayLog("display: %u Hz: %u of 9 DSI commands sent (ctrl %#x trig %#x dma %#x); TE %u Hz before, %u Hz after\n",
+	    hz, sent, ctrl, trig, dma, before, teRate());
+}
+
+/* Autorefresh off, the transfer it may be in the middle of finished (Linux dpu_hw_intf_disable_autorefresh). */
+static bool
+pushStart(unsigned height)
+{
+	if (!gPush || !instantnoodle() || !mapDisplay()) {
+		return false;
+	}
+	uint32_t top = displayReg(gDPU, CTL0_TOP), intf = displayReg(gDPU, CTL0_INTF_ACTIVE);
+	uint32_t vig0 = displayReg(gDPU, VIG0_SRC0_ADDR), vig1 = displayReg(gDPU, VIG1_SRC0_ADDR), te = displayReg(gDPU, INTF1_TE_EN);
+
+	gAutorefresh = displayReg(gDPU, INTF1_AUTOREFRESH);
+	if (!(top & CTL_TOP_CMD_MODE) || intf != 0x2 || vig0 != vinfo.v_physaddr || vig1 != vinfo.v_physaddr || !(te & 1)) {
+		displayLog("display: not the command-mode pipeline expected (CTL0 top %#x intf %#x, VIG %#x %#x, TE %#x); "
+		    "frames go on being copied under autorefresh\n", top, intf, vig0, vig1, te);
+		return false;
+	}
+	uint32_t vsync = displayReg(gDPU, INTF1_TE_VSYNC);
+	unsigned waited;
+
+	displayWrite(INTF1_TE_VSYNC, vsync & ~INTF1_TE_EXTERNAL);
+	displayWrite(INTF1_AUTOREFRESH, gAutorefresh & ~(1u << 31));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (waited = 0; waited < PUSH_TIMEOUT_MS * 10; waited++) {
+		uint32_t line = displayReg(gDPU, INTF1_TE_LINE) & 0xffff;
+
+		if (line == 0 || line >= height) {
+			break;
+		}
+		IODelay(100);
+	}
+	displayWrite(INTF1_TE_VSYNC, vsync);
+	if (waited == PUSH_TIMEOUT_MS * 10) {
+		displayLog("display: the autorefresh frame did not finish; autorefresh back on\n");
+		displayWrite(INTF1_AUTOREFRESH, gAutorefresh);
+		return false;
+	}
+	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+	if (gPushIrq) {
+		displayWrite(MDP_INTR_EN, displayReg(gDPU, MDP_INTR_EN) | MDP_INTR_PP0_DONE);
+		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &gTePeriod);
+		displayWrite(INTF1_TEAR_INTR_CLEAR, TEAR_RD_PTR);
+		displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) | TEAR_RD_PTR);
+		gPushIrqLive = gic_v3_spi_attach(MDSS_INTID, false, pushInterrupt, NULL) == KERN_SUCCESS;
+		if (!gPushIrqLive) {
+			displayLog("display: MDSS interrupt %u taken; the done bit is polled\n", MDSS_INTID);
+		}
+	}
+	gPushing = true;
+	if (refreshHz() == 90 || refreshHz() == 60) {
+		panelRate(refreshHz());
+	}
+	displayLog("display: autorefresh %#x off after %u us; each frame is pushed through CTL0 on the panel's TE (%s)\n",
+	    gAutorefresh, waited * 100, gPushIrqLive ? "interrupt" : "polled");
+	return true;
+}
+
+/* Wait until no push is in flight: the framebuffer is the MDP's while one is. false: it never finished. */
+static bool
+pushWait(void)
+{
+	uint64_t pushed = gPushed, deadline;
+
+	if (pushed == 0) {
+		return true;
+	}
+	clock_interval_to_deadline(PUSH_TIMEOUT_MS, kMillisecondScale, &deadline);
+	for (;;) {
+		uint64_t step;
+
+		clock_interval_to_deadline(2, kMillisecondScale, &step);
+		assert_wait_deadline((event_t) &gPushDone, THREAD_UNINT, step < deadline ? step : deadline);
+		if (!__atomic_load_n(&gPushIrqLive, __ATOMIC_ACQUIRE) && __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) == 0 &&
+		    (displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE)) {
+			/* (no interrupt: polled; clearing the bit under a live interrupt would take its done away) */
+			displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+			__atomic_store_n(&gPushDone, mach_absolute_time(), __ATOMIC_RELEASE);
+		}
+		if (__atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) != 0 || mach_absolute_time() >= deadline) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			break;
+		}
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+	uint64_t done = __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE);
+
+	gPushed = 0;
+	if (done == 0) {
+		return false;
+	}
+	if (gTouchLat) {
+		redwood_tl("tl: k %u kick %llu done %llu\n", gPushId, micros(pushed), micros(done));
+	}
+	return true;
+}
+
+/* The frame in the framebuffer to the panel. Every processor that wrote it has drained its stores (drawRows()). */
+static void
+pushFrame(uint32_t swap, uint64_t buffer)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (gDouble) {
+		displayWrite(VIG0_SRC0_ADDR, (uint32_t) buffer);
+		displayWrite(VIG1_SRC0_ADDR, (uint32_t) buffer);
+	}
+	__atomic_store_n(&gPushDone, 0, __ATOMIC_RELEASE);
+	gPushId = swap;
+	gPushed = mach_absolute_time();
+	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+	displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME);
+	displayWrite(CTL0_START, 1);
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Back to the loader (loader_return.c), from any context: the panel refreshing from the boot framebuffer again. */
+extern "C" void
+redwood_display_quiesce(void)
+{
+	if (!gPushing) {
+		return;
+	}
+	for (unsigned i = 0; i < PUSH_TIMEOUT_MS * 10 && gPushed != 0 &&
+	    !(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE) && __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) == 0; i++) {
+		IODelay(100);
+	}
+	pushStop();
+}
+
 static inline uint32_t
 recStep(void)
 {
 	return gRecStep >= 2 && gRecStep <= 8 ? gRecStep : 3;
+}
+
+static void
+traceScanout(uint32_t swap, const char *stage)
+{
+	if (gDPU != 0 && gTouchLat) {
+		redwood_tl("tl: h %u %s at %llu intf1 frame %u line %u out %#x count %#x\n", swap, stage,
+		    micros(mach_absolute_time()), displayReg(gDPU, 0x6b8ac), displayReg(gDPU, 0x6b8b0),
+		    displayReg(gDPU, 0x6baac), displayReg(gDPU, 0x6bab0));
+	}
 }
 #define REC_STEP        recStep()
 
@@ -252,6 +781,9 @@ public:
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
 	unsigned        fSwapFirst, fSwapsWaiting;
+	uint64_t        fSwapsQueued, fSwapsCopied;   /* (fSwapLock) swaps handed over; and done with their surfaces */
+	uint32_t        fLastSurface;           /* (fSwapLock) layer 0's surface in the last swap ... */
+	bool            fAlternating;           /* ... another than in the swap before, and no other layer */
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
 	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
@@ -294,6 +826,12 @@ public:
 	uint64_t        fFirstFrame, fRecFirst; /* when the first frame was shown, and the first recorded */
 	bool            fRecDone;
 	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
+	uint32_t        fStatRaced;             /* frames whose surface the GPU was given work on while being copied */
+	uint8_t *       fBuffer[2];             /* fb_push=2: the two framebuffers, and which is written next */
+	uint64_t        fBufferPhys[2];
+	IOMemoryMap *   fBufferMap;             /* ... the second one's mapping, kept */
+	unsigned        fBack;
+	bool            fPushTried;             /* pushStart() asked, at the first frame (the console draws until then) */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
@@ -301,10 +839,14 @@ public:
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void presenter(void);
+	void dequeueSwap(void);
+	void waitCopied(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+	void drawShare(const struct RowJob * job, uint32_t * blendRow);
+	int32_t         fNextRow;               /* (drawShare()) the first row nobody has taken yet */
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
@@ -381,6 +923,31 @@ IOMobileFramebuffer::publishModes(void)
 
 	setProperty("TimingElements", timings);
 	setProperty("ColorElements", colors);
+	/*
+	 * The window server's frame period for the built-in panel comes from here, not from the timings
+	 * (QuartzCore windowserver-apple-display.cpp; without it, 1/60 s whatever SyncRate says): the
+	 * shortest interval between refreshes, in 2^-32 s (given the mach time of 1/90 s, 213333, it took
+	 * 49.7 us), and the step between possible ones, in mach time. One fixed rate: both the period.
+	 */
+	if (refreshHz() != kFBRefreshHz) {
+		OSDictionary * refresh = OSDictionary::withCapacity(2);
+		uint64_t period;
+
+		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+		if (refresh != NULL) {
+			OSNumber * interval = OSNumber::withNumber((1ULL << 32) / refreshHz(), 64);
+			OSNumber * step = OSNumber::withNumber(period, 64);
+
+			if (interval != NULL && step != NULL) {
+				refresh->setObject("displayMinRefreshInterval", interval);
+				refresh->setObject("displayRefreshStepMachTime", step);
+			}
+			OSSafeReleaseNULL(interval);
+			OSSafeReleaseNULL(step);
+			setProperty("IOMFBDisplayRefresh", refresh);
+			refresh->release();
+		}
+	}
 	OSSafeReleaseNULL(timings);
 	OSSafeReleaseNULL(colors);
 	OSSafeReleaseNULL(timing);
@@ -424,6 +991,11 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
+	probeDisplay();
+	uint32_t hz;
+	if (instantnoodle() && gPush != 0 && !PE_parse_boot_argn("fb_hz", &hz, sizeof(hz))) {
+		gPanelHz = 90;                  /* (fb_hz=60: the firmware's rate) */
+	}
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -674,6 +1246,27 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			}
 		}
 	}
+	/* the framebuffer is write-combined: this processor's rows reach memory before the frame is pushed */
+	__asm__ volatile ("dsb st" ::: "memory");
+}
+
+/*
+ * Rows of a job in turns of ROW_SHARE, until there are none: a processor that is slower (a small core) or
+ * taken by another thread does fewer, instead of the whole copy waiting for its fixed third.
+ */
+#define ROW_SHARE               48
+
+void
+IOMobileFramebuffer::drawShare(const RowJob * job, uint32_t * blendRow)
+{
+	for (;;) {
+		int32_t y = __atomic_fetch_add(&fNextRow, ROW_SHARE, __ATOMIC_RELAXED);
+
+		if (y >= job->py1) {
+			return;
+		}
+		drawRows(job, y, y + ROW_SHARE < job->py1 ? y + ROW_SHARE : job->py1, blendRow);
+	}
 }
 
 /* A helper of the scaling (fb_threads): waits for rows to do, does them, says so. */
@@ -689,7 +1282,6 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 	IOLockUnlock(fb->fHelperLock);
 	for (;;) {
 		const RowJob * job;
-		int32_t rows, y0, y1;
 		uint32_t * blend;
 
 		IOLockLock(fb->fHelperLock);
@@ -699,12 +1291,8 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		done = fb->fHelperGeneration;
 		job = fb->fHelperJob;
 		IOLockUnlock(fb->fHelperLock);
-		/* share index + 1 of fThreads (the presenter takes share 0) */
-		rows = job->py1 - job->py0;
-		y0 = job->py0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
-		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
 		blend = fb->fHelperBlend[index];
-		fb->drawRows(job, y0, y1, blend);
+		fb->drawShare(job, blend);
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
 		if (fb->fHelpersBusy == 0) {
@@ -804,14 +1392,15 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		drawRows(&job, py0, py1, fBlendRow);
 		return;
 	}
-	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
+	/* shared out: this thread and the helpers take rows until there are none, then it waits for them */
 	IOLockLock(fHelperLock);
+	fNextRow = py0;
 	fHelperJob = &job;
 	fHelpersBusy = fThreads - 1;
 	fHelperGeneration++;
 	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
 	IOLockUnlock(fHelperLock);
-	drawRows(&job, py0, py0 + (int32_t) ((int64_t) (py1 - py0) / fThreads), fBlendRow);
+	drawShare(&job, fBlendRow);
 	IOLockLock(fHelperLock);
 	while (fHelpersBusy != 0) {
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
@@ -870,7 +1459,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
 	if (gTouchLat) {
-		redwood_tl("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
+		redwood_tl("tl: s %u at %llu surface %u\n", swapWord(swap, SWAP_ID), micros(now), swapWord(swap, SWAP_SURFACE(0)));
 	}
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
@@ -891,8 +1480,15 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 
 		fSwapSurfaces[slot][layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
+		if (fSwapSurfaces[slot][layer] != NULL) {
+			MiniIOSurfaceDisplayUse(fSwapSurfaces[slot][layer], 1);
+		}
 	}
 	fSwapsWaiting++;
+	fSwapsQueued++;
+	fAlternating = swapWord(swap, SWAP_SURFACE(0)) != fLastSurface && swapWord(swap, SWAP_SURFACE(1)) == 0 &&
+	    swapWord(swap, SWAP_SURFACE(2)) == 0 && swapWord(swap, SWAP_SURFACE(3)) == 0;
+	fLastSurface = swapWord(swap, SWAP_SURFACE(0));
 	IOLockWakeup(fSwapLock, fSwap, true);
 	IOLockUnlock(fSwapLock);
 }
@@ -920,11 +1516,49 @@ IOMobileFramebuffer::presenter(void)
 		show(swap, surfaces);
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
+				MiniIOSurfaceDisplayUse(surfaces[layer], -1);   /* (copied out, or discarded) */
 				MiniIOSurfaceDrop(surfaces[layer]);
 			}
 		}
+		IOLockLock(fSwapLock);
+		fSwapsCopied++;
+		IOLockWakeup(fSwapLock, &fSwapsCopied, false);
+		IOLockUnlock(fSwapLock);
 		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
 	}
+}
+
+/*
+ * IOMobileFramebufferSwapWait. The window server draws the next frame as soon as this returns, into the
+ * surface it handed over least recently: until the presenter has copied that one, the GPU would be writing
+ * the very pixels being copied (bands of two frames, half drawn tiles). It alternates two surfaces on the
+ * phone (3 and 4), so the last swap may still be copied meanwhile -- which lets drawing and copying overlap;
+ * with one surface, or more layers than one, every swap so far. SWAP_GPU_MS at most: a GPU that stopped
+ * answering must not stop the window server.
+ */
+void
+IOMobileFramebuffer::waitCopied(void)
+{
+	AbsoluteTime deadline;
+
+	clock_interval_to_deadline(SWAP_GPU_MS, kMillisecondScale, &deadline);
+	IOLockLock(fSwapLock);
+	for (uint64_t target = fSwapsQueued - (fAlternating ? 1 : 0); fSwapsCopied < target;) {
+		if (IOLockSleepDeadline(fSwapLock, &fSwapsCopied, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
+			break;
+		}
+	}
+	IOLockUnlock(fSwapLock);
+}
+
+void
+IOMobileFramebuffer::dequeueSwap(void)
+{
+	IOLockLock(fSwapLock);
+	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+	fSwapsWaiting--;
+	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+	IOLockUnlock(fSwapLock);
 }
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
@@ -939,13 +1573,57 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
-			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; discarded\n",
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+			dequeueSwap();
+			return;
 		}
+	}
+	if (gTouchLat) {
+		redwood_tl("tl: d %u began %llu ready %llu\n", swapWord(swap, SWAP_ID), micros(began), micros(mach_absolute_time()));
+	}
+	/* the GPU work each surface was waited for: new work naming it during the copy is a race (see waitCopied()) */
+	uint32_t fences[SWAP_LAYERS];
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		fences[layer] = surfaces[layer] != NULL ? surfaces[layer]->drawn : 0;
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	if (gOnTheBeat) {
+	if (!fPushTried) {
+		fPushTried = true;
+		if (pushStart(fPanelHeight) && gPush == 2) {
+			size_t frame = round_page((size_t) fRowBytes * fPanelHeight);
+
+			fBuffer[0] = fBase;
+			fBufferPhys[0] = vinfo.v_physaddr;
+			fBufferPhys[1] = DOUBLE_PHYS;
+			/* (in the kernel map: ml_io_map's range has no room for 10 MB) */
+			IOMemoryDescriptor * memory = vinfo.v_physaddr + frame <= DOUBLE_PHYS && DOUBLE_PHYS + frame <= 0x9e300000ull ?
+			    IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) DOUBLE_PHYS, frame, kIODirectionInOut) : NULL;
+
+			fBufferMap = memory != NULL ? memory->map(kIOMapWriteCombineCache) : NULL;
+			OSSafeReleaseNULL(memory);
+			fBuffer[1] = fBufferMap != NULL ? (uint8_t *) fBufferMap->getVirtualAddress() : NULL;
+			gDouble = fBuffer[1] != NULL;
+			fBack = 1;
+			displayLog("display: second framebuffer at %#llx: %s\n", DOUBLE_PHYS, gDouble ? "frames alternate" : "not mapped");
+		}
+	}
+	if (!gPushing && fBuffer[0] != NULL && fBase != fBuffer[0]) {
+		fBase = fBuffer[0];             /* (given back: pushStop()) */
+	}
+	if (gDouble) {
+		fBase = fBuffer[fBack];         /* the one not being sent: written now, waited for at the push */
+	} else if (gPushing) {
+		/* paced by the panel: the frame before has to be out of the framebuffer first */
+		if (!pushWait()) {
+			displayLog("display: a pushed frame did not finish in %u ms; autorefresh back on\n", PUSH_TIMEOUT_MS);
+			pushStop();
+		}
+		fStatBeatWait += mach_absolute_time() - began;
+		fStatOnBeat++;
+		began = mach_absolute_time();
+	} else if (gOnTheBeat) {
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -970,12 +1648,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	shown = began;
+	traceScanout(swapWord(swap, SWAP_ID), "copy-begin");
 	/* its turn has come: the swap after it may be handed over */
-	IOLockLock(fSwapLock);
-	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-	fSwapsWaiting--;
-	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
-	IOLockUnlock(fSwapLock);
+	dequeueSwap();
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
@@ -1042,7 +1717,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL && surfaces[layer]->drawn != fences[layer] && fStatRaced++ < 20) {
+			displayLog("display: swap %u: surface %u got GPU work %u while it was copied (waited for %u)\n",
+			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), surfaces[layer]->drawn, fences[layer]);
+		}
+	}
+	if (gDouble && !pushWait()) {
+		displayLog("display: a pushed frame did not finish in %u ms; the boot framebuffer and autorefresh back\n", PUSH_TIMEOUT_MS);
+		pushStop();
+	} else if (gPushing) {
+		pushFrame(swapWord(swap, SWAP_ID), fBufferPhys[fBack]);
+		fBack ^= gDouble;
+	}
 	drawn = mach_absolute_time();
+	traceScanout(swapWord(swap, SWAP_ID), "copy-end");
 	if (recorded != NULL) {
 		record(recorded);
 	}
@@ -1235,6 +1924,21 @@ IOMobileFramebufferUserClient::armVSync(void)
 {
 	uint64_t period, now = mach_absolute_time();
 
+	uint64_t te = __atomic_load_n(&gTeTime, __ATOMIC_ACQUIRE), te_period = gTePeriod;
+
+	/* the panel's next TE, where its interrupt says (fb_push) */
+	if (te != 0 && te_period != 0 && now - te < 4 * te_period) {
+		static bool said;
+
+		for (fVSyncTime = te + te_period; fVSyncTime <= now + te_period / 8; fVSyncTime += te_period) {
+		}
+		if (!said) {
+			said = true;
+			displayLog("display: the frame clock follows the panel's TE, measured %llu us apart\n", micros(te_period));
+		}
+		thread_call_enter_delayed(fVSyncCall, fVSyncTime);
+		return;
+	}
 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
 	fVSyncTime += period;
@@ -1352,12 +2056,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		fOwner->present((const uint8_t *) args->structureInput);
 		return kIOReturnSuccess;
 
-	case kFBMethodSwapWait:                         /* a swap is on the screen as soon as it is made */
+	case kFBMethodSwapWait:                         /* the swaps so far copied out of their surfaces */
+	{
+		uint64_t began = mach_absolute_time();
+
+		fOwner->waitCopied();
 		if (gTouchLat) {
-			redwood_tl("tl: w %llu %#llx %#llx at %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
-			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
+			redwood_tl("tl: w %llu %#llx %#llx at %llu waited %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
+			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(began),
+			    micros(mach_absolute_time() - began));
 		}
 		return kIOReturnSuccess;
+	}
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:

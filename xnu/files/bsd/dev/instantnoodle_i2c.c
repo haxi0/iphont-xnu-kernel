@@ -19,8 +19,40 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 static LCK_GRP_DECLARE(i2c_lck_grp, "instantnoodle-i2c");
-static LCK_MTX_DECLARE(i2c_lock, &i2c_lck_grp);
-static LCK_MTX_DECLARE(map_lock, &i2c_lck_grp);           /* not i2c_lock: a transfer may map a tile */
+static LCK_MTX_DECLARE(map_lock, &i2c_lck_grp);           /* a transfer may map a tile */
+
+extern void redwood_tl(const char *format, ...) __printflike(1, 2);
+
+static uint64_t
+micros(uint64_t absolute)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(absolute, &ns);
+	return ns / NSEC_PER_USEC;
+}
+
+/* A clock-stretching fuel gauge must not hold up the touch screen on a different bus. */
+static void
+bus_lock(struct instantnoodle_i2c *b)
+{
+	if (__atomic_load_n(&b->lock, __ATOMIC_ACQUIRE) == NULL) {
+		lck_mtx_lock(&map_lock);
+		if (b->lock == NULL) {
+			uint32_t trace = 0;
+			lck_mtx_t *lock = lck_mtx_alloc_init(&i2c_lck_grp, LCK_ATTR_NULL);
+
+			if (lock == NULL) {
+				panic("instantnoodle: no lock for I2C bus %s", b->name);
+			}
+			PE_parse_boot_argn("touch_lat", &trace, sizeof(trace));
+			b->trace = trace != 0;
+			__atomic_store_n(&b->lock, lock, __ATOMIC_RELEASE);
+		}
+		lck_mtx_unlock(&map_lock);
+	}
+	lck_mtx_lock(b->lock);
+}
 
 bool
 instantnoodle_board(void)
@@ -212,7 +244,7 @@ bb_rx(struct instantnoodle_i2c *b, bool ack)
 void
 instantnoodle_i2c_recover(struct instantnoodle_i2c *b)
 {
-	lck_mtx_lock(&i2c_lock);
+	bus_lock(b);
 	line(b, b->sda, true);
 	for (int i = 0; i < 9; i++) {
 		line(b, b->scl, false);
@@ -221,7 +253,7 @@ instantnoodle_i2c_recover(struct instantnoodle_i2c *b)
 		bb_delay();
 	}
 	bb_stop(b);
-	lck_mtx_unlock(&i2c_lock);
+	lck_mtx_unlock(b->lock);
 }
 
 int
@@ -229,14 +261,14 @@ instantnoodle_i2c_write(struct instantnoodle_i2c *b, uint8_t addr, const uint8_t
 {
 	int err;
 
-	lck_mtx_lock(&i2c_lock);
+	bus_lock(b);
 	bb_start(b);
 	err = bb_tx(b, (uint8_t)(addr << 1));
 	for (unsigned i = 0; i < n && err == 0; i++) {
 		err = bb_tx(b, bytes[i]);
 	}
 	bb_stop(b);
-	lck_mtx_unlock(&i2c_lock);
+	lck_mtx_unlock(b->lock);
 	if (err) {
 		b->errors++;
 	}
@@ -247,8 +279,10 @@ int
 instantnoodle_i2c_read(struct instantnoodle_i2c *b, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n)
 {
 	int err;
+	uint64_t began = mach_absolute_time(), locked, done;
 
-	lck_mtx_lock(&i2c_lock);
+	bus_lock(b);
+	locked = mach_absolute_time();
 	bb_start(b);
 	err = bb_tx(b, (uint8_t)(addr << 1));
 	if (err == 0) {
@@ -262,9 +296,14 @@ instantnoodle_i2c_read(struct instantnoodle_i2c *b, uint8_t addr, uint8_t reg, u
 		buf[i] = bb_rx(b, i + 1 < n);
 	}
 	bb_stop(b);
-	lck_mtx_unlock(&i2c_lock);
+	done = mach_absolute_time();
+	lck_mtx_unlock(b->lock);
 	if (err) {
 		b->errors++;
+	}
+	if (b->trace) {
+		redwood_tl("tl: b %s begin %llu locked %llu done %llu bytes %u error %d\n", b->name,
+		    micros(began), micros(locked), micros(done), n, err);
 	}
 	return err;
 }

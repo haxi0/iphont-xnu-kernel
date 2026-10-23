@@ -12,7 +12,9 @@ What is here:
 - `mu-silicium.patch` -- changes to existing files:
   `BootShim/BootShim.S` (copies our "XNUP" container, which follows the UEFI image, to 0xF0000000),
   `BootManagerLib` (starts the XNU loader from the container instead of the boot menu);
-- `files/` -- new files: `Platforms/Xiaomi/redwoodPkg` (memory map, driver list),
+- `files/` -- new files: `Platforms/Xiaomi/redwoodPkg` (memory map, driver list), and
+  `Platforms/OnePlus/instantnoodlePkg` for the OnePlus 8 (its UEFI drivers come mostly from `kebab`, the OnePlus 8T
+  on the same SoC: `files/Binaries/instantnoodle/README.md`; `uefi/export.sh` saves both packages),
   `Silicon/.../BootManagerLib/XnuLoader.[ch]`, `Resources/Configs/redwood.toml`, `Resources/DTBs/redwood.dtb`
   (the device tree from the phone's vendor_boot), `Binaries/redwood` (UEFI drivers from the firmware
   `OS1.0.3.0.UMSMIXM`, extracted with [UEFIReader](https://github.com/WOA-Project/UEFIReader) from `xbl.img`,

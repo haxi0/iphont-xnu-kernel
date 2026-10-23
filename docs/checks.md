@@ -18,7 +18,8 @@ README during the work on this port. They are written down because eleven of the
   "applies exactly"; without `-s` it said `succeeded at 410 (offset 2 lines)`.
 - **Inference from absence.** "Not in the log" and "did not happen" are different things: the loader's log
   drops its middle (the sign is a size at the limit and the exact line `the log between the first 256 KB and
-  the last 1 MB was dropped`, not the words `was dropped`, which the button driver also prints). A `grep`'s
+  the last 1 MB was dropped`, not the words `was dropped`, which the button driver also prints; boot-arg
+`log_launchd=0` keeps launchd's own lines, most of a long boot's log, out of what comes back). A `grep`'s
   field of view reads the same way: six matches of `bin/sh` were `/var/jb/bin/sh`, and "`xl ramdisk` has no
   guard" missed a guard twenty lines higher. And a silent instrument first has to be shown that it **can**
   speak: a watchdog that "never fired" proves something only together with the number of times it ran (ours

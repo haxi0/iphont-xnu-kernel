@@ -184,7 +184,7 @@ def main():
     if chip:
         found = [seen - before for before, seen, read in chip if before]
         took = [read - seen for before, seen, read in chip]
-        print(f'  touch chip: looked at every {mean(found) / 1000:.2f} ms (a report waits half of that on average); '
+        print(f'  touch chip: observed poll spacing {mean(found) / 1000:.2f} ms; '
               f'reading a report takes {mean(took) / 1000:.2f} ms')
     pictures, width, height = recording(raws[0]) if raws else ([], 0, 0)
     totals = []
@@ -229,7 +229,7 @@ def main():
             print(f'  waiting for the display driver\'s beat:              {beat / 1000:6.2f} ms')
             print(f'  copying (scaling) it into the panel\'s memory:       {copy / 1000:6.2f} ms')
             print(f'  ({len(rows)} frames, {len(within)} samples; then the panel\'s next scan of those rows, '
-                  f'0 to 8.3 ms at 120 Hz)')
+                  f'which these timestamps do not measure)')
     if totals:
         print(f'all zigzags: {mean(totals) / 1000:.1f} ms behind the finger on average')
 

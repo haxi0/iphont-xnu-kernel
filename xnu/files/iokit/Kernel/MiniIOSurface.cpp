@@ -753,6 +753,15 @@ MiniIOSurfaceUsage(uint32_t * count, uint64_t * bytes)
 }
 
 void
+MiniIOSurfaceDisplayUse(MiniIOSurface * s, int delta)
+{
+	IOLockLock(gSurfaceLock);
+	s->useCount[0] += delta;
+	s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
+	IOLockUnlock(gSurfaceLock);
+}
+
+void
 MiniIOSurfaceDrop(MiniIOSurface * s)
 {
 	if (s == NULL) {

@@ -128,12 +128,14 @@ What has been seen working on the phone itself (the kernel's log of a run says e
 
 | Works | How | Not yet |
 |---|---|---|
-| Boot to SpringBoard, 8 cores, prime core at 2.84 GHz | `cpus=8 cpufreq=1 bootcpu=7` | Metal for apps (as on redwood) |
-| Touch screen (Samsung S6SY761) and the keys | `board=instantnoodle` (the loader passes it) | Wi-Fi (QCA6390 on PCIe, not redwood's WCN6750) |
+| Boot to SpringBoard, 8 cores, prime core at 2.84 GHz | `cpus=8 cpufreq=1 bootcpu=7` | Metal for the whole system is not on by default (`metal=2 metal_profile=1` reaches the home screen; chronod's widgets still have 2 pipelines refused) |
+| Display: 90 Hz, no tearing; iOS at up to 90 fps (the MDP pushes double-buffered frames on the panel's TE) | default with `board=instantnoodle` (`fb_hz=60`, `fb_push=1`/`0` fall back) | The scaling to the panel is done by the processor: about 5% of frames still miss a refresh |
+| Touch screen (Samsung S6SY761, by its interrupt) and the keys | `board=instantnoodle` (the loader passes it; `touch_irq=0`: polling) | Wi-Fi (QCA6390 on PCIe, not redwood's WCN6750) |
 | Battery: level, voltage, current, charging (TI bq27541 gauge, PM8150B USB input) | on with `board=instantnoodle` | Sound (TFA9894 amplifiers, WCD938x codec) |
 | Haptics from iOS (Awinic AW8697): system feedback, CoreHaptics | `haptic=5`, `fw-haptic` | Cameras, sensors, Bluetooth |
 | Flashlight from iOS (PM8150L flash LED, both LEDs) | `torch=3` | Charging control (it charges as the boot chain set it up) |
-| Adreno 650 drawing for CoreAnimation (Mesa/freedreno, OpenGL ES) | `gpu=1`, `fw-gpu`, images with `GL=1` | |
+| Adreno 650 drawing for CoreAnimation (Mesa/freedreno, OpenGL ES) | `gpu=1`, `fw-gpu`, images with `GL=1`; after a cold power-on, one run with `adreno=21 adreno_return=1 adreno_watch=3` first | `gpu=1` straight from a cold power-on (CrashDump mode); third-party Metal apps (none tried yet) |
+| Metal driver on the Adreno 650: blits, clears, 4x MSAA resolve, command-buffer completion; 263 of Apple's 271 fragment shaders draw, the 258 compared agree with softpipe | `metal=1` (test programs) | Metal heaps, fences, events |
 
 Run `xl enter` with the profile loaded (`common/run.sh instantnoodle`, or `. common/lib.sh; load_device
 instantnoodle` first): a bare `./xl enter` builds redwood's UEFI, which hangs this phone on its fastboot logo
@@ -147,14 +149,22 @@ The firmware comes out of the phone's own vendor partition (here a backup of `ve
 7z e vendor_a.img 'firmware/a650_*' -ofw-gpu                       # GPU (gpu=1)
 tools/mk-mesa.sh                                                   # Mesa, once (needs meson, ninja)
 GL=1 REST=1 FLASHBOOT=1 CRYPTEXES=flash userland/build.sh          # root.apfs + flashboot.apfs
+. common/lib.sh && load_device instantnoodle                       # the profile, before xl enter
 ./xl enter && ./xl ramdisk userland/flashboot.apfs
 XL_SECS=900 XL_CMDLINE="cpus=8 cpufreq=1 bootcpu=7 ufs=2 root_apfs=ufs_darwin haptic=5 torch=3 gpu=1" ./xl run
 ```
 
 Boot-args for the GPU and Metal work: `metal=1` lets the Metal driver serve test programs (`RC_JOBS=rc.jobs.metaldefer`
 runs the blits, every fragment shader and the timings); `metal=2 metal_profile=1` hands it the whole system;
-`metal_sync=1` makes every draw wait for its own fence again (slower, but a GPU failure names the draw);
+by default a Metal command buffer is one GPU submission and one fence (8 full-screen draws block `-commit` for
+107 us, against 7086 us with a fence per draw); `metal_sync=1` makes every draw wait for its own fence again
+(slower, but a GPU failure names the draw);
 `log_launchd=0` keeps launchd's lines out of the log that comes back, so long test output survives.
+
+The panel runs at 90 Hz without tearing: frames are double-buffered and pushed by the MDP on the panel's TE,
+and CoreAnimation's frame clock follows that TE (`fb_hz=60`, `fb_push=1` or `fb_push=0` fall back to 60 Hz, one
+buffer, or the firmware's autorefresh). Touch is interrupt-driven (`touch_irq=0`: 10 ms polling). Measurements,
+fallbacks and the RAM-only procedure: [instantnoodle latency](docs/instantnoodle-latency.md).
 
 ## Prebuilt boot image
 

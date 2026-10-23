@@ -30,13 +30,15 @@ bool instantnoodle_gpio_level(struct instantnoodle_pin p);
 /*
  * An I2C bus driven on its two pins (open drain: low = output 0, high = input, the board's
  * pull-ups, or the pins' own, make the level), about 100 kHz. The SoC's serial engines are not used: their FIFO
- * mode is off on this phone and the DMA mode needs GPI. One transfer at a time, on all the buses.
+ * mode is off on this phone and the DMA mode needs GPI. One transfer at a time per bus.
  */
 struct instantnoodle_i2c {
 	const char *name;
 	struct instantnoodle_pin sda, scl;
 	unsigned pull;                  /* INSTANTNOODLE_PULL_UP where the board has no pull-ups of its own */
 	unsigned errors;                /* transfers that were not acknowledged */
+	struct _lck_mtx_ *lock;          /* initialized on first use; the bus lives for the kernel's lifetime */
+	bool trace;                     /* touch_lat=1: lock wait and wire time */
 };
 int instantnoodle_i2c_write(struct instantnoodle_i2c *bus, uint8_t addr, const uint8_t *bytes, unsigned n);
 int instantnoodle_i2c_read(struct instantnoodle_i2c *bus, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n);

@@ -1,8 +1,9 @@
 # Porting HackiOS to another device
 
-HackiOS was brought up on the POCO X5 Pro 5G (Snapdragon 778G). A Qualcomm phone with an unlockable bootloader
-is the realistic next target: the boot chain (Mu-Silicium UEFI started with `fastboot boot`) and most of the kernel's
-platform code carry over. Start with:
+HackiOS was brought up on the POCO X5 Pro 5G (Snapdragon 778G), and the OnePlus 8 (`instantnoodle`, Snapdragon 865)
+is the second phone: read its profile, UEFI package and `board=instantnoodle` drivers as a worked example of
+everything below. A Qualcomm phone with an unlockable bootloader is the realistic next target: the boot chain
+(Mu-Silicium UEFI started with `fastboot boot`) and most of the kernel's platform code carry over. Start with:
 
 ```sh
 common/new-device.sh <codename> path/to/device.dtb
@@ -25,7 +26,9 @@ the way `uefi/` ports redwood (it follows `lisa`, the same SoC package):
 
 Put the addresses in the profile: `FD_BASE`, `FD_SIZE` (where the shim puts the UEFI image) and `PAYLOAD_BASE`
 (free RAM for the kernel and images). The prebuilt `BootShim.bin` is built for redwood's addresses: build the
-shim from your Mu-Silicium tree (`mkxnuimg.py` does it when `Mu-Silicium/` is there).
+shim from your Mu-Silicium tree (`mkxnuimg.py` does it when `Mu-Silicium/` is there). Load the profile before
+`./xl enter` (`. common/lib.sh; load_device <codename>`): without it `mkxnuimg.py` builds redwood's UEFI, and on
+another phone that hangs at the fastboot logo until `fastboot reboot bootloader`.
 
 ## 2. The loader
 
@@ -46,14 +49,24 @@ Rebuild with `xnuloader/build.sh`; QEMU must still pick `qemu-virt` (no match = 
 ## 3. The kernel
 
 What is generic: GICv3, the timer, PSCI SMP, the display (the UEFI's framebuffer), APFS and ramfs, the driver
-replacements, the return-to-loader path. What is redwood-specific and needs looking at:
+replacements, the return-to-loader path. (A framebuffer the display hardware keeps rereading on its own tears under
+the processor's copy; a command-mode panel's can be pushed once per frame instead, as the OnePlus 8's is:
+`fb_probe=1` shows how the firmware left the pipeline, [instantnoodle latency](instantnoodle-latency.md) the rest.)
+What is redwood-specific and needs looking at:
 
 - **touch**: `bsd/dev/redwood_goodix.c` (Goodix GT9916 over bit-banged SPI) — another panel needs its own driver
-  feeding `/dev/redwood-touch` (`bsd/dev/redwood_input.c`);
+  feeding `/dev/redwood-touch` (`bsd/dev/redwood_input.c`); the OnePlus 8's `instantnoodle_touch.c` is one, on the
+  bit-banged I2C of `instantnoodle_i2c.c`, which its fuel gauge (`instantnoodle_battery.c`) shares. Gate a new
+  phone's drivers on a `board=` boot-arg the loader passes, so redwood's keep running unchanged;
 - **buttons, CPU frequency, watchdog**: GPIO/PMIC numbers and the EPSS block in `redwood_input.c`,
   `redwood_cpufreq.c`, `osfmk/arm64/loader_return.c`;
-- **GPU / Wi-Fi / sound**: `redwood_adreno.c` (Adreno 642L), `redwood_wifi.c` (WCN6750 + ath11k), `redwood_audio.c`
-  — the same Qualcomm subsystems (SMEM, SMP2P, GLINK, QRTR, QMI) are reused, the addresses and firmware differ.
+- **flash LED, vibration motor**: `redwood_torch.c` and `redwood_haptic.c` take a table per board (PMIC block,
+  pins, chip); the OnePlus 8's PM8150L and AW8697 are the second entries;
+- **GPU / Wi-Fi / sound**: `redwood_adreno.c` (Adreno 642L, and the Adreno 650 as its `kona` variant: the clock
+  controller's debug selectors, the SMMU stream the hypervisor accepts, and which CP registers exist differ by
+  chip; the log names the bring-up step that stopped), `redwood_wifi.c` (WCN6750 + ath11k),
+  `redwood_audio.c` — the same Qualcomm subsystems (SMEM, SMP2P, GLINK, QRTR, QMI) are reused, the addresses and
+  firmware differ. The OnePlus 8's Wi-Fi (QCA6390) is on PCIe, which nothing here drives yet.
 
 Start with no extras: the system boots to the lock screen with only the framebuffer, touch and the CPU.
 
