@@ -24,8 +24,8 @@
  * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
  * program's worth of care (every client's buffers are in the one address space; a client that
  * goes takes its own away), fences and buffers as file descriptors. A GPU that has stopped
- * answering is reported (redwood_gpu_report()) and, with boot-arg gpu_recover=1, reset and
- * started again, so that the submission that hung is all that is lost: what that does and
+ * answering is reported (redwood_gpu_report()) and, with boot-arg gpu_recover=1 (the default on
+ * the OnePlus 8), reset and started again, so that the submission that hung is all that is lost: what that does and
  * which source says so is at redwood_gpu_recover() in bsd/dev/redwood_adreno.c. Without the
  * boot-arg it stays stopped and nothing is waited for again.
  */

@@ -3233,8 +3233,8 @@ redwood_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  *
- * Boot-arg gpu_recover=1: a submission the core never finishes does not cost the rest of the
- * run. The core's own half is reset and started again, and what was outstanding is given up
+ * Boot-arg gpu_recover=1 (the default on the OnePlus 8; gpu_recover=0 turns it off): a submission
+ * the core never finishes does not cost the rest of the run. The core's own half is reset and started again, and what was outstanding is given up
  * (redwood_gpu_recover() below, which says what is done and which source says so). Without it
  * such a submission is only reported, and the GPU stays stopped.
  */
@@ -4158,6 +4158,8 @@ redwood_adreno_init(void)
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+			/* on by default where it has been seen to work: the Adreno 650, 3 hangs of 3 (log 185937) */
+			gpu_recover = kona;
 			PE_parse_boot_argn("gpu_recover", &gpu_recover, sizeof(gpu_recover));
 			/* before any client exists: gpu_address_span() must not change under a live buffer */
 			PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
