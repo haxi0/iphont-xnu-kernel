@@ -21,7 +21,8 @@
  * them. Linux hands such memory around as file descriptors; here it has a name already. That
  * memory is ordinary, cached memory, which everybody else reads and writes as such.
  *
- * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
+ * Not here yet: interrupts on the redwood (there, waiting is asking again five times a millisecond;
+ * the OnePlus 8's fences raise one, gpu_irq), more than one
  * program's worth of care (every client's buffers are in the one address space; a client that
  * goes takes its own away), fences and buffers as file descriptors. A GPU that has stopped
  * answering is reported (redwood_gpu_report()) and, with boot-arg gpu_recover=1 (the default on
@@ -63,6 +64,8 @@ void redwood_gpu_to_memory(void * start, uint64_t size);
 uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool redwood_gpu_done(uint32_t fence);
+bool redwood_gpu_interrupts(void);
+void redwood_gpu_sleep(uint32_t fence, uint64_t until);
 uint32_t redwood_gpu_last(void);
 void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void redwood_gpu_report(const char * why);
@@ -202,6 +205,7 @@ struct redwood_worked {
 #define GPU_SUBMIT_BOS          8192
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
 #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+#define GPU_SLEEP_MS            10              /* ... or, woken by its interrupt (gpu_irq), the longest sleep between two */
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
@@ -237,7 +241,14 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
 		}
 		IOLockUnlock(gGPULock);
-		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+		if (redwood_gpu_interrupts()) {
+			uint64_t until;
+
+			clock_interval_to_deadline(GPU_SLEEP_MS, kMillisecondScale, &until);
+			redwood_gpu_sleep(fence, until < began + patience ? until : began + patience);
+		} else {
+			delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+		}
 		IOLockLock(gGPULock);
 	}
 	/*

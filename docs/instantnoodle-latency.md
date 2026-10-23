@@ -50,6 +50,12 @@ be found out by trying. The second framebuffer at `0x9ca00000`, inside the firmw
   repacked to it, go back with the boot framebuffer for the loader. A swap with no such frame (another layer,
   a surface new to the display) is copied by the processor as before, into a framebuffer the window server
   does not hold. `fb_gpu=0` keeps everything as before.
+- **The GPU's fences raise its interrupt** (`gpu_irq=1`, the default here: GIC 332, `RBBM_INT_0` bit 20 from
+  `CACHE_FLUSH_TS` with the IRQ bit, as Linux's `a6xx_submit`), and a wait for one sleeps until it comes instead of
+  looking every 200 us. With it (`192057`, a lighter load than `184104`: hardly any touches) the presenter's wait
+  for the GPU went from 0.48 / 2.49 ms to 0.35 / 0.42 ms (median / p95), SwapEnd → panel RAM p95 to 17.8 ms, and
+  1.3% of swaps came a refresh late. A GPU hang resets the 3D core's half and goes on (`gpu_recover`, now the
+  default here: 3 hangs of 3 recovered in `rc.jobs.metalrecover`, logs `185937`, `190442`, `191115`).
 - **The copy**, where there still is one, is shared out in 48-row pieces taken in turn, not fixed thirds. A
   copying thread on a small core, or one preempted, no longer holds up the frame.
 - **Touch.** S6SY761 reports arrive by the TLMM summary interrupt (`touch_irq=0`: 10 ms polling). The worker

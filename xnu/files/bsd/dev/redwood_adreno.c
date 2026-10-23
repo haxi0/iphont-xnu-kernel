@@ -92,6 +92,8 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -105,6 +107,13 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
+/* osfmk/arm64/gic_v3_irq.c */
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+extern void gic_v3_spi_detach(uint32_t intid);
+extern uint64_t gic_v3_spi_count(uint32_t intid);
+static uint32_t gpu_irq;                /* (below: "the 3D core's interrupt") */
 
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
 /*
@@ -3200,6 +3209,9 @@ redwood_adreno_quiesce(void)
 	if (cx_off) {
 		return;
 	}
+	if (gpu_irq) {
+		gic_v3_spi_mask(32 + 300);      /* (GPU_INTID, below) */
+	}
 	if (gmu_runs) {
 		wr(gmu.base + GMU_CM3_SYSRESET, 1);
 		gmu_runs = false;
@@ -3260,6 +3272,18 @@ redwood_adreno_quiesce(void)
 #define GMU_PWR_COL_KEEPALIVE   GMU_WORD(0x50c3)        /* a6xx_gmu.xml; 1: the GMU keeps the core powered, whatever it makes of it */
 #define GMU_AHB_FENCE_STATUS_CLR GMU_WORD(0x9314)       /* the bits of ahb_fence_status written here are forgotten */
 #define GPU_RECOVERIES          64                      /* at most in one run: a program that hangs every submission fills no log with this */
+/*
+ * Boot-arg gpu_irq (1 by default on the OnePlus 8): a submission's fence ends in the 3D core's interrupt
+ * (Linux a6xx_submit: CACHE_FLUSH_TS with the IRQ bit; RBBM_INT_0 bit 20), and whoever waits for a fence
+ * sleeps until it comes (redwood_gpu_sleep()) instead of looking again every 200 us. A wait still looks at
+ * the fence every GPU_SLEEP_MS, should an interrupt ever be missed.
+ */
+#define GPU_INTID               (32 + 300)              /* dt: qcom,kgsl-3d0 interrupts <0 0x12c 4>, level: "kgsl_3d0_irq" */
+#define RBBM_INT_0_MASK         GPU_WORD(0x0038)
+#define RBBM_INT_CACHE_FLUSH_TS (1u << 20)
+#define EVENT_IRQ               (1u << 31)              /* of CP_EVENT_WRITE's first word */
+static uint32_t gpu_irq;                                /* the interrupt is ours, and fences raise it */
+static int gpu_fence_event;                             /* (its address) what a waiter sleeps on */
 
 static bool gpu_kept;
 static uint32_t gpu_fence;              /* the number of the last submission */
@@ -3378,6 +3402,11 @@ redwood_gpu_stop(void)
 			waited++;
 		}
 		core_stuck = !redwood_gpu_done(gpu_fence);
+		if (gpu_irq) {
+			gic_v3_spi_detach(GPU_INTID);
+			wr(gpu.base + RBBM_INT_0_MASK, 0);
+			gpu_irq = 0;
+		}
 		printf("adreno: the run is about to end: the GPU is given back (%s after %u us)\n",
 		    core_stuck ? "STILL AT WORK" : "it had finished what it was given", 100 * waited);
 		gpu_block_stop();
@@ -3594,6 +3623,40 @@ redwood_gpu_last(void)
 	return gpu_fence;
 }
 
+/* Interrupt context: the 3D core has passed a fence (or says something else, which is only cleared). */
+static void
+gpu_interrupt(void *context __unused, uint32_t intid __unused)
+{
+	wr(gpu.base + RBBM_INT_CLEAR_CMD, rd(gpu.base + RBBM_INT_0_STATUS));
+	thread_wakeup((event_t)&gpu_fence_event);
+}
+
+/* The core raises its interrupt at a fence again (after step 20, which a reset makes it forget). */
+static void
+gpu_interrupt_on(void)
+{
+	wr(gpu.base + RBBM_INT_CLEAR_CMD, rd(gpu.base + RBBM_INT_0_STATUS));
+	wr(gpu.base + RBBM_INT_0_MASK, RBBM_INT_CACHE_FLUSH_TS);
+}
+
+bool
+redwood_gpu_interrupts(void)
+{
+	return gpu_irq != 0;
+}
+
+/* With no lock held: until submission `fence` may be done (its interrupt), or `until` (mach absolute time). */
+void
+redwood_gpu_sleep(uint32_t fence, uint64_t until)
+{
+	assert_wait_deadline((event_t)&gpu_fence_event, THREAD_UNINT, until);
+	if (redwood_gpu_done(fence)) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		return;
+	}
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
 /* The core is to write down what time it is: at one end of submission `fence`. */
 static void
 ring_time(uint32_t fence, uint32_t end)
@@ -3696,7 +3759,7 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 	ring_time(gpu_fence, 1);
 	ring_register(CP_SCRATCH_REG2, gpu_fence);
 	ring_command(CP_EVENT_WRITE, 4);
-	ring(EVENT_CACHE_FLUSH);
+	ring(EVENT_CACHE_FLUSH | (gpu_irq ? EVENT_IRQ : 0));
 	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
 	ring(0);
 	ring(gpu_fence);
@@ -3790,6 +3853,9 @@ redwood_gpu_recover(void)
 		return false;
 	}
 	gpu_recoveries++;
+	if (gpu_irq) {
+		gic_v3_spi_mask(GPU_INTID);     /* (nothing of the core's is to be read while it is being reset) */
+	}
 	step = 0;                               /* (the steps are over: no line of theirs waits for the loader any more) */
 	newest_step = ~0u;
 
@@ -3851,6 +3917,10 @@ redwood_gpu_recover(void)
 	*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = gpu_fence;
 	to_memory(core_scratch.memory, 4096);
 	gpu_timed = gpu_fence;
+	if (gpu_irq) {
+		gpu_interrupt_on();
+		gic_v3_spi_unmask(GPU_INTID);
+	}
 	printf("adreno: gpu: THE 3D CORE IS RECOVERED (%u time%s in this run); submissions up to %u are given up as done\n",
 	    gpu_recoveries, gpu_recoveries == 1 ? "" : "s", gpu_fence);
 	return true;
@@ -3900,9 +3970,10 @@ redwood_adreno_minute(void)
 			}
 		}
 	}
-	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz\n", tenths[0] / 10,
-	    tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
-	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000);
+	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz; %llu interrupts\n",
+	    tenths[0] / 10, tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
+	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000,
+	    gpu_irq ? gic_v3_spi_count(GPU_INTID) : 0ull);
 }
 
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
@@ -4163,6 +4234,17 @@ redwood_adreno_init(void)
 			PE_parse_boot_argn("gpu_recover", &gpu_recover, sizeof(gpu_recover));
 			/* before any client exists: gpu_address_span() must not change under a live buffer */
 			PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
+			gpu_irq = kona;
+			PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
+			if (gpu_irq) {
+				gpu_interrupt_on();
+				if (gic_v3_spi_attach(GPU_INTID, false, gpu_interrupt, NULL) != KERN_SUCCESS) {
+					wr(gpu.base + RBBM_INT_0_MASK, 0);
+					gpu_irq = 0;
+				}
+				printf("adreno: fences raise the 3D core's interrupt (%u): %s\n", GPU_INTID,
+				    gpu_irq ? "waits sleep until it comes" : "NOT TAKEN, waits look again every 200 us");
+			}
 			gpu_kept = true;
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service RedwoodGPU\n");
