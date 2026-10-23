@@ -27,6 +27,8 @@ extern char *proc_name_address(struct proc *p);
 void user_exception_trace(exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t count, thread_t thread);
 
 static TUNABLE(uint32_t, user_exception_trace_enabled, "systrace", 0);
+/* the same without systrace's line for every failing system call, which can bury the one that matters */
+static TUNABLE(uint32_t, user_exception_trace_only, "exctrace", 0);
 
 static bool
 plausible_user_address(uint64_t address)
@@ -45,11 +47,16 @@ user_exception_trace(exception_type_t exception, mach_exception_data_t code, mac
 	task_t task;
 	struct proc *proc;
 
-	if (!user_exception_trace_enabled || thread != current_thread()) {
+	if ((!user_exception_trace_enabled && !user_exception_trace_only) || thread != current_thread()) {
 		return;
 	}
+	/*
+	 * ... and the ones that end a program without a fault of its own: a guard it broke (a port or a
+	 * descriptor; code 0 says which kind), a resource it ran out of, and EXC_CRASH, whose code holds
+	 * the signal that is ending it -- Maps went this way on 2026-10-24 and said nothing at all.
+	 */
 	if (exception != EXC_BAD_ACCESS && exception != EXC_BAD_INSTRUCTION && exception != EXC_ARITHMETIC &&
-	    exception != EXC_BREAKPOINT) {
+	    exception != EXC_BREAKPOINT && exception != EXC_GUARD && exception != EXC_RESOURCE && exception != EXC_CRASH) {
 		return;
 	}
 	task = get_threadtask(thread);
