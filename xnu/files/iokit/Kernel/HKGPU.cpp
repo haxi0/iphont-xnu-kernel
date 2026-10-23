@@ -21,10 +21,15 @@
  * them. Linux hands such memory around as file descriptors; here it has a name already. That
  * memory is ordinary, cached memory, which everybody else reads and writes as such.
  *
+ * Every client has page tables of its own (boot-arg gpu_pt, the default on the OnePlus 8; see
+ * hk_gpu_space_new() in bsd/dev/hk_adreno.c): the GPU reaches, while it runs a program's
+ * commands, that program's buffers and nothing else -- an IOSurface is shared by being entered
+ * into each program's tables that asks for it (surfaceBuffer()). A request the SMMU refuses is
+ * counted against the program (MSM_PARAM_FAULTS) and logged. Without gpu_pt (the redwood) every
+ * client's buffers are in the one address space.
+ *
  * Not here yet: interrupts on the redwood (there, waiting is asking again five times a millisecond;
- * the OnePlus 8's fences raise one, gpu_irq), more than one
- * program's worth of care (every client's buffers are in the one address space; a client that
- * goes takes its own away), fences and buffers as file descriptors. A GPU that has stopped
+ * the OnePlus 8's fences raise one, gpu_irq), fences and buffers as file descriptors. A GPU that has stopped
  * answering is reported (hk_gpu_report()) and, with boot-arg gpu_recover=1 (the default on
  * the OnePlus 8), reset and started again, so that the submission that hung is all that is lost: what that does and
  * which source says so is at hk_gpu_recover() in bsd/dev/hk_adreno.c. Without the
@@ -57,11 +62,18 @@ void hk_gpu_address_free(uint64_t address, uint64_t size);
 void hk_gpu_space(uint64_t * used, uint32_t * live, uint64_t * largest, unsigned * holes, unsigned * most,
     uint64_t * lost, uint32_t * refused);
 extern uint32_t gpu_va;                 /* boot-arg gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
-bool hk_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-void hk_gpu_mapped(void);
-void hk_gpu_unmap(uint64_t address, uint64_t size);
+struct gpu_space;                       /* a program's page tables (gpu_pt); NULL: the one space for everybody */
+extern uint32_t gpu_pt;
+struct gpu_space * hk_gpu_space_new(void);
+uint32_t hk_gpu_space_leave(struct gpu_space * space);
+bool hk_gpu_space_free(struct gpu_space * space);
+uint32_t hk_gpu_space_faults(struct gpu_space * space);
+void hk_gpu_faults(void);
+bool hk_gpu_map(struct gpu_space * space, uint64_t address, uint64_t phys, bool read_only);
+void hk_gpu_mapped(struct gpu_space * space);
+void hk_gpu_unmap(struct gpu_space * space, uint64_t address, uint64_t size);
 void hk_gpu_to_memory(void * start, uint64_t size);
-uint32_t hk_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+uint32_t hk_gpu_submit(struct gpu_space * space, const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hk_gpu_done(uint32_t fence);
 bool hk_gpu_interrupts(void);
@@ -312,6 +324,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
 		if (hk_gpu_done(fence)) {
+			hk_gpu_faults();
 			if (waited) {
 				gGPUStat.waits++;
 				gGPUStat.waiting += mach_absolute_time() - began;
@@ -341,6 +354,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	 * wait has failed, and says so: the submission did not finish.
 	 */
 	if (milliseconds >= 1000 && !gGPUReported) {
+		hk_gpu_faults();                /* (a fault is often why: said, and put down to its program, first) */
 		hk_gpu_report("no answer");
 		gGPUReported = !hk_gpu_recover();
 	}
@@ -538,6 +552,7 @@ class HKGPUUserClient : public IOUserClient
 	OSDeclareDefaultStructors(HKGPUUserClient);
 
 	task_t                  fTask;
+	struct gpu_space *      fSpace;                 /* its page tables (gpu_pt); NULL: the one space */
 	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextQueue;
 	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
@@ -590,6 +605,15 @@ HKGPUUserClient::start(IOService * provider)
 	if (!hk_gpu_ready() || !IOUserClient::start(provider)) {
 		return false;
 	}
+	if (gpu_pt) {
+		IOLockLock(gGPULock);
+		fSpace = hk_gpu_space_new();
+		IOLockUnlock(gGPULock);
+		if (fSpace == NULL) {
+			IOLog("HKGPU: no page tables for a program\n");
+			return false;
+		}
+	}
 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
 	return fBuffers != NULL;
 }
@@ -631,7 +655,7 @@ HKGPUUserClient::freeBuffer(struct gpu_buffer * b)
 		} else if (b->surface == NULL && hk_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
 			b->memory = NULL;               /* (now the kept one's) */
 		} else if (hk_gpu_ready()) {
-			hk_gpu_unmap(b->address, b->size);
+			hk_gpu_unmap(fSpace, b->address, b->size);
 			hk_gpu_address_free(b->address, b->size);
 		}
 		if (b->memory != NULL) {
@@ -662,7 +686,7 @@ HKGPUUserClient::reap(void)
 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
 			left->memory = NULL;
 		} else if (hk_gpu_ready()) {
-			hk_gpu_unmap(left->address, left->size);
+			hk_gpu_unmap(fSpace, left->address, left->size);
 			hk_gpu_address_free(left->address, left->size);
 		}
 		if (left->memory != NULL) {
@@ -695,6 +719,19 @@ HKGPUUserClient::clientClose(void)
 		}
 		if (fLeftCount != 0) {
 			IOLog("HKGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
+		}
+		/* its page tables, once the core has been switched out of them (and with nothing of the GPU's left in them) */
+		if (fSpace != NULL) {
+			uint32_t left = hk_gpu_space_leave(fSpace);
+
+			if (left != 0) {
+				gpuWait(left, 1000);
+			}
+			if (fLeftCount == 0 && hk_gpu_space_free(fSpace)) {
+				fSpace = NULL;
+			} else {
+				IOLog("HKGPU: the GPU may still be in the page tables of a program that is gone: they stay\n");
+			}
 		}
 		IOLockUnlock(gGPULock);
 	}
@@ -755,11 +792,11 @@ HKGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t 
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
 
-		mapped = phys != 0 && hk_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+		mapped = phys != 0 && hk_gpu_map(fSpace, b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
 	}
-	hk_gpu_mapped();
+	hk_gpu_mapped(fSpace);
 	if (!mapped) {
-		hk_gpu_unmap(b->address, size);
+		hk_gpu_unmap(fSpace, b->address, size);
 		hk_gpu_address_free(b->address, size);
 		IOLog("HKGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
 		return NULL;
@@ -784,7 +821,7 @@ HKGPUUserClient::dropKept(struct gpu_kept * k)
 		return;
 	}
 	if (hk_gpu_ready()) {
-		hk_gpu_unmap(k->address, k->size);
+		hk_gpu_unmap(fSpace, k->address, k->size);
 		hk_gpu_address_free(k->address, k->size);
 	}
 	k->memory->release();
@@ -1006,18 +1043,16 @@ HKGPUUserClient::gemInfo(struct msm_gem_info * request)
 		request->value = b->address;
 	} else if (request->info == MSM_INFO_SET_IOVA) {
 		/*
-		 * Where a buffer goes is not the program's to choose here: every client is in the
-		 * one SMMU context 0, so an address one program picked would be a place in every
-		 * other program's space as well. Linux draws the line in the same place for the
-		 * two parameters that describe a space -- VA_START and VA_SIZE are refused unless
-		 * the client has page tables of its own (adreno_gpu.c, adreno_get_param) -- and
-		 * placing a buffer is the stronger request of the two. Said once, by name, rather
-		 * than returned as a bare code nobody can look up.
+		 * Where a buffer goes is not the program's to choose here: addresses come out of one
+		 * list for every client (bsd/dev/hk_adreno.c, hk_gpu_address), with page tables
+		 * of its own (gpu_pt) or without, where every client is in the one space and an
+		 * address one program picked would be a place in every other program's as well.
+		 * Said once, by name, rather than returned as a bare code nobody can look up.
 		 */
 		if (!gGPUSaidSetIova) {
 			gGPUSaidSetIova = true;
-			IOLog("HKGPU: a program asked to place buffer %u at %#llx itself: refused. There is one "
-			    "page table here for every client, so addresses are the kernel's to give and "
+			IOLog("HKGPU: a program asked to place buffer %u at %#llx itself: refused. Addresses "
+			    "come out of one list for every client, so they are the kernel's to give and "
 			    "MSM_INFO_GET_IOVA is how to learn them\n", request->handle, request->value);
 		}
 		ret = kIOReturnUnsupported;
@@ -1111,7 +1146,7 @@ HKGPUUserClient::submit(struct msm_gem_submit * request)
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
 	}
-	request->fence = hk_gpu_submit(addresses, words, count);
+	request->fence = hk_gpu_submit(fSpace, addresses, words, count);
 	/*
 	 * The ring is full and the core is not reading it: it has stopped. With gpu_recover=1 it is
 	 * reset and given this submission again -- after a reset the ring is empty, so there is
@@ -1122,7 +1157,7 @@ HKGPUUserClient::submit(struct msm_gem_submit * request)
 		hk_gpu_report("the ring is full");
 		gGPUReported = !hk_gpu_recover();
 		if (!gGPUReported) {
-			request->fence = hk_gpu_submit(addresses, words, count);
+			request->fence = hk_gpu_submit(fSpace, addresses, words, count);
 		}
 	}
 	if (gpu_log && request->fence != 0) {
@@ -1161,6 +1196,7 @@ HKGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 	}
 	reap();
+	hk_gpu_faults();
 	if (fSubmits++ < 4) {
 		IOLog("HKGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
 		    addresses[0], words[0]);
@@ -1319,6 +1355,13 @@ HKGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * a
 
 	switch (selector) {
 	case kMsmGetParam:
+		if (r.param.param == 0x09) {            /* FAULTS: requests of this program's the SMMU refused (Linux: per address space) */
+			IOLockLock(gGPULock);
+			hk_gpu_faults();
+			r.param.value = hk_gpu_space_faults(fSpace);
+			IOLockUnlock(gGPULock);
+			break;
+		}
 		ret = hk_gpu_parameter(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
 		break;
 	case kMsmSetParam:                              /* the program's name, for Linux's lists of who uses the GPU */

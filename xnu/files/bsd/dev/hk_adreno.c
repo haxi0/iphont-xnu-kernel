@@ -1286,26 +1286,30 @@ struct gpu_space {
 	} tables[SPACE_TABLES];
 	uint64_t *last_entry, *last_table;      /* the level 2 entry looked up last, and its table */
 	uint32_t last_changed;                  /* the table an entry was written in last */
+	vm_offset_t spare;                      /* a page of ours that tables are cut from, four of 4K each, */
+	unsigned spare_left;                    /* ... and how many of them are left: a space's pages are its own (space_free()) */
+	uint32_t faults;                        /* requests its context refused while these were its tables (hk_gpu_faults()) */
+	bool left;                              /* the ring has switched away from it for good, at submission */
+	uint32_t left_at;                       /* ... this one (hk_gpu_space_leave()) */
+	struct gpu_space *next;                 /* the programs' spaces, in a list (hk_gpu_space_new()) */
 };
 
 static uint64_t *
 space_new_table(struct gpu_space *space)
 {
-	static vm_offset_t spare;
-	static unsigned spare_left;
 	uint64_t *table;
 
 	if (space->table_count == SPACE_TABLES) {
 		return NULL;
 	}
-	if (spare_left == 0) {
-		if (kmem_alloc(kernel_map, &spare, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
-		    KERN_SUCCESS) {
+	if (space->spare_left == 0) {
+		if (kmem_alloc(kernel_map, &space->spare, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 			return NULL;
 		}
-		spare_left = PAGE_SIZE / 4096;
+		space->spare_left = PAGE_SIZE / 4096;
 	}
-	table = (uint64_t *)(spare + PAGE_SIZE - 4096 * spare_left--);
+	table = (uint64_t *)(space->spare + PAGE_SIZE - 4096 * space->spare_left--);
 	space->tables[space->table_count].phys = kvtophys((vm_offset_t)table);
 	space->tables[space->table_count++].table = table;
 	return table;
@@ -1565,8 +1569,8 @@ space_off(struct gpu_space *space, uint32_t match)
 
 /* One call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
 static int32_t
-scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
-    uint64_t *answer)
+scm4(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+    uint64_t fourth, uint64_t *answer)
 {
 	uint64_t session = 0;
 
@@ -1580,7 +1584,7 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		register uint64_t x2 __asm__("x2") = first;
 		register uint64_t x3 __asm__("x3") = second;
 		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
+		register uint64_t x5 __asm__("x5") = fourth;
 		register uint64_t x6 __asm__("x6") = session;
 		register uint64_t x7 __asm__("x7") = 0;
 
@@ -1595,6 +1599,13 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 	}
 	printf("adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
 	return -1;
+}
+
+static int32_t
+scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+    uint64_t *answer)
+{
+	return scm4(what, function, arguments, first, second, third, 0, answer);
 }
 
 static bool
@@ -2533,6 +2544,19 @@ static struct gpu_space second_space = {
 };
 #define SECOND_MATCH            2
 static bool second_space_is_on, second_stream_is_on;
+/*
+ * Boot-arg gpu_pt (1 by default on the OnePlus 8): every program that opens HKGPU has page tables of
+ * its own, and the 3D core reaches only that program's buffers while it runs that program's commands
+ * (hk_gpu_space_new() below; Linux's msm per-process page tables). It takes three things of the
+ * core besides, all as Linux sets them for this GPU and all from here on, so that a program's
+ * commands cannot undo it: its ring and the page it writes fences into are the core's privileged
+ * memory (Linux: MSM_BO_MAP_PRIV, with CP_APRIV_CNTL as step 20 writes it), its registers that
+ * matter are out of reach of a program's commands (a6xx_set_cp_protect, a650_protect_regs), and
+ * TrustZone lets the command processor itself change context 0's tables (the "SMMU aperture",
+ * adreno_hw_init). 0: one space for everybody, as before.
+ */
+uint32_t gpu_pt;
+#define PTE_PRIVILEGED          PTE_GMU         /* the 3D core's privileged accesses alone (no PTE_UNPRIVILEGED) */
 static struct gpu_block core_ring, core_sqe, core_scratch, core_target;
 static bool core_space_is_on, core_runs, zap_is_loaded;
 #define RING_WORDS              (CORE_RING_SIZE / 4)
@@ -2630,9 +2654,10 @@ step_core_space(void)
 	    "make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
 	microcode = image_file("fw", FW("sqe.fw"), &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
-	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
+	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE,
+	    gpu_pt ? PTE_PRIVILEGED | PTE_READ_ONLY : PTE_CORE) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
-	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, PTE_CORE)) {
+	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, gpu_pt ? PTE_PRIVILEGED : PTE_CORE)) {
 		return false;
 	}
 	memcpy((void *)core_sqe.memory, microcode + 4, size - 4);       /* the file's first word is not microcode */
@@ -2771,6 +2796,72 @@ step_zap_load(void)
 #define HIGHEST_BANK_BIT        (kona ? 16u : 14u)
 #define HBB_LO                  ((HIGHEST_BANK_BIT - 13) & 3)   /* (and its high bit, 0 for both) */
 
+/*
+ * gpu_pt: what keeps one program's commands from reaching past its own page tables (see gpu_pt above).
+ *
+ * The registers: Linux's a650_protect_regs (a6xx_catalog.c), word number and count, as
+ * a6xx_set_cp_protect writes them -- a command of a program's that reads one marked "no read
+ * or write", or writes any of them, stops the command processor with a protection fault
+ * (CP_PROTECT_STATUS says which), which is a hang like any other (hk_gpu_recover()). The last
+ * entry goes in the last register and reaches to the end of the registers.
+ *
+ * The aperture: qcom_scm_set_gpu_smmu_aperture(0) (service MP, command 0x1b), which Linux and
+ * Qualcomm's kgsl make on every a6xx before the core starts; without it the command processor's
+ * CP_SMMU_TABLE_UPDATE does not reach the SMMU. Not offered, or refused: one space for everybody.
+ */
+#define CP_PROTECT_CNTL         GPU_WORD(0x084f)
+#define CP_PROTECT(n)           GPU_WORD(0x0850 + (n))
+#define CP_PROTECTS             48
+#define PROTECT_NORDWR(word, count) (1u << 31 | (count) << 18 | (word))
+#define PROTECT_RDONLY(word, count) ((count) << 18 | (word))
+#define SCM_CP_SMMU_APERTURE    SCM_CALL(0x0c, 0x1b)
+static bool gpu_kept;                   /* (below: the GPU kept on, for the system to draw with) */
+
+static bool
+core_protect(void)
+{
+	static const uint32_t a650[] = {
+		PROTECT_RDONLY(0x00000, 0x04ff), PROTECT_RDONLY(0x00501, 0x0005), PROTECT_RDONLY(0x0050b, 0x02f4),
+		PROTECT_NORDWR(0x0050e, 0x0000), PROTECT_NORDWR(0x00510, 0x0000), PROTECT_NORDWR(0x00534, 0x0000),
+		PROTECT_NORDWR(0x00800, 0x0082), PROTECT_NORDWR(0x008a0, 0x0008), PROTECT_NORDWR(0x008ab, 0x0024),
+		PROTECT_RDONLY(0x008de, 0x00ae), PROTECT_NORDWR(0x00900, 0x004d), PROTECT_NORDWR(0x0098d, 0x0272),
+		PROTECT_NORDWR(0x00e00, 0x0001), PROTECT_NORDWR(0x00e03, 0x000c), PROTECT_NORDWR(0x03c00, 0x00c3),
+		PROTECT_RDONLY(0x03cc4, 0x1fff), PROTECT_NORDWR(0x08630, 0x01cf), PROTECT_NORDWR(0x08e00, 0x0000),
+		PROTECT_NORDWR(0x08e08, 0x0000), PROTECT_NORDWR(0x08e50, 0x001f), PROTECT_NORDWR(0x08e80, 0x027f),
+		PROTECT_NORDWR(0x09624, 0x01db), PROTECT_NORDWR(0x09e60, 0x0011), PROTECT_NORDWR(0x09e78, 0x0187),
+		PROTECT_NORDWR(0x0a630, 0x01cf), PROTECT_NORDWR(0x0ae02, 0x0000), PROTECT_NORDWR(0x0ae50, 0x032f),
+		PROTECT_NORDWR(0x0b604, 0x0000), PROTECT_NORDWR(0x0b608, 0x0007), PROTECT_NORDWR(0x0be02, 0x0001),
+		PROTECT_NORDWR(0x0be20, 0x17df), PROTECT_NORDWR(0x0f000, 0x0bff), PROTECT_RDONLY(0x0fc00, 0x1fff),
+		PROTECT_NORDWR(0x18400, 0x1fff), PROTECT_NORDWR(0x1a800, 0x1fff), PROTECT_NORDWR(0x1f400, 0x0443),
+		PROTECT_RDONLY(0x1f844, 0x007b), PROTECT_NORDWR(0x1f887, 0x001b), PROTECT_NORDWR(0x1f8c0, 0x0000),
+	};
+	const unsigned count = sizeof(a650) / sizeof(a650[0]);
+	uint64_t answer = 0;
+
+	if (!kona) {
+		/* shortcut: only the A650's list is here; the redwood's A660 list (a660_protect_regs) when it is tried there */
+		printf("adreno: %u: gpu_pt: no list of the registers to protect for this GPU: one space for everybody\n", step);
+		gpu_pt = 0;
+		return true;
+	}
+	if (scm("whether it lets the command processor change the GPU's page tables", SCM_64 | SCM_SIP |
+	    SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_CP_SMMU_APERTURE, 0, 0, &answer) != 0 || answer != 1 ||
+	    scm4("to let it (context 0)", SCM_64 | SCM_SIP | SCM_CP_SMMU_APERTURE, 4, 0xffff0000, 0xffffffff, 0xffffffff,
+	    0xffffffff, &answer) != 0) {
+		/* (again after a reset, programs have spaces of their own by now: a core that cannot switch them stays stopped) */
+		printf("adreno: %u: gpu_pt: TrustZone does not let the command processor change the page tables: %s\n", step,
+		    gpu_kept ? "THE 3D CORE IS NOT STARTED AGAIN" : "one space for everybody");
+		gpu_pt = gpu_kept ? gpu_pt : 0;
+		return !gpu_kept;
+	}
+	put(&gpu, "cp_protect_cntl", CP_PROTECT_CNTL, 1u << 0 | 1u << 1 | 1u << 3);    /* on; a fault; the last reaches the end */
+	for (unsigned i = 0; i < count - 1; i++) {
+		put(&gpu, "cp_protect", CP_PROTECT(i), a650[i]);
+	}
+	put(&gpu, "cp_protect", CP_PROTECT(CP_PROTECTS - 1), a650[count - 1]);
+	return true;
+}
+
 static bool
 step_core_start(void)
 {
@@ -2826,6 +2917,9 @@ step_core_start(void)
 	if (!kona) {                    /* (Linux, kgsl: the A660 family's alone) */
 		put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
 		put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	}
+	if (gpu_pt && !core_protect()) {
+		return false;
 	}
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
 	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, 0x04100000);     /* Mesa's value for this GPU */
@@ -3256,8 +3350,8 @@ hk_adreno_quiesce(void)
  * such a submission is only reported, and the GPU stays stopped.
  */
 #define GPU_CHIP_ID             (kona ? 0x06050002ull : 0x06030500ull)  /* dt: qcom,chipid */
-#define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
-#define GPU_ADDRESSES_SIZE      0xe0000000ull
+#define GPU_ADDRESSES_START     0x40000000ull   /* above the first GB, the steps' and every program's (hk_gpu_space_new()); below 4 GB, as Linux keeps them */
+#define GPU_ADDRESSES_SIZE      0xc0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
 #define GPU_TIMES_AT            0x400           /* ... and when the core began and ended each of its last submissions */
 #define GPU_TIMES               64
@@ -3269,6 +3363,8 @@ hk_adreno_quiesce(void)
 #define CP_IB2_BASE             GPU_WORD(0x092b)
 #define CP_IB2_REM_SIZE         GPU_WORD(0x092d)
 #define CP_INDIRECT_BUFFER      0x3f
+#define CP_SMMU_TABLE_UPDATE    0x53            /* (gpu_pt: hk_gpu_space_new() below) */
+#define EVENT_CACHE_INVALIDATE  0x31
 #define EVENT_INVALIDATE_DEPTH  0x18
 #define EVENT_INVALIDATE_COLOR  0x19
 /* and, for a core that has stopped answering (gpu_recover=1: hk_gpu_recover() below) */
@@ -3332,12 +3428,16 @@ static unsigned gpu_free_count;
  * sets bo->iova from msm_bo_iova(), one GEM_INFO call per buffer -- so the kernel is the
  * allocator for both of this port's consumers and neither of them fights it.
  *
- * One thing to know before anything is built on these addresses: there is one space, so an
- * address is the same memory in every program. That is what makes an argument buffer possible
- * at all -- a buffer of addresses means something wherever it is read -- and it is also why
- * one program's shader can reach another's buffers by naming an address it was never given.
- * Nothing here can check an address a shader computes; only page tables of the client's own
- * could, and there is one context for everybody (space_on() above, context 0).
+ * With gpu_pt (the default on the OnePlus 8) every program has page tables of its own
+ * (hk_gpu_space_new() below), and a shader that names an address it was never given reaches
+ * nothing: the SMMU refuses it and says so (hk_gpu_faults()). The addresses are still handed out
+ * of the one list for all of them -- a buffer's address is unique in the run, not only in its
+ * program -- which costs nothing while all of them together stay under 3 GB, and means that a
+ * table switched late or a TLB entry kept too long ends in a refusal and never in somebody else's
+ * memory. The first GB is the steps' and is in every program's tables (the ring and the fence
+ * page as the core's privileged memory, which a program's commands cannot reach).
+ * Without gpu_pt there is one space, and an address is the same memory in every program: one
+ * program's shader can reach another's buffers by naming an address it was never given.
  *
  * boot-arg gpu_va:
  *   0 (the default)  as it has always been. Addresses packed one allocation after another,
@@ -3355,7 +3455,8 @@ static unsigned gpu_free_count;
  * Why VA_START and VA_SIZE are behind the arg rather than always answered: in msm they mean
  * "this space is yours to place buffers in", and msm refuses them outright to a client that
  * does not have page tables of its own (adreno_gpu.c, adreno_get_param: -EINVAL when
- * ctx->aspace == gpu->aspace). Here every client is in the one context 0, so the honest
+ * ctx->aspace == gpu->aspace). Here, with page tables of its own (gpu_pt) or without, a client
+ * does not own the range -- the addresses of all of them come out of one list -- so the honest
  * default is msm's refusal; with the arg they are answered as what they are here, which is
  * the range the kernel allocates out of -- a number to size a heap or maxBufferLength against,
  * not a licence to place anything. Nothing in Mesa is affected either way: freedreno asks
@@ -3584,32 +3685,203 @@ hk_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes,
 	*refused = gpu_va_refused;
 }
 
-/* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, hk_gpu_mapped(). */
+/*
+ * One 4K page of ours at an address of the 3D core's, in a program's space (NULL: the one space,
+ * without gpu_pt); after the last of a buffer's, hk_gpu_mapped().
+ */
 bool
-hk_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+hk_gpu_map(struct gpu_space *space, uint64_t address, uint64_t phys, bool read_only)
 {
-	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
+	return space_map(space != NULL ? space : &core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
 }
 
 void
-hk_gpu_mapped(void)
+hk_gpu_mapped(struct gpu_space *space)
 {
-	space_commit(&core_space);
+	space_commit(space != NULL ? space : &core_space);
 }
 
+/*
+ * Every space's tables are tagged alike (ASID 0, as Linux's msm_iommu_pagetable_create has
+ * them), so forgetting that context's translations forgets those of the space switched to last
+ * as well as this one's, whichever the core is in.
+ */
 void
-hk_gpu_unmap(uint64_t address, uint64_t size)
+hk_gpu_unmap(struct gpu_space *space, uint64_t address, uint64_t size)
 {
 	uint32_t context = smmu_context(&core_space);
 
+	space = space != NULL ? space : &core_space;
 	for (uint64_t offset = 0; offset < size; offset += 4096) {
-		space_map(&core_space, address + offset, 0, 0);
+		space_map(space, address + offset, 0, 0);
 	}
-	space_commit(&core_space);
+	space_commit(space);
 	wr(smmu.base + context + SMMU_CB_TLBIASID, core_space.context);
 	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
 	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
 	}
+}
+
+/*
+ * ---- gpu_pt: a program's own page tables --------------------------------------------------
+ *
+ * Linux's msm, per-process page tables, for this GPU: one SMMU context (0) for the 3D core
+ * whatever it runs, and the root of its tables changed by the command processor itself, in the
+ * ring, between one program's submissions and the next's (a6xx_set_pagetable: CP_SMMU_TABLE_UPDATE,
+ * then CACHE_INVALIDATE so that nothing of the last program's lingers in the core's caches). The
+ * ring is in order, so the switch takes effect exactly between the two programs' commands, and
+ * nobody waits for it. Linux puts the kernel's own memory behind TTBR1; here the steps' first GB
+ * is entered in every program's root as the same level 2 table (the core's own), which needs
+ * no change of the steps' constant addresses.
+ *
+ * A space is freed only once the core is known to be in some other one: hk_gpu_space_leave()
+ * switches the ring back to the core's own tables, and hk_gpu_space_free() refuses while that
+ * has not been done.
+ */
+static struct gpu_space *ring_space = &core_space;     /* whose tables the ring switched to last; NULL: not known */
+static struct gpu_space *gpu_spaces;                   /* the programs' */
+static uint32_t gpu_space_count;
+
+struct gpu_space *
+hk_gpu_space_new(void)
+{
+	struct gpu_space *space;
+	vm_offset_t memory;
+
+	if (!gpu_pt || core_space.root == NULL || !(core_space.root[0] & 1)) {
+		return NULL;
+	}
+	if (kmem_alloc(kernel_map, &memory, round_page(sizeof(*space)), KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		return NULL;
+	}
+	space = (struct gpu_space *)memory;
+	space->name = "a program";
+	space->context = core_space.context;
+	if ((space->root = space_new_table(space)) == NULL) {
+		kmem_free(kernel_map, memory, round_page(sizeof(*space)));
+		return NULL;
+	}
+	space->root[0] = core_space.root[0];    /* the steps' first GB: the core's own level 2 table */
+	space_changed(space, space->root);
+	space_commit(space);
+	space->next = gpu_spaces;
+	gpu_spaces = space;
+	gpu_space_count++;
+	return space;
+}
+
+/* The command processor is to switch to `space`'s tables before the commands that follow in the ring. */
+static void
+ring_table(struct gpu_space *space)
+{
+	uint64_t root = space->tables[0].phys;
+
+	ring_command(CP_SMMU_TABLE_UPDATE, 4);
+	ring((uint32_t)root);
+	ring((uint32_t)(root >> 32) & 0xffff);  /* ASID 0 above it */
+	ring(0);                                /* CONTEXTIDR: not for this format of tables */
+	ring(core_space.context);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_CACHE_INVALIDATE);
+	ring_space = space;
+}
+
+/*
+ * Before a space goes, once its program submits nothing more: the number of a submission after
+ * which the core is not in its tables (0: nothing to wait for). If the ring takes nothing more,
+ * the space is not left, and hk_gpu_space_free() keeps it.
+ */
+uint32_t
+hk_gpu_space_leave(struct gpu_space *space)
+{
+	uint32_t fence = gpu_fence;             /* (the switch away from it, if there was one, is at or before this one) */
+
+	if (space == NULL || !gpu_kept) {
+		return 0;
+	}
+	if (ring_space == space || ring_space == NULL) {
+		fence = hk_gpu_submit(NULL, NULL, NULL, 0);
+		if (fence == 0) {
+			return 0;
+		}
+	}
+	space->left = true;
+	space->left_at = fence;
+	return fence;
+}
+
+/*
+ * A space whose buffers are all unmapped, and that the core has left (hk_gpu_space_leave(), and
+ * its submission done); false: it may still be in use, and stays, its tables lost to the run.
+ */
+bool
+hk_gpu_space_free(struct gpu_space *space)
+{
+	struct gpu_space **link;
+
+	if (space == NULL) {
+		return true;
+	}
+	if (gpu_kept && (!space->left || ring_space == space || ring_space == NULL || !hk_gpu_done(space->left_at))) {
+		return false;
+	}
+	for (link = &gpu_spaces; *link != NULL && *link != space; link = &(*link)->next) {
+	}
+	if (*link != NULL) {
+		*link = space->next;
+		gpu_space_count--;
+	}
+	for (uint32_t i = 0; i < space->table_count; i++) {
+		if (((vm_offset_t)space->tables[i].table & PAGE_MASK) == 0) {     /* (the first of a page's four) */
+			kmem_free(kernel_map, (vm_offset_t)space->tables[i].table, PAGE_SIZE);
+		}
+	}
+	kmem_free(kernel_map, (vm_offset_t)space, round_page(sizeof(*space)));
+	return true;
+}
+
+/*
+ * What context 0 has refused since this was last asked, put down to the space whose tables it
+ * was walking (CB_TTBR0 says which: the command processor writes it). With serve-after-fault
+ * on, a refused read gives zeroes and a refused write is dropped, and the core goes on; so this
+ * is the only word of it. Linux counts the same per address space (msm_gpu_fault_crashstate_capture,
+ * MSM_PARAM_FAULTS).
+ */
+void
+hk_gpu_faults(void)
+{
+	static uint32_t said;
+	uint32_t context = smmu_context(&core_space), status;
+	uint64_t root, address;
+	struct gpu_space *space;
+
+	if (!gpu_kept || ((status = rd(smmu.base + context + SMMU_CB_FSR)) & SMMU_FSR_ALL) == 0) {
+		return;
+	}
+	address = (uint64_t)rd(smmu.base + context + SMMU_CB_FAR + 4) << 32 | rd(smmu.base + context + SMMU_CB_FAR);
+	root = ((uint64_t)rd(smmu.base + context + SMMU_CB_TTBR0 + 4) << 32 | rd(smmu.base + context + SMMU_CB_TTBR0)) &
+	    PTE_ADDRESS;
+	for (space = gpu_spaces; space != NULL && space->tables[0].phys != root; space = space->next) {
+	}
+	if (space == NULL && core_space.tables[0].phys == root) {
+		space = &core_space;
+	}
+	if (space != NULL) {
+		space->faults++;
+	}
+	if (said++ < 32) {
+		printf("adreno: gpu: THE SMMU REFUSED the 3D core in %s: address %#llx, status %#x, syndrome %#x\n",
+		    space == NULL ? "tables nobody has" : space == &core_space ? "the kernel's own tables" : "a program's tables",
+		    address, status, rd(smmu.base + context + SMMU_CB_FSYNR0));
+	}
+	wr(smmu.base + context + SMMU_CB_FSR, status);
+}
+
+uint32_t
+hk_gpu_space_faults(struct gpu_space *space)
+{
+	return space != NULL ? space->faults : core_space.faults;
 }
 
 /* Memory that the 3D core and a program see without this processor's cache in between: out of that cache. */
@@ -3732,14 +4004,14 @@ hk_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 }
 
 /*
- * Command buffers for the 3D core to run, in order: each an address and a count of words. As
- * Linux's a6xx_submit puts them in the ring. Returns the submission's number; 0: the ring is
- * full and the core is not reading it.
+ * Command buffers for the 3D core to run, in order: each an address and a count of words, in
+ * `space`'s addresses (NULL: the core's own). As Linux's a6xx_submit puts them in the ring.
+ * Returns the submission's number; 0: the ring is full and the core is not reading it.
  */
 uint32_t
-hk_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+hk_gpu_submit(struct gpu_space *space, const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
-	uint32_t wanted = 26 + 4 * count, room = 0;
+	uint32_t wanted = 33 + 4 * count, room = 0;
 
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
@@ -3754,6 +4026,9 @@ hk_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 	gpu_times();
 	if (++gpu_fence == 0) {
 		gpu_fence = 1;
+	}
+	if ((space != NULL ? space : &core_space) != ring_space) {
+		ring_table(space != NULL ? space : &core_space);
 	}
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -3857,6 +4132,7 @@ bool
 hk_gpu_recover(void)
 {
 	uint32_t fence_status;
+	bool started;
 
 	if (!gpu_kept || !gpu_recover) {
 		return false;
@@ -3907,11 +4183,22 @@ hk_gpu_recover(void)
 	    rd(gpu.base + RBBM_INT_0_STATUS), ring_at, rd(gmu.base + GMU_AO_GPU_CX_BUSY_STATUS),
 	    rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS), fence_status);
 
-	if (!step_core_start() || !step_core_commands()) {
+	/*
+	 * gpu_pt: whether the switch in the ring before the hang was carried out is not known, and the
+	 * tables the core is in may be those of a program about to go; so the core is put in its own
+	 * before anything else is given it (hk_gpu_space_free() relies on it).
+	 */
+	started = step_core_start() && step_core_commands();
+	if (started && gpu_pt) {
+		ring_table(&core_space);
+		started = ring_run("go back to the kernel's own page tables");
+	}
+	if (!started) {
 		printf("adreno: gpu: THE 3D CORE DOES NOT TAKE COMMANDS AGAIN after the reset: it is given up for this run, as it "
 		    "would have been without gpu_recover=1\n");
 		wr(gmu.base + GMU_PWR_COL_KEEPALIVE, 0);
 		quiet = true;
+		ring_space = NULL;              /* (not known: no program's tables are freed from now on) */
 		return false;
 	}
 	wr(gmu.base + GMU_PWR_COL_KEEPALIVE, 0);
@@ -4223,6 +4510,8 @@ hk_adreno_init(void)
 	bool by_itself = false;
 
 	kona = instantnoodle_board();
+	gpu_pt = kona;
+	PE_parse_boot_argn("gpu_pt", &gpu_pt, sizeof(gpu_pt));
 	if (kona) {
 		/* dt: qcom,gmu@3d6a000 0x30000 long; kgsl-smmu@3da0000 0x10000 (eight pages of 4K, by its ID registers) */
 		gmu.size = 0x30000;

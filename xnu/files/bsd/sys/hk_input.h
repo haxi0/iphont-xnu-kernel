@@ -117,11 +117,18 @@ void hk_gpu_address_free(uint64_t address, uint64_t size);
 void hk_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most,
     uint64_t *lost, uint32_t *refused);
 extern uint32_t gpu_va;                 /* boot-arg gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
-bool hk_gpu_map(uint64_t address, uint64_t phys, bool read_only);
-void hk_gpu_mapped(void);
-void hk_gpu_unmap(uint64_t address, uint64_t size);
+struct gpu_space;                       /* a program's page tables (gpu_pt); NULL: the one space for everybody */
+extern uint32_t gpu_pt;
+struct gpu_space *hk_gpu_space_new(void);
+uint32_t hk_gpu_space_leave(struct gpu_space *space);
+bool hk_gpu_space_free(struct gpu_space *space);
+uint32_t hk_gpu_space_faults(struct gpu_space *space);
+void hk_gpu_faults(void);
+bool hk_gpu_map(struct gpu_space *space, uint64_t address, uint64_t phys, bool read_only);
+void hk_gpu_mapped(struct gpu_space *space);
+void hk_gpu_unmap(struct gpu_space *space, uint64_t address, uint64_t size);
 void hk_gpu_to_memory(void *start, uint64_t size);
-uint32_t hk_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+uint32_t hk_gpu_submit(struct gpu_space *space, const uint64_t *addresses, const uint32_t *words, uint32_t count);
 bool hk_gpu_done(uint32_t fence);
 uint32_t hk_gpu_last(void);
 void hk_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
