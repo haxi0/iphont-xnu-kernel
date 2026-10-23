@@ -137,7 +137,7 @@ What has been seen working on the phone itself (the kernel's log of a run says e
 | Haptics from iOS (Awinic AW8697): system feedback, CoreHaptics | `haptic=5`, `fw-haptic` | Cameras, sensors, Bluetooth |
 | Flashlight from iOS (PM8150L flash LED, both LEDs) | `torch=3` | Charging control (it charges as the boot chain set it up) |
 | Adreno 650 drawing for CoreAnimation (Mesa/freedreno, OpenGL ES); its speed follows its load (305-525 MHz), a hang is recovered; every program has GPU page tables of its own, and its commands cannot reach another's memory, the kernel's ring or the GPU's protected registers (`RC_JOBS=rc.jobs.gpuiso`) | `gpu=1`, `fw-gpu`, images with `GL=1` (from a cold start too); `gpu_dcvs=0` / `gpu_recover=0` / `gpu_pt=0` turn those off | third-party Metal apps (none tried yet) |
-| Metal driver on the Adreno 650: blits, clears, 4x MSAA resolve, command-buffer completion; 263 of Apple's 271 fragment shaders draw, the 258 compared agree with softpipe | `metal=1` (test programs) | Metal heaps, fences, events |
+| Metal driver on the Adreno 650: blits, clears, 4x MSAA resolve, command-buffer completion, fences, events and shared events, heaps (`metal_sync_test`); 263 of Apple's 271 fragment shaders draw, the 258 compared agree with softpipe; Apple Maps runs on it: its pipelines build and its command buffers complete without error (`RC_JOBS=rc.jobs.maps`, offline, no picture checked) | `metal=1` (test programs), `metal=2` (the system) | shared events across processes; heaps do not suballocate |
 
 Run `xl enter` with the profile loaded (`common/run.sh instantnoodle`, or `. common/lib.sh; load_device
 instantnoodle` first): a bare `./xl enter` builds redwood's UEFI, which hangs this phone on its fastboot logo
