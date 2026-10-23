@@ -44,14 +44,14 @@ code += r'''
 #define CMD_READ_ALL 0x61
 #define PANEL_W 1080
 #define PANEL_H 2400
-#define REDWOOD_TOUCH_DOWN 1
-#define REDWOOD_TOUCH_MOVE 2
-#define REDWOOD_TOUCH_UP 3
+#define HK_TOUCH_DOWN 1
+#define HK_TOUCH_MOVE 2
+#define HK_TOUCH_UP 3
 static struct { uint32_t x, y; bool down; } finger[MAX_FINGERS];
 static unsigned events, posted, reads, left_events;
 static int read_error;
 static uint8_t packet[8];
-static void redwood_touch_post(unsigned kind, unsigned id, unsigned x, unsigned y) {
+static void hk_touch_post(unsigned kind, unsigned id, unsigned x, unsigned y) {
     assert(kind >= 1 && kind <= 3 && id < 10 && x <= 65535 && y <= 65535);
     posted++;
 }
