@@ -134,7 +134,7 @@ What has been seen working on the phone itself (the kernel's log of a run says e
 | Battery: level, voltage, current, charging (TI bq27541 gauge, PM8150B USB input) | on with `board=instantnoodle` | Sound (TFA9894 amplifiers, WCD938x codec) |
 | Haptics from iOS (Awinic AW8697): system feedback, CoreHaptics | `haptic=5`, `fw-haptic` | Cameras, sensors, Bluetooth |
 | Flashlight from iOS (PM8150L flash LED, both LEDs) | `torch=3` | Charging control (it charges as the boot chain set it up) |
-| Adreno 650 drawing for CoreAnimation (Mesa/freedreno, OpenGL ES) | `gpu=1`, `fw-gpu`, images with `GL=1`; after a cold power-on, one run with `adreno=21 adreno_return=1 adreno_watch=3` first | `gpu=1` straight from a cold power-on (CrashDump mode); third-party Metal apps (none tried yet) |
+| Adreno 650 drawing for CoreAnimation (Mesa/freedreno, OpenGL ES) | `gpu=1`, `fw-gpu`, images with `GL=1` (from a cold start too) | third-party Metal apps (none tried yet) |
 | Metal driver on the Adreno 650: blits, clears, 4x MSAA resolve, command-buffer completion; 263 of Apple's 271 fragment shaders draw, the 258 compared agree with softpipe | `metal=1` (test programs) | Metal heaps, fences, events |
 
 Run `xl enter` with the profile loaded (`common/run.sh instantnoodle`, or `. common/lib.sh; load_device

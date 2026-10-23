@@ -74,9 +74,9 @@ XL_SECS=180 XL_FOLLOW=4 XL_FOLLOW_KEEP=1 XL_CMDLINE="cpus=8 cpufreq=1 bootcpu=7 
 python3 tools/pipeline-latency.py logs/HHMMSS-run.log logs/HHMMSS-run.log.live.*
 ```
 
-`gpu=1` is only safe when the GPU is already warm. From a cold power-on its early bring-up sends the phone to
-CrashDump mode: three out of three times. First do one run with `adreno=21 adreno_return=1 adreno_watch=3`
-(the bring-up ~60 s into boot), then `gpu=1` works for the rest of that loader session.
+`gpu=1` works from a cold start (logs `180011`, `180356`). It used to send the phone to CrashDump mode there: this
+TrustZone crashes when asked to give up the zap shader (image 13) before it has been handed that image's header in
+this boot, and step 19 asked exactly that first. The header now goes first (`step_zap_load`, `redwood_adreno.c`).
 
 Host checks: `CC=clang python3 tools/instantnoodle-input-test.py`, `python3 tools/pipeline-latency.py --self-test`.
 

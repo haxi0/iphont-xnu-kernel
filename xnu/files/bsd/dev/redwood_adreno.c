@@ -1716,6 +1716,8 @@ zap_header(uint64_t *phys)
 	return true;
 }
 
+static bool zap_signed;                 /* TrustZone has been handed the header in this run (step 12 or 19) */
+
 static bool
 step_zap_signature(void)
 {
@@ -1732,6 +1734,7 @@ step_zap_signature(void)
 	    header, 0, &answer);
 	if (result == 0 && answer == 0) {
 		printf("adreno: %u: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n", step);
+		zap_signed = true;
 		return true;
 	}
 	printf("adreno: %u: TrustZone does not take it: the call returns %d, its answer is %#llx\n", step, result, answer);
@@ -2661,7 +2664,11 @@ step_core_space(void)
  * vendor's driver does the same when it is unloaded: kgsl_zap_shader_unload), and the next one
  * loads it as if the phone had just started. A kernel that did not end in order cannot have
  * done that. So the same request is made here first: TrustZone answers it with success whether
- * it had a shader or not, and hands the memory back cleared (it then reads as zeroes). Should
+ * it had a shader or not, and hands the memory back cleared (it then reads as zeroes) -- once it
+ * has been handed the header in this boot of the phone. The OnePlus 8's TrustZone, asked to give
+ * up image 13 before it has ever seen that image's header, sends the phone to CrashDump mode
+ * (2 of 2 from a cold start with step 12 left out; 0 of 2 with it, logs 174518 and 175516), so
+ * the header goes first here unless step 12 has handed it already. Should
  * it ever refuse, and then refuse the header or the place too, that is taken to mean that it
  * has a zap shader from before and keeps it: it is used as it is, and nothing is written.
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
@@ -2693,6 +2700,15 @@ step_zap_load(void)
 		return false;
 	}
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
+	if (!zap_header(&header)) {
+		return false;
+	}
+	if (!zap_signed) {
+		/* (its answer does not matter: a shader kept from before refuses it, and the request below ends that) */
+		scm("to take the zap shader's signature first, so that giving one up is safe", SCM_64 | SCM_SIP |
+		    SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU, header, 0, &answer);
+		zap_signed = true;
+	}
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
 	segment = image_file("fw", FW("zap.b02"), &size);
@@ -2701,9 +2717,6 @@ step_zap_load(void)
 	}
 	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put the image there, and ask "
 	    "TrustZone to authenticate and run it");
-	if (!zap_header(&header)) {
-		return false;
-	}
 	if (scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
 	    header, 0, &answer) != 0 || answer != 0) {
 		printf("adreno: %u: TrustZone does not take the signature (%#llx): TAKEN TO MEAN THAT IT KEEPS A ZAP SHADER FROM "
