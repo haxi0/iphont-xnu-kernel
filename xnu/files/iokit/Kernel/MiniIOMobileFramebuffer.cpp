@@ -65,6 +65,8 @@ enum {
 	kFBMethodGetBlock               = 79,
 	kFBMethodSwapCancelAll          = 81,
 	kFBMethodGetProtectionOptions   = 82,
+	kFBMethodRedwoodPanelAcquire    = 200,  /* ours (fb_gpu, userland/src/eagl.c): out: index, surface, width, height, bytes a row */
+	kFBMethodRedwoodPanelReady      = 201,  /* ours: in: index, the surface whose frame was scaled into it */
 };
 
 /* The swap request (IOMobileFramebufferSwapEnd): 0x46c bytes, of which we read these. */
@@ -402,6 +404,21 @@ static uint32_t gAutorefresh;           /* the firmware's setting, back for the 
  * being sent while the other is, and the pipes are pointed at it with the push.
  */
 #define DOUBLE_PHYS             0x9ca00000ull
+#define SPLASH_END              0x9e300000ull   /* dt: cont_splash_region@9c000000, 0x2300000 long: the display's memory */
+#define VIG0_SRC_YSTRIDE0       0x5024          /* (Linux dpu_hw_sspp.c: SSPP_SRC_YSTRIDE0, plane 0 in 15:0) */
+#define VIG1_SRC_YSTRIDE0       0x7024
+/*
+ * fb_gpu=1 (the default): with two framebuffers, the window server's GPU scales each frame into one of them
+ * itself (userland/src/eagl.c) and that one is pushed as it is: nothing is copied here (IOMobileFramebuffer::
+ * fPanel). Its rows are then a multiple of 64 bytes, as the GPU's render targets need: 4352 bytes for 1080
+ * pixels instead of the firmware's 4320, which the pipes are told; the firmware's pitch goes back with
+ * the boot framebuffer (pushStop()).
+ */
+static TUNABLE(uint32_t, gPanelGpu, "fb_gpu", 1);
+static uint32_t gStride[2];             /* VIG0 and VIG1's SRC_YSTRIDE0 as the firmware left them; 0: not changed */
+static volatile uint8_t * gPanelBase;   /* ... and the boot framebuffer mapped whole at the GPU's pitch, */
+static uint32_t gPanelRowBytes, gPanelRows;     /* ... that pitch, and its rows */
+extern "C" uint64_t loader_screen[2];  /* (osfmk/arm64/loader_return.c) what the panel shows, for the loader's screenshots */
 static bool gDouble;
 static uint32_t gTeVsync;               /* INTF1's TE counter setting from the firmware; 0: not changed */
 static bool gPushing;                   /* autorefresh off: frames are pushed */
@@ -473,10 +490,24 @@ pushStop(void)
 		/* the boot framebuffer again, latched by the first autorefresh frame */
 		displayWrite(VIG0_SRC0_ADDR, (uint32_t) vinfo.v_physaddr);
 		displayWrite(VIG1_SRC0_ADDR, (uint32_t) vinfo.v_physaddr);
+		if (gStride[0] != 0) {
+			/* what the boot framebuffer holds, to the firmware's pitch: rows only move down in memory */
+			for (uint32_t y = 1; gPanelBase != NULL && y < gPanelRows; y++) {
+				for (uint32_t x = 0; x < vinfo.v_rowbytes; x += 4) {
+					*(volatile uint32_t *) (gPanelBase + (size_t) y * vinfo.v_rowbytes + x) =
+					    *(volatile uint32_t *) (gPanelBase + (size_t) y * gPanelRowBytes + x);
+				}
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			displayWrite(VIG0_SRC_YSTRIDE0, gStride[0]);
+			displayWrite(VIG1_SRC_YSTRIDE0, gStride[1]);
+			gStride[0] = 0;
+		}
 		displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME);
 		gDouble = false;
 	}
 	displayWrite(INTF1_AUTOREFRESH, gAutorefresh);
+	loader_screen[0] = 0;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	gPushing = false;
 }
@@ -688,6 +719,8 @@ pushFrame(uint32_t swap, uint64_t buffer)
 		displayWrite(VIG1_SRC0_ADDR, (uint32_t) buffer);
 	}
 	__atomic_store_n(&gPushDone, 0, __ATOMIC_RELEASE);
+	loader_screen[1] = gStride[0] != 0 ? gPanelRowBytes : vinfo.v_rowbytes;
+	loader_screen[0] = buffer;
 	gPushId = swap;
 	gPushed = mach_absolute_time();
 	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
@@ -832,6 +865,27 @@ public:
 	IOMemoryMap *   fBufferMap;             /* ... the second one's mapping, kept */
 	unsigned        fBack;
 	bool            fPushTried;             /* pushStart() asked, at the first frame (the console draws until then) */
+	/*
+	 * fb_gpu: the two framebuffers as surfaces (MiniIOSurfaceCreateScanout) for the window server's GPU to
+	 * scale a frame into. It asks for one (panelAcquire(): one that is neither on its way to the panel nor
+	 * waiting to be), draws its frame of surface S into it and says so (panelReady()); the swap of S that
+	 * follows pushes that buffer if S has had no GPU work since (panelFor()). Any other swap is copied here,
+	 * as before, into a buffer the window server does not hold.
+	 */
+	MiniIOSurface * fPanel[2];
+	uint8_t         fPanelState[2];         /* (fSwapLock) kPanelFree, kPanelDrawing (the window server's), kPanelReady */
+	uint32_t        fPanelSurface[2];       /* (fSwapLock) kPanelReady: the frame of this surface, */
+	uint32_t        fPanelDrawn[2];         /* ... after this submission of the GPU's (the surface's `drawn`), */
+	uint32_t        fPanelAge[2];           /* ... said at this many swaps shown */
+	int             fPanelSent;             /* (fSwapLock) the one pushed last; -1: none yet */
+	task_t          fPanelTask;             /* the one task that draws into them (not held: only compared) */
+	uint32_t        fShownSurfaces[4];      /* (fSwapLock) layer 0's last different surfaces: what a frame worth scaling is in */
+	uint32_t        fStatPanel;             /* frames pushed as the GPU drew them, since the last five-second line */
+	IOReturn panelAcquire(task_t task, uint64_t * out);
+	IOReturn panelReady(task_t task, uint32_t index, uint32_t sid);
+	int panelFor(const uint8_t * swap, MiniIOSurface * surface);
+	int panelSpare(void);
+	void panelSent(int index);
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
@@ -1489,6 +1543,10 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	fAlternating = swapWord(swap, SWAP_SURFACE(0)) != fLastSurface && swapWord(swap, SWAP_SURFACE(1)) == 0 &&
 	    swapWord(swap, SWAP_SURFACE(2)) == 0 && swapWord(swap, SWAP_SURFACE(3)) == 0;
 	fLastSurface = swapWord(swap, SWAP_SURFACE(0));
+	if (fLastSurface != 0 && fLastSurface != fShownSurfaces[0]) {
+		memmove(&fShownSurfaces[1], &fShownSurfaces[0], sizeof(fShownSurfaces) - sizeof(fShownSurfaces[0]));
+		fShownSurfaces[0] = fLastSurface;
+	}
 	IOLockWakeup(fSwapLock, fSwap, true);
 	IOLockUnlock(fSwapLock);
 }
@@ -1551,6 +1609,221 @@ IOMobileFramebuffer::waitCopied(void)
 	IOLockUnlock(fSwapLock);
 }
 
+enum { kPanelFree, kPanelDrawing, kPanelReady };
+#define PANEL_WAIT_MS           20      /* for a push to finish: a TE and a transfer at 60 Hz */
+#define PANEL_STALE_SWAPS       3       /* a frame said to be ready that no swap has taken in so many is given up */
+
+/* With fSwapLock held: is framebuffer `index` on its way to the panel right now? */
+static bool
+panelInFlight(int index, int sent)
+{
+	return index == sent && __atomic_load_n(&gPushed, __ATOMIC_ACQUIRE) != 0 &&
+	       __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) == 0 &&
+	       (__atomic_load_n(&gPushIrqLive, __ATOMIC_ACQUIRE) || !(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE));
+}
+
+/*
+ * The window server's GPU is about to scale a frame: a framebuffer for it, neither waiting to be pushed nor
+ * being pushed (a command-mode panel has the frame in its own memory once the push is done, so that is
+ * soon). One it held and did not say was ready is taken back first. out: index, surface, width, height,
+ * bytes a row.
+ */
+IOReturn
+IOMobileFramebuffer::panelAcquire(task_t task, uint64_t * out)
+{
+	AbsoluteTime deadline, slice;
+	int index = -1;
+
+	if (fPanel[0] == NULL || !gDouble) {
+		return kIOReturnNotReady;
+	}
+	clock_interval_to_deadline(PANEL_WAIT_MS, kMillisecondScale, &deadline);
+	IOLockLock(fSwapLock);
+	if (fPanelTask == NULL) {
+		fPanelTask = task;              /* (the first to ask: the window server, whose GPU alone may draw into them) */
+		fPanel[0]->scanoutOwner = fPanel[1]->scanoutOwner = task;
+	}
+	if (task != fPanelTask) {
+		IOLockUnlock(fSwapLock);
+		return kIOReturnNotPermitted;
+	}
+	for (int i = 0; i < 2; i++) {
+		if (fPanelState[i] == kPanelDrawing) {
+			fPanelState[i] = kPanelFree;
+		}
+	}
+	for (;;) {
+		bool pushing = false;
+
+		/* (the one not pushed last first: the other may still be on its way) */
+		for (int n = 0; n < 2 && index < 0; n++) {
+			int i = fPanelSent == 0 ? 1 - n : n;
+
+			if (fPanelState[i] == kPanelFree && !panelInFlight(i, fPanelSent)) {
+				index = i;
+			}
+			pushing |= fPanelState[i] == kPanelFree;
+		}
+		/* (only a push is waited for: a frame waiting for its swap is the presenter's to take, later) */
+		if (index >= 0 || !pushing || mach_absolute_time() >= deadline) {
+			break;
+		}
+		/* (the end of a push is an interrupt that wakes nobody here: looked at every millisecond) */
+		clock_interval_to_deadline(1, kMillisecondScale, &slice);
+		IOLockSleepDeadline(fSwapLock, fPanelState, slice < deadline ? slice : deadline, THREAD_UNINT);
+	}
+	if (index >= 0) {
+		fPanelState[index] = kPanelDrawing;
+		fPanelAge[index] = fSwapsShown;
+	}
+	IOLockUnlock(fSwapLock);
+	if (index < 0) {
+		return kIOReturnBusy;
+	}
+	out[0] = (uint64_t) index;
+	out[1] = fPanel[index]->sid;
+	out[2] = fPanelWidth;
+	out[3] = fPanelHeight;
+	out[4] = fRowBytes;
+	return kIOReturnSuccess;
+}
+
+/* The window server's GPU has been given the frame of surface `sid`, scaled into framebuffer `index`. */
+IOReturn
+IOMobileFramebuffer::panelReady(task_t task, uint32_t index, uint32_t sid)
+{
+	MiniIOSurface * surface = MiniIOSurfaceCopy(sid);
+	IOReturn ret = kIOReturnBadArgument;
+
+	IOLockLock(fSwapLock);
+	if (task != fPanelTask) {
+		ret = kIOReturnNotPermitted;
+	} else if (index < 2 && fPanelState[index] == kPanelDrawing && surface != NULL &&
+	    sid != fShownSurfaces[0] && sid != fShownSurfaces[1] && sid != fShownSurfaces[2] && sid != fShownSurfaces[3]) {
+		/* (a picture of the screen's size that is not the screen's -- a snapshot: no swap will come for it) */
+		fPanelState[index] = kPanelFree;
+		ret = kIOReturnNotFound;
+	} else if (index < 2 && fPanelState[index] == kPanelDrawing && surface != NULL) {
+		for (int i = 0; i < 2; i++) {
+			if (fPanelState[i] == kPanelReady && fPanelSurface[i] == sid) {
+				fPanelState[i] = kPanelFree;            /* (an earlier frame of the same surface: never to be shown) */
+			}
+		}
+		fPanelState[index] = kPanelReady;
+		fPanelSurface[index] = sid;
+		fPanelDrawn[index] = surface->drawn;
+		fPanelAge[index] = fSwapsShown;
+		ret = kIOReturnSuccess;
+	}
+	IOLockWakeup(fSwapLock, fPanelState, false);
+	IOLockUnlock(fSwapLock);
+	if (surface != NULL) {
+		MiniIOSurfaceDrop(surface);
+	}
+	return ret;
+}
+
+/*
+ * The presenter, for a swap: the framebuffer the GPU has scaled this very frame into, once the GPU is done
+ * with it; -1: none (copied here). Only a swap of one full-screen layer qualifies, and only if its surface has
+ * had no GPU work since the window server said the frame was ready. Ready ones no swap took are given up.
+ */
+int
+IOMobileFramebuffer::panelFor(const uint8_t * swap, MiniIOSurface * surface)
+{
+	uint32_t sid = swapWord(swap, SWAP_SURFACE(0));
+	int32_t src[4], dst[4];
+	int index = -1;
+	bool whole;
+
+	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+	whole = surface != NULL && surface->info.width == fWidth && surface->info.height == fHeight &&
+	    swapWord(swap, SWAP_SURFACE(1)) == 0 && swapWord(swap, SWAP_SURFACE(2)) == 0 && swapWord(swap, SWAP_SURFACE(3)) == 0 &&
+	    src[0] == 0 && src[1] == 0 && (src[2] <= 0 || (uint32_t) src[2] == fWidth) && (src[3] <= 0 || (uint32_t) src[3] == fHeight) &&
+	    dst[0] == 0 && dst[1] == 0 && (dst[2] <= 0 || (uint32_t) dst[2] == fWidth) && (dst[3] <= 0 || (uint32_t) dst[3] == fHeight);
+	IOLockLock(fSwapLock);
+	static uint32_t told;
+	if (told < 8 && fPanelTask != NULL && !(whole && ((fPanelState[0] == kPanelReady && fPanelSurface[0] == sid &&
+	    fPanelDrawn[0] == surface->drawn) || (fPanelState[1] == kPanelReady && fPanelSurface[1] == sid &&
+	    fPanelDrawn[1] == surface->drawn)))) {
+		told++;
+		IOLog("MiniIOMobileFramebuffer: swap %u of surface %u (%s, GPU work %u) copied: framebuffers %u/%u/%u and %u/%u/%u "
+		    "(state/surface/GPU work)\n", swapWord(swap, SWAP_ID), sid, whole ? "whole" : "not one whole layer",
+		    surface != NULL ? surface->drawn : 0, fPanelState[0], fPanelSurface[0], fPanelDrawn[0], fPanelState[1],
+		    fPanelSurface[1], fPanelDrawn[1]);
+	}
+	for (int i = 0; i < 2; i++) {
+		if (fPanelState[i] == kPanelDrawing && fSwapsShown - fPanelAge[i] > PANEL_STALE_SWAPS) {
+			fPanelState[i] = kPanelFree;            /* (taken and never said to be ready: the window server gave up on it) */
+		}
+		if (fPanelState[i] != kPanelReady) {
+			continue;
+		}
+		if (whole && fPanelSurface[i] == sid && fPanelDrawn[i] == surface->drawn) {
+			index = i;
+		} else if (fPanelSurface[i] == sid || fSwapsShown - fPanelAge[i] > PANEL_STALE_SWAPS) {
+			fPanelState[i] = kPanelFree;
+		}
+	}
+	IOLockWakeup(fSwapLock, fPanelState, false);
+	IOLockUnlock(fSwapLock);
+	if (index >= 0 && !MiniIOSurfaceDrawn(fPanel[index], SWAP_GPU_MS)) {
+		IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with framebuffer %d after %u ms; copied instead\n",
+		    swapWord(swap, SWAP_ID), index, SWAP_GPU_MS);
+		panelSent(-1);
+		IOLockLock(fSwapLock);
+		fPanelState[index] = kPanelFree;
+		IOLockUnlock(fSwapLock);
+		index = -1;
+	}
+	return index;
+}
+
+/*
+ * The presenter, for a frame copied here: a framebuffer the window server does not hold (the one not pushed last
+ * first). None free -- one waits for a swap that has not come, the other is being drawn: the waiting one is taken
+ * back, its frame given up (the swap it was for is copied in its turn), once the GPU is done with it.
+ */
+int
+IOMobileFramebuffer::panelSpare(void)
+{
+	int index = -1, taken = -1;
+
+	IOLockLock(fSwapLock);
+	for (int n = 0; n < 2 && index < 0; n++) {
+		int i = fPanelSent == 0 ? 1 - n : n;
+
+		if (fPanelState[i] == kPanelFree) {
+			index = i;
+		} else if (fPanelState[i] == kPanelReady && taken < 0) {
+			taken = i;
+		}
+	}
+	if (index < 0 && taken >= 0) {
+		fPanelState[taken] = kPanelFree;
+		index = taken;
+	}
+	IOLockUnlock(fSwapLock);
+	if (taken == index && index >= 0 && !MiniIOSurfaceDrawn(fPanel[index], SWAP_GPU_MS)) {
+		index = -1;
+	}
+	return index;
+}
+
+/* The presenter has pushed framebuffer `index` (-1: nothing new): free for the next frame once the push is done. */
+void
+IOMobileFramebuffer::panelSent(int index)
+{
+	IOLockLock(fSwapLock);
+	if (index >= 0) {
+		fPanelState[index] = kPanelFree;
+		fPanelSent = index;
+	}
+	IOLockWakeup(fSwapLock, fPanelState, false);
+	IOLockUnlock(fSwapLock);
+}
+
 void
 IOMobileFramebuffer::dequeueSwap(void)
 {
@@ -1570,6 +1843,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
 	bool report;
+	int panel;                              /* fb_gpu: the framebuffer the GPU has drawn this frame into; -1: none */
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -1591,7 +1865,45 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	began = ready = mach_absolute_time();
 	if (!fPushTried) {
 		fPushTried = true;
-		if (pushStart(fPanelHeight) && gPush == 2) {
+		uint32_t rowBytes = (fPanelWidth * 4 + 63) & ~63u, stride0 = 0, stride1 = 0;
+		uint64_t panelSize = round_page_64((uint64_t) rowBytes * fPanelHeight);
+
+		if (pushStart(fPanelHeight) && gPush == 2 && gPanelGpu) {
+			/* both inside the display's memory, apart, and the pipes reading the boot framebuffer's pitch now */
+			stride0 = displayReg(gDPU, VIG0_SRC_YSTRIDE0);
+			stride1 = displayReg(gDPU, VIG1_SRC_YSTRIDE0);
+			if ((stride0 & 0xffff) == fRowBytes && (stride1 & 0xffff) == fRowBytes &&
+			    vinfo.v_physaddr + panelSize <= DOUBLE_PHYS && DOUBLE_PHYS + panelSize <= SPLASH_END) {
+				fPanel[0] = MiniIOSurfaceCreateScanout(vinfo.v_physaddr, fPanelWidth, fPanelHeight, rowBytes);
+				fPanel[1] = MiniIOSurfaceCreateScanout(DOUBLE_PHYS, fPanelWidth, fPanelHeight, rowBytes);
+			}
+			if (fPanel[0] != NULL && fPanel[1] != NULL) {
+				gStride[0] = stride0;
+				gStride[1] = stride1;
+				displayWrite(VIG0_SRC_YSTRIDE0, (stride0 & ~0xffffu) | rowBytes);    /* (latched by the first push) */
+				displayWrite(VIG1_SRC_YSTRIDE0, (stride1 & ~0xffffu) | rowBytes);
+				fRowBytes = rowBytes;
+				gPanelBase = fPanel[0]->pixels();
+				gPanelRowBytes = rowBytes;
+				gPanelRows = fPanelHeight;
+				for (unsigned i = 0; i < 2; i++) {
+					fBuffer[i] = fPanel[i]->pixels();
+				}
+				fBufferPhys[0] = vinfo.v_physaddr;
+				fBufferPhys[1] = DOUBLE_PHYS;
+				fPanelSent = -1;
+				fBack = 1;
+				gDouble = true;
+			} else {
+				MiniIOSurfaceDrop(fPanel[0]);
+				MiniIOSurfaceDrop(fPanel[1]);
+				fPanel[0] = fPanel[1] = NULL;
+			}
+			displayLog("display: framebuffers %#llx and %#llx as surfaces %u and %u for the GPU (rows of %u bytes; the "
+			    "pipes had %#x %#x)%s\n", (uint64_t) vinfo.v_physaddr, DOUBLE_PHYS, fPanel[0] ? fPanel[0]->sid : 0,
+			    fPanel[1] ? fPanel[1]->sid : 0, rowBytes, stride0, stride1, gDouble ? "" : ": not taken, copied here");
+		}
+		if (gPushing && gPush == 2 && !gDouble) {
 			size_t frame = round_page((size_t) fRowBytes * fPanelHeight);
 
 			fBuffer[0] = fBase;
@@ -1609,8 +1921,30 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			displayLog("display: second framebuffer at %#llx: %s\n", DOUBLE_PHYS, gDouble ? "frames alternate" : "not mapped");
 		}
 	}
+	if (!gPushing && fPanel[0] != NULL && fRowBytes != vinfo.v_rowbytes) {
+		fRowBytes = vinfo.v_rowbytes;   /* (given back, pushStop(): the boot framebuffer at the firmware's pitch) */
+		fBuffer[0] = (uint8_t *) vinfo.v_baseaddr;
+	}
 	if (!gPushing && fBuffer[0] != NULL && fBase != fBuffer[0]) {
 		fBase = fBuffer[0];             /* (given back: pushStop()) */
+	}
+	panel = gDouble && fPanel[0] != NULL ? panelFor(swap, surfaces[0]) : -1;
+	if (gDouble && fPanel[0] != NULL && panel < 0) {
+		/* copied here, then: into one the window server does not hold, out of the panel's way */
+		int spare = panelSpare();
+
+		if (spare < 0) {
+			displayLog("display: swap %u: both framebuffers are the GPU's; not shown\n", swapWord(swap, SWAP_ID));
+			fSwapsShown++;                  /* (what waits for a swap ages all the same) */
+			dequeueSwap();
+			return;
+		}
+		if (spare == fPanelSent && !pushWait()) {
+			displayLog("display: a pushed frame did not finish in %u ms; the boot framebuffer and autorefresh back\n",
+			    PUSH_TIMEOUT_MS);
+			pushStop();
+		}
+		fBack = (unsigned) spare;
 	}
 	if (gDouble) {
 		fBase = fBuffer[fBack];         /* the one not being sent: written now, waited for at the push */
@@ -1711,7 +2045,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
-			drawLayer(s, src, dst);
+			if (panel < 0) {
+				drawLayer(s, src, dst);
+			}
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
@@ -1727,8 +2063,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		displayLog("display: a pushed frame did not finish in %u ms; the boot framebuffer and autorefresh back\n", PUSH_TIMEOUT_MS);
 		pushStop();
 	} else if (gPushing) {
-		pushFrame(swapWord(swap, SWAP_ID), fBufferPhys[fBack]);
-		fBack ^= gDouble;
+		unsigned sent = panel >= 0 ? (unsigned) panel : fBack;
+
+		pushFrame(swapWord(swap, SWAP_ID), fBufferPhys[sent]);
+		if (fPanel[0] != NULL && gDouble) {
+			panelSent((int) sent);
+		} else {
+			fBack ^= gDouble;
+		}
 	}
 	drawn = mach_absolute_time();
 	traceScanout(swapWord(swap, SWAP_ID), "copy-end");
@@ -1749,6 +2091,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 
 	/* every five seconds in which something was drawn: how many frames, and what each cost here */
 	fStatFrames++;
+	fStatPanel += panel >= 0;
 	fStatDrawing += mach_absolute_time() - began;
 	if (fStatSince == 0) {
 		fStatSince = began;
@@ -1763,11 +2106,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
-		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
+		    "%u gave up; %u swaps came a refresh late themselves; %u frames scaled by the GPU\n", fStatFrames, nanos / NSEC_PER_MSEC,
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
-		    fStatHeld, fStatLost, fStatSwapsLate);
+		    fStatHeld, fStatLost, fStatSwapsLate, fStatPanel);
 		fStatSwapsLate = 0;
+		fStatPanel = 0;
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}
 		if (different == 8 && fStatFrames > 8) {
@@ -2003,6 +2347,27 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	}
 
 	switch (selector) {
+	case kFBMethodRedwoodPanelAcquire:
+	{
+		uint64_t panel[5];
+		IOReturn ret;
+
+		if (args->scalarOutputCount < 5) {
+			return kIOReturnBadArgument;
+		}
+		ret = fOwner->panelAcquire(fTask, panel);
+		if (ret == kIOReturnSuccess) {
+			memcpy(out, panel, sizeof(panel));
+			args->scalarOutputCount = 5;
+		}
+		return ret;
+	}
+	case kFBMethodRedwoodPanelReady:
+		if (args->scalarInputCount < 2) {
+			return kIOReturnBadArgument;
+		}
+		return fOwner->panelReady(fTask, (uint32_t) in[0], (uint32_t) in[1]);
+
 	case kFBMethodGetDisplaySize:                   /* out: width, height */
 		if (args->scalarOutputCount < 2) {
 			return kIOReturnBadArgument;

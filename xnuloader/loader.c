@@ -914,6 +914,8 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the kernel is new enough to have what follows */
+	uint64_t screen;                /* (a virtual address too) { physical address, bytes a row } of what the panel shows; 0: SCREEN */
 };
 
 /*
@@ -981,6 +983,7 @@ static uint64_t recording_len;
 static const char *sound_data;
 static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
+#define KERNEL_LIVE_MAGIC3      0x334556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
@@ -2663,6 +2666,28 @@ static struct {
 	uint64_t base;
 	uint32_t width, height, stride;
 } SCREEN;
+
+/*
+ * What the panel shows: during a run, the frame the kernel's display driver last sent (kernel_live.screen, with
+ * the pitch it was written at), if that is in the display's memory; otherwise the framebuffer as found.
+ */
+static void
+screen_now(uint64_t *base, uint32_t *stride)
+{
+	*base = SCREEN.base;
+	*stride = SCREEN.stride;
+	if (running_live != NULL && running_live->magic2 == KERNEL_LIVE_MAGIC2 && running_live->magic3 == KERNEL_LIVE_MAGIC3 &&
+	    running_live->screen != 0) {
+		const volatile uint64_t *screen = (const volatile uint64_t *)(uintptr_t)(running_live->screen + running_slide);
+		uint64_t at = screen[0], row = screen[1];
+
+		if (at >= SCREEN.base && at - SCREEN.base < 0x4000000 && row >= (uint64_t)SCREEN.width * 4 &&
+		    row <= (uint64_t)SCREEN.width * 4 + 256) {
+			*base = at;
+			*stride = (uint32_t)row;
+		}
+	}
+}
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
@@ -3683,8 +3708,11 @@ fb_command(char *cmd)
 				fb_reply("OKAY", last_result);
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
 				/* width height bytes-per-row */
-				uint32_t mark = log_len;
-				print("%d %d %d", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, (uint64_t)SCREEN.stride);
+				uint32_t mark = log_len, stride;
+				uint64_t base;
+
+				screen_now(&base, &stride);
+				print("%d %d %d", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, (uint64_t)stride);
 				log_buf[log_len] = 0;
 				fb_reply("OKAY", log_buf + mark);
 				log_len = mark;
@@ -3759,8 +3787,12 @@ fb_command(char *cmd)
 				fb_reply("FAIL", "no display");
 				return;
 			}
-			staged_data = (const char *)(uintptr_t)SCREEN.base;
-			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
+			uint64_t base;
+			uint32_t stride;
+
+			screen_now(&base, &stride);
+			staged_data = (const char *)(uintptr_t)base;
+			staged_len = (uint64_t)stride * SCREEN.height;
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem recording")) {
 			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */

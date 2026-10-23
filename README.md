@@ -129,7 +129,7 @@ What has been seen working on the phone itself (the kernel's log of a run says e
 | Works | How | Not yet |
 |---|---|---|
 | Boot to SpringBoard, 8 cores, prime core at 2.84 GHz | `cpus=8 cpufreq=1 bootcpu=7` | Metal for the whole system is not on by default (`metal=2 metal_profile=1` reaches the home screen; chronod's widgets still have 2 pipelines refused) |
-| Display: 90 Hz, no tearing; iOS at up to 90 fps (the MDP pushes double-buffered frames on the panel's TE) | default with `board=instantnoodle` (`fb_hz=60`, `fb_push=1`/`0` fall back) | The scaling to the panel is done by the processor: about 5% of frames still miss a refresh |
+| Display: 90 Hz, no tearing; iOS at up to 90 fps (the MDP pushes double-buffered frames on the panel's TE; the GPU scales them into the framebuffers, `fb_gpu=0`: the processor) | default with `board=instantnoodle` (`fb_hz=60`, `fb_push=1`/`0` fall back) | About 2% of swaps still come a refresh late (one push in flight at a time) |
 | Touch screen (Samsung S6SY761, by its interrupt) and the keys | `board=instantnoodle` (the loader passes it; `touch_irq=0`: polling) | Wi-Fi (QCA6390 on PCIe, not redwood's WCN6750) |
 | Battery: level, voltage, current, charging (TI bq27541 gauge, PM8150B USB input) | on with `board=instantnoodle` | Sound (TFA9894 amplifiers, WCD938x codec) |
 | Haptics from iOS (Awinic AW8697): system feedback, CoreHaptics | `haptic=5`, `fw-haptic` | Cameras, sensors, Bluetooth |

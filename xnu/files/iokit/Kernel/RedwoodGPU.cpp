@@ -828,13 +828,17 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
-	if (s->client != NULL) {
-		/* (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes) */
+	if (s->client != NULL || (s->scanout != NULL && s->scanoutOwner != fTask)) {
+		/*
+		 * (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows
+		 * the GPU takes; or a panel buffer, which only the window server's GPU draws into)
+		 */
 		MiniIOSurfaceDrop(s);
 		return kIOReturnUnsupported;
 	}
 	size = round_page_64(s->info.allocSize);
-	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	memory = s->scanout != NULL ? IOSubMemoryDescriptor::withSubRange(s->scanout, 0, size, kIODirectionInOut) :
+	    IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
 	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
 		OSSafeReleaseNULL(memory);
 		MiniIOSurfaceDrop(s);
@@ -865,9 +869,10 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
 	if (b != NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
+	} else if ((b = s->scanout != NULL ? newBuffer(s->scanout, 0, size, 0, &request->handle) :
+	    newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
 		b->memory = memory;
-		b->kernel = s->kbase + PAGE_SIZE;
+		b->kernel = s->kpixels;
 		b->surface = s;
 		gGPUStat.surfaces++;
 	}
@@ -970,6 +975,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 
 		if (b == NULL) {
 			continue;
+		}
+		if (b->surface != NULL && b->surface->scanout != NULL) {
+			continue;                       /* (write-combined: never in this processor's cache) */
 		}
 		if (b->surface != NULL) {
 			uint32_t seed = b->surface->shared()->seed;

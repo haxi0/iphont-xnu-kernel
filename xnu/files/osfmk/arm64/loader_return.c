@@ -199,6 +199,8 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": what follows is there */
+	const uint64_t *screen;         /* loader_screen */
 };
 
 /*
@@ -208,12 +210,18 @@ struct loader_live {
 uint64_t loader_recording[3];
 /* ... and of the sound (/dev/redwood-audio makes one with boot-arg rec_sound). */
 uint64_t loader_sound[3];
+/*
+ * The frame the panel shows, for "oem screenshot" during a run: { physical address, bytes a row }; 0: the boot
+ * framebuffer as the loader knows it (the display driver keeps it, MiniIOMobileFramebuffer.cpp).
+ */
+uint64_t loader_screen[2];
 
 struct loader_live loader_live = {
 	.magic = 0x214556494c554e58ULL, .log = loader_log, .log_len = &loader_log_len, .log_ring_at = &loader_log_ring_at,
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL, .screen = loader_screen,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */

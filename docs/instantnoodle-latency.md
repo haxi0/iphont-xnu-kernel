@@ -39,29 +39,45 @@ be found out by trying. The second framebuffer at `0x9ca00000`, inside the firmw
   `SwapWait` now waits until the surface it will draw into next has been copied. That is every swap but the
   last when the surfaces alternate, and all of them otherwise. A detector logs GPU work naming a surface
   during its copy; it found 0.
-- **The copy** is shared out in 48-row pieces taken in turn, not fixed thirds. A copying thread on a small core,
-  or one preempted, no longer holds up the frame.
+- **The scaling, by the GPU** (`fb_gpu=1`, the default). The two framebuffers are surfaces for the window
+  server's GPU (`MiniIOSurfaceCreateScanout`), both inside the firmware's `cont_splash_region@9c000000`
+  (0x2300000 bytes), mapped write-combined. Once CoreAnimation's frame is drawn, `userland/src/eagl.c` asks for one
+  that is neither waiting to be pushed nor being pushed (framebuffer selector 200), scales the frame into it with
+  `glBlitFramebuffer(..., GL_LINEAR)` and says so once that has gone to the GPU (201). The swap that follows
+  pushes that framebuffer as it is, after its GPU fence, if the frame's surface has had no GPU work since; the
+  processor copies nothing. The GPU's render targets need rows in multiples of 64 bytes, so the pipes read rows
+  of 4352 bytes instead of the firmware's 4320 (`SSPP_SRC_YSTRIDE0`). The firmware's pitch, and the last frame
+  repacked to it, go back with the boot framebuffer for the loader. A swap with no such frame (another layer,
+  a surface new to the display) is copied by the processor as before, into a framebuffer the window server
+  does not hold. `fb_gpu=0` keeps everything as before.
+- **The copy**, where there still is one, is shared out in 48-row pieces taken in turn, not fixed thirds. A
+  copying thread on a small core, or one preempted, no longer holds up the frame.
 - **Touch.** S6SY761 reports arrive by the TLMM summary interrupt (`touch_irq=0`: 10 ms polling). The worker
   runs at priority 92, because at the default 81 the copying threads delayed it by up to 7 ms at 90 Hz.
 
-`xl screenshot` reads a framebuffer at an arbitrary moment, so a capture taken mid-copy shows two frames. That is
-not what the panel received.
+`xl screenshot` takes the framebuffer the kernel pushed last, at the pitch it was written at (`loader_screen` in
+`osfmk/arm64/loader_return.c`; a loader built before this reads the boot framebuffer at 4320, skewed).
 
 ## Numbers (ms, median / p95)
 
-| stage | firmware autorefresh, 60 Hz (`022537`) | now: 90 Hz, defaults (`164134`) |
-|---|---|---|
-| SwapEnd → presenter (queue) | 0.04 / 30.1 | 0.03 / 5.7 |
-| SwapEnd → copy complete | 12.1 / 46.8 | 5.9 / 17.1 |
-| kick → panel RAM written (TE + 8.7 ms transfer) | none (tore) | 11.36 / 11.36 |
-| SwapEnd → panel RAM written | not measurable | 17.2 / 28.5 |
-| frames in a busy second (p50 / p90) | ≤ 60 | 87 / 88 |
-| touch report line → worker | 0.016 / 0.032 (IRQ), poll period 13.6 / 15.3 | 0.017 / 0.031 |
-| touch I2C read (se13) | 2.2–2.8 | 3.1 / 3.6 |
-| kernel post → HID read → dispatch | 0.02 → 0.08 | 0.03 → 0.16 |
+| stage | firmware autorefresh, 60 Hz (`022537`) | 90 Hz, processor scaling (`164134`) | now: GPU scaling (`184104`) |
+|---|---|---|---|
+| SwapEnd → presenter (queue) | 0.04 / 30.1 | 0.03 / 5.7 | 0.03 / 0.08 |
+| SwapEnd → frame ready to push (copy, or the push before) | 12.1 / 46.8 | 5.9 / 17.1 | 5.8 / 10.8 |
+| kick → panel RAM written (TE + 8.7 ms transfer) | none (tore) | 11.36 / 11.36 | 11.36 / 11.37 |
+| SwapEnd → panel RAM written | not measurable | 17.2 / 28.5 (max 229) | 17.2 / 22.2 (max 118) |
+| frames in a busy second (p50 / p90) | ≤ 60 | 87 / 88 | 87 / 88 |
+| swaps a refresh late (busy windows) | | 5.6% | 2.2% |
+| GPU busy (busy windows) | | 16.9% | 18.7% |
+| touch report line → worker | 0.016 / 0.032 (IRQ), poll period 13.6 / 15.3 | 0.017 / 0.031 | 0.015 / 0.028 |
+| touch I2C read (se13) | 2.2–2.8 | 3.1 / 3.6 | 3.0 / 3.8 |
+| kernel post → HID read → dispatch | 0.02 → 0.08 | 0.03 → 0.16 | 0.02 → 0.09 |
 
-The rest of the slipped frames are heavy ones: the GPU's wait p95 is 4 ms, and copies of up to 11 ms on a 11.1 ms
-period. Moving the 1125×2436 → 1080×2400 scaling to the GPU would be the next step.
+With the GPU scaling, 98–100% of the frames of a busy five seconds are pushed as the GPU drew them (`184104`,
+`185234`), and the processor no longer spends some 5 ms of three cores on each. The median from SwapEnd to the
+panel did not move: it is one push in flight at a time, TE plus an 8.7 ms transfer, and a frame waits for the push
+before it. The tail did. The two runs are of different hands on the screen, so the late-swap figures are a
+comparison of like loads, not of one replayed.
 
 ## Procedure
 
