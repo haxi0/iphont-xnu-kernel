@@ -45,6 +45,9 @@ int instantnoodle_i2c_read(struct instantnoodle_i2c *bus, uint8_t addr, uint8_t 
 void instantnoodle_i2c_recover(struct instantnoodle_i2c *bus);     /* nine clocks and a stop: a target holding SDA lets go */
 
 void instantnoodle_battery_init(void);  /* the bq27541 fuel gauge (bsd/dev/instantnoodle_battery.c) */
+void instantnoodle_slider_init(void);
+/* an RPMh LDO on at `mv' (its name in RPMh's command database, e.g. "ldoc10"): bsd/dev/instantnoodle_touch.c */
+bool instantnoodle_supply_on(const char *name, uint32_t mv);   /* the alert slider's hall sensors (bsd/dev/instantnoodle_slider.c) */
 
 /* The speakers' two TFA9874 amplifiers (bsd/dev/instantnoodle_speaker.c): hk_speaker.c's hk_speaker_*() on this board */
 bool instantnoodle_speaker_prepare(const uint8_t *container, uint64_t size);

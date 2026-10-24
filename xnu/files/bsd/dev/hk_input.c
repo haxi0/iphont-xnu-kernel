@@ -224,6 +224,7 @@ hk_input_init(void)
 	hk_buttons_init();
 	hk_battery_init();
 	instantnoodle_battery_init();   /* the OnePlus 8's bq27541 (board=instantnoodle) */
+	instantnoodle_slider_init();    /* ... and its alert slider */
 	hk_thermal_init();         /* after cpufreq (the caps) and the battery (its temperature) */
 	hk_ufs_init();
 	hk_net_init();

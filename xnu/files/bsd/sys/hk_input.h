@@ -27,6 +27,11 @@
 #define HK_BUTTON_VOLUME_UP 2
 #define HK_BUTTON_VOLUME_DOWN 3
 #define HK_BUTTON_HOME     4
+#define HK_SLIDER          6       /* a three-position switch (the OnePlus 8's alert slider) is now at `finger` (HK_SLIDER_*) */
+
+#define HK_SLIDER_DOWN     1       /* ring */
+#define HK_SLIDER_MIDDLE   2       /* silent */
+#define HK_SLIDER_UP       3       /* Do Not Disturb */
 
 struct hk_touch {
 	uint64_t time;                  /* mach_absolute_time() when the sample was posted */

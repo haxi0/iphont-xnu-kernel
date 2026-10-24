@@ -20,6 +20,7 @@
  * the record's 0..65535.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -253,10 +254,15 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-static bool
-supply_on(const char *name, uint32_t mv)
+/* (also the alert slider's sensors' supply, instantnoodle_slider.c: one request at a time) */
+static LCK_GRP_DECLARE(supply_lck_grp, "instantnoodle-supply");
+static LCK_MTX_DECLARE(supply_lock, &supply_lck_grp);
+
+bool
+instantnoodle_supply_on(const char *name, uint32_t mv)
 {
 	uint32_t base = rpmh_address(name);
+	bool done;
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_MODE, base + VRM_ENABLE };
 	uint32_t data[3] = { mv, VRM_MODE_LDO_HPM, 1 };         /* enable last */
 
@@ -264,7 +270,10 @@ supply_on(const char *name, uint32_t mv)
 		printf("touch: RPMh: no regulator \"%s\" (address %#x)\n", name, base);
 		return false;
 	}
-	if (!rpmh_write(address, data, 3)) {
+	lck_mtx_lock(&supply_lock);
+	done = rpmh_write(address, data, 3);
+	lck_mtx_unlock(&supply_lock);
+	if (!done) {
 		printf("touch: RPMh: %s %u mV: no answer\n", name, mv);
 		return false;
 	}
@@ -422,7 +431,7 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 	instantnoodle_i2c_recover(&bus);                /* both lines let go */
 	instantnoodle_gpio_input(PIN_IRQ, INSTANTNOODLE_PULL_NONE);
 	instantnoodle_gpio_output(PIN_RESET, false, INSTANTNOODLE_PULL_UP, 8);  /* in reset while the supplies come up */
-	if (!supply_on("ldoc1", 1800) || (sleep_ms(1), !supply_on("ldoa13", 3008))) {
+	if (!instantnoodle_supply_on("ldoc1", 1800) || (sleep_ms(1), !instantnoodle_supply_on("ldoa13", 3008))) {
 		printf("touch: no supplies: no touch screen\n");
 		goto out;
 	}

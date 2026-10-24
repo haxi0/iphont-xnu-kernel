@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..7a570999151d 100644
+index 44274016a4cf..00d94d1f296f 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,44 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,45 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -77,6 +77,7 @@ index 44274016a4cf..7a570999151d 100644
 +bsd/dev/instantnoodle_i2c.c	standard
 +bsd/dev/instantnoodle_battery.c	standard
 +bsd/dev/instantnoodle_speaker.c	standard
++bsd/dev/instantnoodle_slider.c	standard
 +bsd/dev/hk_battery.c	standard
 +bsd/dev/hk_ufs.c	standard
 +bsd/dev/hk_ufshc.c	standard
@@ -110,7 +111,7 @@ index 44274016a4cf..7a570999151d 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +193,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +194,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -125,7 +126,7 @@ index 44274016a4cf..7a570999151d 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +407,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +408,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -133,7 +134,7 @@ index 44274016a4cf..7a570999151d 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +430,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +431,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
