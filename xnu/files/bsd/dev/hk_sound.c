@@ -69,7 +69,8 @@
  * (kona.c), no group; the pins of msm_cdc_pinctrl_tert's active state: GPIO 133 bit clock, 135 word
  * select, 134 data in (the amplifiers' sense), 137 data out, functions 1, 1, 1 and 3 (pinctrl-sm8250.c),
  * 8 mA, no pull. Its amplifiers have no volume of their own, so the speakers' guard puts their level on
- * the samples (hk_guard_digital()), the test tone's too: silence while they power up, then a fade-in.
+ * the samples (hk_guard_digital()), the test tone's too. They start (26-39 ms) on the silence already queued
+ * at the DSP (160 ms): the level is kept, so the first period of a short sound (the lock sound) is not lost.
  * sound_guard_as is refused there, since it would make them louder. The SMMU stream, its addresses, ADM
  * and ASM are redwood's. Unless sound_amps=1 is given (the device profile gives it), the amplifiers are
  * set up and kept powered down: the whole path runs, the DSP takes the samples, nothing is heard.
@@ -1353,10 +1354,6 @@ watch(void)
 			say_when("iOS plays: the amplifiers are started");
 			starts++;
 			ios_peak = 0;
-			if (mi2s) {
-				/* (no volume in the amplifiers: they power up on silence, and the level fades in once they operate) */
-				hk_guard_attenuation(HK_GUARD_SILENT);
-			}
 			if (!hk_speaker_start() || !hk_speaker_volume(below + extra, 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
 				guard_off(true);
@@ -1364,9 +1361,6 @@ watch(void)
 			} else {
 				on = true;
 				guard_on = true;
-				if (mi2s) {
-					guard_level(below + extra);     /* (from -90 dB, 6 dB every 20 ms: hk_guard.c) */
-				}
 				last_look = now_us();
 				last_monitor = 0;
 				monitor_looks = 0;
