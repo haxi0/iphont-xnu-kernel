@@ -51,6 +51,7 @@
 #include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <sys/hk_input.h>
+#include <sys/mount_internal.h>
 #include <libkern/crc.h>
 #include <vm/memory_types.h>
 #include "hk_ufshc.h"
@@ -896,6 +897,275 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 	return error;
 }
 
+/* ---- the data volume: /dev/hk_data ---- */
+
+/*
+ * An installed phone's data volume (hk_data=1): the store from block UFS_DATA_FIRST -- past the iOS volume, the
+ * cryptexes, the boot area and both slots of the var store -- to its end, as one block device, read and written
+ * in whole 4096-byte blocks through ufs_read() and ufs_write() above and so through every one of their checks
+ * (and the loader's: written, flushed and read back before the answer). HFS+ (bsd/hk_hfs) is mounted on it at
+ * /private/var by init; newfs_hfs makes it, once, on /dev/rhk_data. hk_data=2: the same device in this kernel's
+ * memory instead (hk_data_mb=, default 1536) -- a RAM-only run's throwaway volume, nothing of the flash touched.
+ */
+#define UFS_DATA_FIRST     UFS_DARWIN_BLOCKS_LEAST     /* 3145728: the var store's two slots end here */
+#define DATA_BLOCK         4096u
+static int hk_data_bmajor = -1, hk_data_cmajor = -1;
+static uint32_t hk_data_mode;                 /* 0 none, 1 the store, 2 memory */
+static uint64_t hk_data_bytes;
+static uint8_t *hk_data_ram;
+static uint32_t hk_data_bsize = DATA_BLOCK;  /* what blocks are counted in: 512 for a moment while spec_open and
+                                               * hfs_mountfs count the device, else 4096 (transfers: 4096 always) */
+
+static int
+hk_data_rw(int write, uint64_t offset, uint8_t *data, uint64_t len)
+{
+	if (offset % DATA_BLOCK != 0 || len % DATA_BLOCK != 0) {
+		return EINVAL;                  /* whole blocks: nothing of a block is ever read to write the rest */
+	}
+	if (offset > hk_data_bytes || len > hk_data_bytes - offset) {
+		return EIO;
+	}
+	if (hk_data_mode == 2) {
+		if (write) {
+			memcpy(hk_data_ram + offset, data, len);
+		} else {
+			memcpy(data, hk_data_ram + offset, len);
+		}
+		return 0;
+	}
+	offset += UFS_DATA_FIRST * DATA_BLOCK;
+	return write ? ufs_write((uint32_t)ufs_write_part, offset, data, len) : ufs_read((uint32_t)ufs_write_part, offset, data, len);
+}
+
+static int
+hk_data_open(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
+{
+	return hk_data_mode != 0 && minor(dev) == 0 ? 0 : ENXIO;
+}
+
+static void
+hk_data_strategy(buf_t bp)
+{
+	uint64_t offset = (uint64_t)buf_blkno(bp) * hk_data_bsize, len = buf_count(bp);
+	int error;
+
+	if (hk_data_mode == 0 || offset >= hk_data_bytes) {
+		buf_seterror(bp, hk_data_mode == 0 ? ENXIO : offset == hk_data_bytes ? 0 : EINVAL);
+		buf_setresid(bp, buf_count(bp));
+		buf_biodone(bp);
+		return;
+	}
+	/* a buffer of the cluster layer comes as pages (a UPL) with no address of its own: mapped for the copy */
+	caddr_t va = (caddr_t)buf_dataptr(bp);
+	int mapped = 0;
+
+	if (va == NULL) {
+		if (buf_map(bp, &va) != 0 || va == NULL) {
+			buf_seterror(bp, ENOMEM);
+			buf_setresid(bp, buf_count(bp));
+			buf_biodone(bp);
+			return;
+		}
+		mapped = 1;
+	}
+	error = hk_data_rw(!(buf_flags(bp) & B_READ), offset, (uint8_t *)va, len);
+	if (mapped) {
+		buf_unmap(bp);
+	}
+	buf_setresid(bp, error ? buf_count(bp) : 0);
+	if (error) {
+		buf_seterror(bp, error);
+	}
+	buf_biodone(bp);
+}
+
+static int
+hk_data_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
+{
+	switch (cmd) {
+	case DKIOCGETBLOCKSIZE:
+		*(uint32_t *)data = hk_data_bsize;
+		return 0;
+	case DKIOCGETPHYSICALBLOCKSIZE:
+		*(uint32_t *)data = DATA_BLOCK;
+		return 0;
+	case DKIOCSETBLOCKSIZE:
+		/*
+		 * 512 or 4096: what block numbers and DKIOCGETBLOCKCOUNT count in. spec_open and hfs_mountfs
+		 * switch to 512 to count the device and back (and hfs_mountfs fails the mount if it cannot);
+		 * a transfer is whole 4096-byte blocks either way (hk_data_rw).
+		 */
+		if (*(uint32_t *)data != 512 && *(uint32_t *)data != DATA_BLOCK) {
+			return EINVAL;
+		}
+		hk_data_bsize = *(uint32_t *)data;
+		return 0;
+	case DKIOCGETBLOCKCOUNT:
+		*(uint64_t *)data = hk_data_bytes / hk_data_bsize;
+		return 0;
+	case DKIOCISWRITABLE:
+	case DKIOCISSOLIDSTATE:
+		*(uint32_t *)data = 1;
+		return 0;
+	case DKIOCGETFEATURES:
+		*(uint32_t *)data = 0;  /* no unmap; every write is on the flash when it is answered */
+		return 0;
+	case DKIOCSYNCHRONIZE:
+		return 0;               /* the same: the loader flushes and reads back each write before it answers */
+	case DKIOCGETMAXBLOCKCOUNTREAD:
+	case DKIOCGETMAXBLOCKCOUNTWRITE:
+		*(uint64_t *)data = ufs_buffer_size / DATA_BLOCK;
+		return 0;
+	case DKIOCGETMAXBYTECOUNTREAD:
+	case DKIOCGETMAXBYTECOUNTWRITE:
+		*(uint64_t *)data = ufs_buffer_size;
+		return 0;
+	default:
+		return ENOTTY;
+	}
+}
+
+static int
+hk_data_psize(__unused dev_t dev)
+{
+	return hk_data_mode != 0 ? (int)hk_data_bsize : -1;
+}
+
+/* /dev/rhk_data, for newfs_hfs (and fsck_hfs): a bufferful at a time through memory of this kernel's */
+static int
+hk_data_crw(dev_t dev, struct uio *uio, int write)
+{
+	uint8_t *bounce;
+	int error = 0;
+
+	if (hk_data_mode == 0 || minor(dev) != 0) {
+		return ENXIO;
+	}
+	if (uio_offset(uio) < 0) {
+		return EINVAL;
+	}
+	bounce = kalloc_data(ufs_buffer_size, Z_WAITOK);
+	if (bounce == NULL) {
+		return ENOMEM;
+	}
+	while (error == 0 && uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < hk_data_bytes) {
+		uint64_t at = (uint64_t)uio_offset(uio), want = (uint64_t)uio_resid(uio);
+
+		want = want > ufs_buffer_size ? ufs_buffer_size : want;
+		want = want > hk_data_bytes - at ? hk_data_bytes - at : want;
+		if (write) {
+			error = uiomove((caddr_t)bounce, (int)want, uio);
+			if (error == 0 && (error = hk_data_rw(1, at, bounce, want)) != 0) {
+				uio_setoffset(uio, at);
+				uio_setresid(uio, uio_resid(uio) + (user_ssize_t)want);
+			}
+		} else if ((error = hk_data_rw(0, at, bounce, want)) == 0) {
+			error = uiomove((caddr_t)bounce, (int)want, uio);
+		}
+	}
+	kfree_data(bounce, ufs_buffer_size);
+	return error;
+}
+
+static int
+hk_data_cread(dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	return hk_data_crw(dev, uio, 0);
+}
+
+static int
+hk_data_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	return hk_data_crw(dev, uio, 1);
+}
+
+static const struct bdevsw hk_data_bdevsw = {
+	.d_open     = hk_data_open,
+	.d_close    = ufs_close,
+	.d_strategy = hk_data_strategy,
+	.d_ioctl    = hk_data_ioctl,
+	.d_dump     = eno_dump,
+	.d_psize    = hk_data_psize,
+	.d_type     = D_DISK,
+};
+
+static const struct cdevsw hk_data_cdevsw = {
+	.d_open       = hk_data_open,
+	.d_close      = ufs_close,
+	.d_read       = hk_data_cread,
+	.d_write      = hk_data_cwrite,
+	.d_ioctl      = hk_data_ioctl,
+	.d_stop       = eno_stop,
+	.d_reset      = eno_reset,
+	.d_ttys       = NULL,
+	.d_select     = eno_select,
+	.d_mmap       = eno_mmap,
+	.d_strategy   = eno_strat,
+	.d_reserved_1 = eno_getc,
+	.d_reserved_2 = eno_putc,
+	.d_type       = D_DISK,
+};
+
+static void
+hk_data_start(void)
+{
+	uint32_t mode = 0, mb = 1536;
+
+	if (!PE_parse_boot_argn("hk_data", &mode, sizeof(mode)) || (mode != 1 && mode != 2)) {
+		return;
+	}
+	if (mode == 1) {
+		if (ufs_write_part < 0 || UFS_DARWIN_BLOCKS <= UFS_DATA_FIRST + 65536) {
+			printf("hk_data: no data volume: the store takes no writes (ufs_write=1, and darwin as set up)\n");
+			return;
+		}
+		hk_data_bytes = (UFS_DARWIN_BLOCKS - UFS_DATA_FIRST) * DATA_BLOCK;
+	} else {
+		PE_parse_boot_argn("hk_data_mb", &mb, sizeof(mb));
+		hk_data_bytes = (uint64_t)mb << 20;
+		hk_data_ram = kalloc_data(hk_data_bytes, Z_WAITOK | Z_ZERO);
+		if (hk_data_ram == NULL) {
+			printf("hk_data: no %u MB of memory for a data volume\n", mb);
+			return;
+		}
+	}
+	hk_data_bmajor = bdevsw_add(-1, &hk_data_bdevsw);
+	hk_data_cmajor = hk_data_bmajor < 0 ? -1 : cdevsw_add_with_bdev(-1, &hk_data_cdevsw, hk_data_bmajor);
+	if (hk_data_cmajor < 0) {
+		printf("hk_data: no device numbers to be had\n");
+		return;
+	}
+	hk_data_mode = mode;
+	(void)devfs_make_node(makedev(hk_data_bmajor, 0), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "hk_data");
+	(void)devfs_make_node(makedev(hk_data_cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rhk_data");
+	printf("hk_data: /dev/hk_data: %llu MB, %s\n", hk_data_bytes >> 20, mode == 1 ?
+	    "the store from block 3145728 to its end (read and written through the loader)" : "in memory (a RAM-only run's)");
+}
+
+/*
+ * The orderly end of a run (osfmk/arm64/loader_return.c, beside hk_var_save_on_return): whatever HFS holds for
+ * the data volume onto it, and its journal, waited for -- a run that is not shut down need not lose its last
+ * writes. (A restart or a shutdown of iOS unmounts it on its own.)
+ */
+static int
+hk_data_sync_one(mount_t mp, __unused void *arg)
+{
+	if (strncmp(vfs_statfs(mp)->f_fstypename, "hfs", MFSNAMELEN) == 0) {
+		(void)VFS_SYNC(mp, MNT_WAIT, vfs_context_kernel());
+	}
+	return VFS_RETURNED;
+}
+
+void
+hk_data_sync_on_return(void)
+{
+	if (hk_data_mode == 0) {
+		return;
+	}
+	vfs_iterate(0, hk_data_sync_one, NULL);
+	printf("hk_data: the data volume synced for the end of the run\n");
+}
+
 static const struct bdevsw ufs_bdevsw = {
 	.d_open     = ufs_open,
 	.d_close    = ufs_close,
@@ -1607,6 +1877,7 @@ hk_ufs_init(void)
 			printf("ufs: nothing takes writes: %s is not among the partitions\n", ufs_store_name);
 		}
 	}
+	hk_data_start();
 
 	/*
 	 * ufs_native=1: through this kernel's own driver instead, its own transfer list in the

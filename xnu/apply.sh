@@ -27,4 +27,5 @@ git checkout -q -b redwood "$TAG"
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/hackios.patch"
 cp -a "$HERE/files/." .
+"$HERE/hfs-stage.sh" "$DIR"            # Apple's HFS+ for the data volume, fetched like XNU (bsd/hk_hfs)
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/hackios.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"

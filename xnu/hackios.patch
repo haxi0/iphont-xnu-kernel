@@ -61,8 +61,25 @@ index a4d25040f38f..aad72993d139 100644
  kern_csr.o_INCFLAGS += -I$(SRCROOT)/osfmk
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index 4b83160780c3..d6bb1edb1aae 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -75,6 +75,12 @@ COMP_SUBDIRS =
+ 
+ %MACHDEP
+ 
++# Apple OSS HFS built in (bsd/hk_hfs, xnu/hfs-stage.sh): compiled as its kext is, see hk_hfs_compat.h.
++# The compat header must come after the kernel's -D options, hence _CFLAGS_ADD.
++HK_HFS_ROOT = $(SRCROOT)/bsd/hk_hfs
++HK_HFS_OBJS = BTree.o BTreeAllocate.o BTreeMiscOps.o BTreeNodeOps.o BTreeNodeReserve.o BTreeScanner.o BTreeTreeOps.o BTreeWrapper.o CatalogUtilities.o FileExtentMapping.o FileIDsServices.o MacOSStubs.o UnicodeWrappers.o VolumeAllocation.o hfs_attrlist.o hfs_btreeio.o hfs_catalog.o hfs_chash.o hfs_cnode.o hfs_cprotect.o hfs_endian.o hfs_extents.o hfs_fsinfo.o hfs_hotfiles.o hfs_journal.o hfs_link.o hfs_lookup.o hfs_notification.o hfs_quota.o hfs_readwrite.o hfs_resize.o hfs_search.o hfs_vfsops.o hfs_vfsutils.o hfs_vnops.o hfs_xattr.o rangelist.o hk_hfs_iokit.o
++$(foreach o,$(HK_HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -include $(HK_HFS_ROOT)/hk_hfs_compat.h -I$(HK_HFS_ROOT) -I$(HK_HFS_ROOT)/core))
++
+ tcp_cubic.o_CWARNFLAGS_ADD += -Wno-error=implicit-int-float-conversion
+ 
+ #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..00d94d1f296f 100644
+index 44274016a4cf..f599fff52068 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -109,6 +109,45 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
@@ -111,7 +128,7 @@ index 44274016a4cf..00d94d1f296f 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +194,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +194,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -122,11 +139,52 @@ index 44274016a4cf..00d94d1f296f 100644
 +bsd/miscfs/apfs/apfs_store.c		optional apfs
 +bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
 +bsd/miscfs/apfs/apfs_vnops.c		optional apfs
++
++# Apple OSS hfs-627.100.6, put here by xnu/hfs-stage.sh (an installed phone's data volume)
++bsd/hk_hfs/core/BTree.c		optional hk_hfs
++bsd/hk_hfs/core/BTreeAllocate.c		optional hk_hfs
++bsd/hk_hfs/core/BTreeMiscOps.c		optional hk_hfs
++bsd/hk_hfs/core/BTreeNodeOps.c		optional hk_hfs
++bsd/hk_hfs/core/BTreeNodeReserve.c		optional hk_hfs
++bsd/hk_hfs/core/BTreeScanner.c		optional hk_hfs
++bsd/hk_hfs/core/BTreeTreeOps.c		optional hk_hfs
++bsd/hk_hfs/core/BTreeWrapper.c		optional hk_hfs
++bsd/hk_hfs/core/CatalogUtilities.c		optional hk_hfs
++bsd/hk_hfs/core/FileExtentMapping.c		optional hk_hfs
++bsd/hk_hfs/core/FileIDsServices.c		optional hk_hfs
++bsd/hk_hfs/core/MacOSStubs.c		optional hk_hfs
++bsd/hk_hfs/core/UnicodeWrappers.c		optional hk_hfs
++bsd/hk_hfs/core/VolumeAllocation.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_attrlist.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_btreeio.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_catalog.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_chash.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_cnode.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_cprotect.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_endian.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_extents.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_fsinfo.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_hotfiles.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_journal.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_link.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_lookup.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_notification.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_quota.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_readwrite.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_resize.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_search.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_vfsops.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_vfsutils.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_vnops.c		optional hk_hfs
++bsd/hk_hfs/core/hfs_xattr.c		optional hk_hfs
++bsd/hk_hfs/core/rangelist.c		optional hk_hfs
++bsd/hk_hfs/hk_hfs_iokit.c		optional hk_hfs
++
 +bsd/miscfs/ramfs/ramfs.c			optional ramfs
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +408,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +449,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -134,7 +192,7 @@ index 44274016a4cf..00d94d1f296f 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +431,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +472,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -409,7 +467,7 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..613494793615 100644
+index 4df41ba1f61b..e9713782628b 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -147,6 +147,13 @@
@@ -435,7 +493,20 @@ index 4df41ba1f61b..613494793615 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+@@ -691,6 +698,12 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
+ 
++#if HK_HFS
++	/* HFS+ is built in (an installed phone's data volume): registered as its kext's start() would */
++	extern void hk_hfs_register(void);
++	hk_hfs_register();
++#endif
++
+ #if CONFIG_PROC_UUID_POLICY
+ 	/* Initial proc_uuid_policy subsystem */
+ 	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
+@@ -976,6 +989,14 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -1148,6 +1219,29 @@ index 74a2036cf69e..a68b79ce48fa 100644
  
  #define UIO_IS_USER_SPACE32( a_uio_t )  \
  	( (a_uio_t)->uio_segflg == UIO_USERSPACE32 || (a_uio_t)->uio_segflg == UIO_PHYS_USERSPACE32 || \
+diff --git a/bsd/vfs/kpi_vfs.c b/bsd/vfs/kpi_vfs.c
+index 6bf58c3215f7..bc94d9634bc1 100644
+--- a/bsd/vfs/kpi_vfs.c
++++ b/bsd/vfs/kpi_vfs.c
+@@ -4459,6 +4459,18 @@ vn_rename(struct vnode *fdvp, struct vnode **fvpp, struct componentname *fcnp, s
+ 					_err = VNOP_RENAME(fdvp, *fvpp, fcnp, tdvp, *tvpp, tcnp, ctx);
+ 				}
+ 			}
++#if HK_HFS
++			/*
++			 * HFS+ has no RENAME_SWAP, which Foundation's atomic writes use (usermanagerd: "Failed to
++			 * atomically swap writing file: Operation not supported", seen on iOS 16 over HFS+ by
++			 * ios-instantnoodle's 0052). Swapping two regular files of one volume is what
++			 * exchangedata does: each name ends up with the other file's data and attributes.
++			 */
++			if (_err == ENOTSUP && flags == VFS_RENAME_SWAP && *tvpp != NULLVP &&
++			    vnode_isreg(*fvpp) && vnode_isreg(*tvpp) && vnode_mount(*fvpp) == vnode_mount(*tvpp)) {
++				_err = VNOP_EXCHANGE(*fvpp, *tvpp, 0, ctx);
++			}
++#endif
+ 		} else {
+ 			_err = VNOP_RENAME(fdvp, *fvpp, fcnp, tdvp, *tvpp, tcnp, ctx);
+ 		}
 diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
 index cbaa0b221894..78315a2d54cf 100644
 --- a/bsd/vfs/vfs_attrlist.c
@@ -1510,20 +1604,21 @@ index 60c8b9eedd50..b0029de5ef21 100644
  					("shared_region: %p [%d(%s)] map(%p:'%s'): "
  					"not on process' root volume nor preboot volume\n",
 diff --git a/config/MASTER b/config/MASTER
-index 07147cb3188b..e937e62bf4c3 100644
+index 07147cb3188b..c952e4318cf8 100644
 --- a/config/MASTER
 +++ b/config/MASTER
-@@ -113,6 +113,8 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
+@@ -113,6 +113,9 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
  #	4.4 filesystems
  #
  options		MOCKFS		# Boot from an executable	# <mockfs>
 +options		APFS		# Apple File System, read only	# <apfs>
++options		HK_HFS		# Apple OSS HFS+, built in: an installed phone's data volume	# <hk_hfs>
 +options		RAMFS		# Read-write filesystem in memory	# <ramfs>
  options		FIFO		# fifo support			# <fifo>
  options		FDESC		# fdesc_fs support		# <fdesc>
  options		DEVFS		# devfs support			# <devfs>
 diff --git a/config/MASTER.arm64.bcm2837 b/config/MASTER.arm64.bcm2837
-index 1ed75eea2052..54c5e12d2271 100644
+index 1ed75eea2052..d57a19ae50e2 100644
 --- a/config/MASTER.arm64.bcm2837
 +++ b/config/MASTER.arm64.bcm2837
 @@ -16,15 +16,15 @@
@@ -1542,7 +1637,7 @@ index 1ed75eea2052..54c5e12d2271 100644
 -#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs]
 +#  BSD_DEV =        [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
 +#  BSD_DEBUG =      [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
-+#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs ]
++#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs hk_hfs ]
  #  FILESYS_RELEASE= [ FILESYS_BASE ]
  #  FILESYS_DEV =    [ FILESYS_BASE config_union_mounts fdesc ]
  #  FILESYS_DEBUG =  [ FILESYS_BASE config_union_mounts fdesc ]

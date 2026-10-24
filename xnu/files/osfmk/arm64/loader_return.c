@@ -58,6 +58,7 @@ extern void hk_camera_quiesce(void);
 extern void hk_mic_quiesce(void);
 extern void hk_ufs_quiesce(void);
 extern void hk_var_save_on_return(void);   /* bsd/dev/hk_ufs.c: the data volume into the flash */
+extern void hk_data_sync_on_return(void);  /* bsd/dev/hk_ufs.c: /dev/hk_data's HFS+ onto the flash, its journal too */
 extern void hk_display_quiesce(void);   /* iokit/Kernel/MiniIOMobileFramebuffer.cpp: the boot framebuffer again */
 void loader_checkpoint(uint64_t n);
 
@@ -456,6 +457,7 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
 	if (!as_panic) {
 		hk_var_save_on_return();   /* the data volume kept, while the system is still whole */
+		hk_data_sync_on_return();
 		hk_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
 		hk_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 		hk_adsp_stop();            /* and the audio DSP */
@@ -502,6 +504,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 			loader_log_putc(*c);
 		}
 		hk_var_save_on_return();
+		hk_data_sync_on_return();
 		hk_adreno_stop();
 		hk_wifi_stop();
 		hk_adsp_stop();
