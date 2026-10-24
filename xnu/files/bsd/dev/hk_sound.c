@@ -618,6 +618,7 @@ static bool
 space_find(void)
 {
 	bool used[256] = { false };
+	uint32_t stale = ~0u;
 	uint32_t scr0 = get(&apps_smmu, "scr0", SMMU_SCR0), idr0 = get(&apps_smmu, "idr0", SMMU_IDR0);
 	uint32_t idr1 = get(&apps_smmu, "idr1", SMMU_IDR1), matches = idr0 & 0xff, contexts = idr1 & 0xff;
 
@@ -646,6 +647,10 @@ space_find(void)
 					space.passed = true;
 					return true;
 				}
+				if (smr == (1u << 31 | AUDIO_STREAM) && (s2cr >> 16 & 3) == 0) {
+					stale = n;      /* (ours, as a kernel before this one left it: see below) */
+					continue;
+				}
 				say("sound: ... and does not let it through untranslated: it is somebody's, and is left alone\n");
 				return false;
 			}
@@ -654,6 +659,33 @@ space_find(void)
 			space.old_smr = smr;
 			space.old_s2cr = s2cr;
 		}
+	}
+	if (stale != ~0u) {
+		/*
+		 * Exactly what space_on() writes (the stream alone, through a context), left by a kernel before this one that
+		 * did not get to put it back: nothing else sends stream 0x1801 anywhere (the boot chain sets nothing up for it).
+		 * Taken over, if no other match register uses its context; put back as the boot chain leaves an unused one.
+		 */
+		uint32_t s2cr = rd(apps_smmu.base + SMMU_S2CR(stale)), shared = 0;
+
+		for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
+			shared += n != stale && rd(apps_smmu.base + SMMU_SMR(n)) >> 31 && (rd(apps_smmu.base + SMMU_S2CR(n)) & 0xff) ==
+			    (s2cr & 0xff);
+		}
+		if (shared != 0) {
+			say("sound: ... and its context %u is used by another stream too: left alone\n", s2cr & 0xff);
+			return false;
+		}
+		space.match = stale;
+		space.old_smr = 0;
+		space.old_s2cr = 0x200ff;
+		space.context = s2cr & 0xff;
+		apps_smmu_second.phys = apps_smmu.phys + space.page;
+		apps_smmu_context.phys = apps_smmu.phys + (space.pages + space.context) * space.page;
+		space.old_sctlr = 0;
+		say("sound: ... as a kernel before this one left it (match register %u, context %u): taken over\n", stale, space.context);
+		space.found = true;
+		return true;
 	}
 	for (space.context = 0; space.context < contexts && used[space.context]; space.context++) {
 	}

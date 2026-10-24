@@ -54,6 +54,20 @@
  *            mic_tap=1 with haptic=5 (the vibration motor from 2 s to 3 s of listening: the motor's
  *            175.5 Hz in the samples)
  *
+ * The OnePlus 8 (board=instantnoodle): the same LPASS (its blocks where redwood has them), the same
+ * codec (the tree's wcd938x-tx-slave, the same ID) on the same master, but its main microphone is a
+ * digital one (OxygenOS's mixer paths: "handset-mic" = "dmic2": "TX DMIC MUX2" DMIC1 into decimator 2,
+ * TX_CDC_DMA_TX_3, one channel), powered by the codec's MIC BIAS1 (the tree's routing "TX DMIC1" <-
+ * "MIC BIAS1", qcom,cdc-micbias1-mv 1800). So the codec is only brought up for its bias, and the
+ * samples come from the TX macro's DMIC input: its clock from the VA macro's DMIC0 at MCLK / 4 (the
+ * tree's qcom,tx-dmic-sample-rate 2.4 MHz), the LPASS pins 6 and 7 (dmic01_clk/data_active: function
+ * 1, 8 mA; the clock "output-high", its output enabled -- without that no clock leaves the pin and the
+ * microphone stays silent), no SoundWire data port, the decimator at +6 dB ("TX_DEC2 Volume" 90). The codec's reset is GPIO32 (the tree's wcd938x_reset_active: 16 mA,
+ * output high -- with a function, "func2", that the pin controller refuses, so it is driven as a GPIO here; the codec
+ * does not answer until it is), three master pins (LPASS 0, 1, 2), no HCTL
+ * workaround (its tree has none), the mic biases at the tree's 1800/2700/1800/1800 mV. Decimator 2 is
+ * unmuted after 50 ms and its filter settled after 300 ms (OnePlus's TX_MACRO_DMIC_*_DELAY_MS).
+ *
  * What is asked for is given back at the end, and before the DSP is shut down (hk_mic_dsp_down()).
  */
 #include <kern/clock.h>
@@ -168,6 +182,7 @@ spin_us(uint32_t us)
 }
 
 static bool broken;                     /* a write that did not read back: nothing more is written, all is undone */
+static bool noodle;                     /* board=instantnoodle: the OnePlus 8 (see above) */
 static char last_write[120] = "nothing written";
 
 struct block {
@@ -398,7 +413,8 @@ static struct block tx_swr = { "the TX SoundWire master", 0x03230000, 0x2000 };
 static struct block tx_hctl = { "the TX SoundWire master's HCTL", 0x032a9000, 0x1000 };
 static struct block lpi = { "the LPASS pins", 0x033c0000, 0x10000 };
 static struct block lpi_high = { "the LPASS pins", 0x033ce000, 0x1000 };
-static struct block tlmm = { "the pin controller", 0x0f100000, 0x100000 };
+/* only the reset pin's page: the IO submap is 8 MB, all of it permanent (osfmk/arm/io_map.c) */
+static struct block tlmm = { "the pin controller", 0x0f100000 + 0x1000 * 83, 0x1000 };
 
 static void
 look(void)
@@ -430,21 +446,26 @@ look(void)
 		snprintf(name, sizeof(name), "gpio%u in/out", pins[i]);
 		(void)get(&lpi, name, 0x1000 * pins[i] + 4);
 	}
-	(void)get(&lpi_high, "gpio14 config (SoundWire TX data 2)", 0);
-	(void)get(&lpi_high, "gpio14 in/out", 4);
-	(void)get(&tlmm, "gpio83 config (the codec's reset)", 0x1000 * 83);
-	(void)get(&tlmm, "gpio83 in/out", 0x1000 * 83 + 4);
+	if (!noodle) {
+		(void)get(&lpi_high, "gpio14 config (SoundWire TX data 2)", 0);
+		(void)get(&lpi_high, "gpio14 in/out", 4);
+		(void)get(&tlmm, "gpio83 config (the codec's reset)", 0);
+		(void)get(&tlmm, "gpio83 in/out", 4);
+	}
 	/* (last: the master is a block of its own, and not yet known; with its version above 1.5.1 the votes are all it needs) */
 	for (size_t i = 0; i < sizeof(swr) / sizeof(swr[0]); i++) {
 		(void)get(&tx_swr, swr[i].name, swr[i].offset);
 	}
-	(void)get(&tx_hctl, "HCTL (0x32a90a8)", 0x0a8);
+	if (!noodle) {
+		(void)get(&tx_hctl, "HCTL (0x32a90a8)", 0x0a8);
+	}
 }
 
 /* ---- the codec's reset, the master's pins ------------------------------------------------------------ */
 
-#define TLMM_CFG_83             (0x1000 * 83)
-#define TLMM_IO_83              (0x1000 * 83 + 4)
+static unsigned reset_pin = 83;        /* the codec's reset: redwood's GPIO83, the OnePlus 8's GPIO32 */
+#define TLMM_CFG_83             0
+#define TLMM_IO_83              4
 static uint32_t found_reset_cfg, found_reset_io;
 static bool reset_taken;
 
@@ -457,6 +478,7 @@ reset_release(void)
 	found_reset_cfg = rd(tlmm.base + TLMM_CFG_83);
 	found_reset_io = rd(tlmm.base + TLMM_IO_83);
 	reset_taken = true;
+	say("mic: the codec's reset (gpio%u) as found: config %#x, in/out %#x\n", reset_pin, found_reset_cfg, found_reset_io);
 	/* the sleep state: gpio, 16 mA, no pull, output low; 20 us; the active state: output high */
 	if (!put(&tlmm, "gpio83 out (the codec's reset)", TLMM_IO_83, 0, 2) ||
 	    !put(&tlmm, "gpio83 config: gpio, 16 mA, no pull, output", TLMM_CFG_83, 0x3c0, 0x3ff)) {
@@ -484,12 +506,22 @@ reset_restore(void)
 }
 
 static struct block lpi_slew = { "the LPASS pins' slew rates", 0x0355a000, 0x1000 };
-static const struct { unsigned pin, slew_bit; uint32_t pull; const char *name; } swr_pins[] = {
+struct lpi_pin {
+	unsigned pin, slew_bit;
+	uint32_t pull;
+	const char *name;
+};
+static const struct lpi_pin redwood_swr_pins[] = {
 	{ 0, 0, 0, "gpio0 (SoundWire TX clock)" }, { 1, 2, 2, "gpio1 (data 0)" }, { 2, 4, 2, "gpio2 (data 1)" },
 	{ 14, 6, 2, "gpio14 (data 2)" },
+}, noodle_swr_pins[] = {
+	/* (tx_swr_clk/data1/data2_active: function 1, 2 mA, slew rate 1; the clock without a pull, the data with a keeper) */
+	{ 0, 0, 0, "gpio0 (SoundWire TX clock)" }, { 1, 2, 2, "gpio1 (data 1)" }, { 2, 4, 2, "gpio2 (data 2)" },
 };
-#define SWR_PINS                (sizeof(swr_pins) / sizeof(swr_pins[0]))
-static uint32_t found_pin_cfg[SWR_PINS], found_pin_dir[SWR_PINS], found_slew;
+static const struct lpi_pin *swr_pins = redwood_swr_pins;
+static unsigned swr_pin_count = sizeof(redwood_swr_pins) / sizeof(redwood_swr_pins[0]);
+#define SWR_PINS                swr_pin_count
+static uint32_t found_pin_cfg[4], found_pin_dir[4], found_slew;
 static bool pins_taken;
 
 static bool
@@ -638,16 +670,18 @@ master_on(void)
 	uint32_t ssp = SWR_BUS_HZ * 2 / (SWR_ROWS * SWR_COLUMNS * SWR_FRAME_SYNC_HZ), cfg;
 	bool linked = false;
 
-	if (tx_hctl.base == 0) {
-		tx_hctl.base = ml_io_map(tx_hctl.phys, tx_hctl.size);
-	}
-	found_hctl = rd(tx_hctl.base + 0x0a8);
 	master_taken = true;
-	/* "SW workaround to gate hw_ctl for SWR version >= 1.6" */
-	if (!put(&tx_hctl, "HCTL: bit 1 cleared", 0x0a8, found_hctl & ~2u, 0x3)) {
-		return false;
+	if (!noodle) {
+		if (tx_hctl.base == 0) {
+			tx_hctl.base = ml_io_map(tx_hctl.phys, tx_hctl.size);
+		}
+		found_hctl = rd(tx_hctl.base + 0x0a8);
+		/* "SW workaround to gate hw_ctl for SWR version >= 1.6" */
+		if (!put(&tx_hctl, "HCTL: bit 1 cleared", 0x0a8, found_hctl & ~2u, 0x3)) {
+			return false;
+		}
+		spin_us(505);
 	}
-	spin_us(505);
 	/* swrm_runtime_resume() */
 	if (!put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) || !put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) ||
 	    !put(&tx_swr, "MCP_BUS_CTRL", SWRM_MCP_BUS_CTRL, 1, 0)) {
@@ -692,7 +726,9 @@ master_off(void)
 	(void)put(&tx_swr, "INTERRUPT_EN: none", SWRM_INTERRUPT_EN, 0, 0);
 	(void)put(&tx_swr, "CPU1_INTERRUPT_EN: none", SWRM_CPU1_INTERRUPT_EN, 0, 0);
 	(void)put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0);
-	(void)put(&tx_hctl, "HCTL, as it was found", 0x0a8, found_hctl, 0x3);
+	if (!noodle) {
+		(void)put(&tx_hctl, "HCTL, as it was found", 0x0a8, found_hctl, 0x3);
+	}
 	master_taken = false;
 }
 
@@ -899,13 +935,14 @@ static bool
 codec_init(void)
 {
 	uint8_t efuse = 0;
-	/* the tree's qcom,cdc-micbias1..4-mv: 2750 mV, (2750 - 1000) / 50 */
-	const uint8_t vout = (2750 - 1000) / 50;
+	/* the tree's qcom,cdc-micbias1..4-mv, (mV - 1000) / 50: redwood 2750 all four; the OnePlus 8 1800, 2700, 1800, 1800 */
+	const uint8_t vout = (2750 - 1000) / 50, vout1 = noodle ? (1800 - 1000) / 50 : vout, vout2 = noodle ? (2700 - 1000) / 50 : vout,
+	    vout34 = noodle ? (1800 - 1000) / 50 : vout;
 
 	if (!codec_put(WCD_INTR_LEVEL_0, 0, 0xff) || !codec_put(WCD_INTR_LEVEL_0 + 1, 0, 0xff) ||
 	    !codec_put(WCD_INTR_LEVEL_0 + 2, 0, 0xff) ||
-	    !codec_bits(WCD_ANA_MICB1, 0x3f, vout) || !codec_bits(WCD_ANA_MICB2, 0x3f, vout) ||
-	    !codec_bits(WCD_ANA_MICB3, 0x3f, vout) || !codec_bits(WCD_ANA_MICB4, 0x3f, vout) ||
+	    !codec_bits(WCD_ANA_MICB1, 0x3f, vout1) || !codec_bits(WCD_ANA_MICB2, 0x3f, vout2) ||
+	    !codec_bits(WCD_ANA_MICB3, 0x3f, vout34) || !codec_bits(WCD_ANA_MICB4, 0x3f, vout34) ||
 	    !codec_bits(WCD_SLEEP_CTL, 0x0e, 0x0e) || !codec_bits(WCD_SLEEP_CTL, 0x80, 0x80)) {
 		return false;
 	}
@@ -1057,14 +1094,21 @@ datapath_on(void)
 	return true;
 }
 
-/* "MIC BIAS1" (wcd938x_micbias_control(MICB_ENABLE)), then ADC1's request (wcd938x_enable_req()) in "low power" mode */
+/* "MIC BIAS1" (wcd938x_micbias_control(MICB_ENABLE)) */
 static bool
-adc1_on(void)
+micbias1_on(void)
 {
 	return codec_bits(WCD_CDC_DIG_CLK_CTL, 0xf0, 0xf0) && codec_bits(WCD_CDC_ANA_CLK_CTL, 0x10, 0x10) &&
 	       codec_bits(WCD_CDC_ANA_TX_CLK_CTL, 0x01, 0x01) && codec_bits(WCD_MICB1_TEST_CTL_2, 0x01, 0x01) &&
 	       codec_bits(WCD_MICB2_TEST_CTL_2, 0x01, 0x01) && codec_bits(WCD_MICB3_TEST_CTL_2, 0x01, 0x01) &&
-	       codec_bits(WCD_MICB4_TEST_CTL_2, 0x01, 0x01) && codec_bits(WCD_ANA_MICB1, 0xc0, (test_bits & 1) ? 0x00 : 0x40) &&
+	       codec_bits(WCD_MICB4_TEST_CTL_2, 0x01, 0x01) && codec_bits(WCD_ANA_MICB1, 0xc0, (test_bits & 1) ? 0x00 : 0x40);
+}
+
+/* "MIC BIAS1", then ADC1's request (wcd938x_enable_req()) in "low power" mode */
+static bool
+adc1_on(void)
+{
+	return micbias1_on() &&
 	       /* "ADC1 Volume" 6 (Xiaomi's mixer paths) */
 	       codec_bits(WCD_ANA_TX_CH1, 0x1f, 6) &&
 	       codec_bits(WCD_CDC_ANA_CLK_CTL, 0x08, 0x08) && codec_bits(WCD_CDC_ANA_CLK_CTL, 0x10, 0x10) &&
@@ -1115,6 +1159,13 @@ bolero_look(void)
 	uint32_t id0 = get(&va_macro, "CORE_ID_0", VA_CORE_ID_0) & 0xff, id1 = get(&va_macro, "CORE_ID_1", VA_CORE_ID_1) & 0xff;
 
 	bolero_version = id0 == 0x01 && id1 == 0x0f ? 20 : id0 == 0x02 && id1 == 0x0e ? 21 : 0;
+	if (noodle && id0 == 0x00 && id1 == 0x0f) {
+		/* SM8250's: 1.x, its number from how many macros there are (bolero_soc_codec_probe(): four, 1.2); a DMIC needs
+		 * none of 2.x's SoundWire mics' dividers */
+		say("mic: the digital codec is bolero 1.2 (SM8250's)\n");
+		bolero_version = 12;
+		return true;
+	}
 	say("mic: the digital codec is bolero %s\n", bolero_version == 20 ? "2.0" : bolero_version == 21 ? "2.1" : "OF AN UNKNOWN VERSION");
 	if (bolero_version != 21) {
 		return bolero_version == 20;
@@ -1224,6 +1275,141 @@ va_mic_off(void)
 		(void)put(&va_macro, "SWR_MIC_CTL (put back as found)", VA_SWR_MIC_CTL0 + 4 * i, found_va_mic[i], 0);
 	}
 	va_mic_taken = false;
+}
+
+/* ---- the OnePlus 8: its digital main microphone (DMIC1, decimator 2) ------------------------------------- */
+
+#define TX_ADC_MUX2_CFG0                0x110
+#define TX_ADC_MUX2_CFG1                0x114
+#define TX2_PATH_CTL                    0x500
+#define TX2_PATH_CFG0                   0x504
+#define TX2_VOL_CTL                     0x50c
+#define TX2_PATH_SEC2                   0x518
+#define VA_DMIC0_CTL                    0x084           /* (the bolero regmap's VA_TOP_CSR_DMIC0_CTL, 0x3084) */
+#define VA_DMIC_CFG                     0x094
+#define DMIC_CLK_DIV_4                  2               /* TX_MACRO_CLK_DIV_4: 9.6 MHz / 2.4 MHz */
+
+static const struct lpi_pin dmic_pins[] = {
+	{ 6, 0, 0, "gpio6 (DMIC01 clock)" }, { 7, 0, 0, "gpio7 (DMIC01 data)" },
+};
+static uint32_t found_dmic_pin[2][2], found_dmic_regs[6], found_va_dmic[2];
+static bool dmic_taken, dmic_clock_taken, micbias_taken;
+static const uint32_t dmic_dec_regs[] = { TX_ADC_MUX2_CFG0, TX_ADC_MUX2_CFG1, TX2_PATH_CTL, TX2_PATH_CFG0, TX2_VOL_CTL, TX2_PATH_SEC2 };
+
+/*
+ * msm_cdc_pinctrl's active state for DMIC01; bolero_dmic_clk_enable(DMIC1); the mixer controls' writes ("TX DMIC MUX2"
+ * DMIC1: tx_macro_put_dec_enum(), TX2_TX_PATH_CFG0 bit 7 a DMIC; the decimator's own mux left at MSM_DMIC); then
+ * tx_macro_enable_dec() for decimator 2, a DMIC: the rate, its mode, muted, on, its HPF gate open, 150 Hz while it settles
+ */
+static bool
+dmic_on(void)
+{
+	uint32_t cfg0;
+
+	if (lpi.base == 0) {
+		lpi.base = ml_io_map(lpi.phys, lpi.size);
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		found_dmic_pin[i][0] = rd(lpi.base + 0x1000 * dmic_pins[i].pin);
+		found_dmic_pin[i][1] = rd(lpi.base + 0x1000 * dmic_pins[i].pin + 4);
+	}
+	for (unsigned i = 0; i < sizeof(dmic_dec_regs) / sizeof(dmic_dec_regs[0]); i++) {
+		found_dmic_regs[i] = get(&tx_macro, "(as found)", dmic_dec_regs[i]);
+	}
+	found_va_dmic[0] = get(&va_macro, "DMIC0_CTL (as found)", VA_DMIC0_CTL);
+	found_va_dmic[1] = get(&va_macro, "DMIC_CFG (as found)", VA_DMIC_CFG);
+	dmic_taken = dmic_clock_taken = true;
+	for (unsigned i = 0; i < 2; i++) {
+		/* function 1, 8 mA, the pull as found; the clock "output-high" (lpi_config_set(): its output enabled, bit 9) */
+		uint32_t cfg = (found_dmic_pin[i][0] & ~0x3fcu) | 1u << 2 | 3u << 6 | (i == 0 ? 1u << 9 : 0);
+
+		if (i == 0 && !put(&lpi, "gpio6: high", 0x1000 * dmic_pins[i].pin + 4, 2, 2)) {
+			return false;
+		}
+		if (!put(&lpi, dmic_pins[i].name, 0x1000 * dmic_pins[i].pin, cfg, 0x3ff)) {
+			return false;
+		}
+	}
+	if (!put_bits(&va_macro, "DMIC_CFG", VA_DMIC_CFG, 0x80, 0x00) ||
+	    !put_bits(&va_macro, "DMIC0_CTL: MCLK / 4 (2.4 MHz)", VA_DMIC0_CTL, 0x0e, DMIC_CLK_DIV_4 << 1) ||
+	    !put_bits(&va_macro, "DMIC0_CTL: the clock on", VA_DMIC0_CTL, 0x01, 0x01) ||
+	    !put_bits(&tx_macro, "TX2_TX_PATH_CFG0: a digital mic", TX2_PATH_CFG0, 0x80, 0x80) ||
+	    !put_bits(&tx_macro, "ADC_MUX2_CFG0: DMIC1", TX_ADC_MUX2_CFG0, 0xf0, 2u << 4) ||
+	    !put_bits(&tx_macro, "ADC_MUX2_CFG1: MSM_DMIC", TX_ADC_MUX2_CFG1, 0x03, 0x00) ||
+	    !put_bits(&tx_macro, "TX2_TX_PATH_CTL: 48 kHz", TX2_PATH_CTL, 0x0f, 0x04) ||
+	    !put_bits(&tx_macro, "TX2_TX_PATH_CFG0: mode 0", TX2_PATH_CFG0, 0x06, 0x00) ||
+	    !put_bits(&tx_macro, "TX2_TX_PATH_CTL: muted", TX2_PATH_CTL, 0x10, 0x10) ||
+	    !put_bits(&tx_macro, "TX2_TX_PATH_CTL: on", TX2_PATH_CTL, 0x20, 0x20) ||
+	    !put_bits(&tx_macro, "TX2_TX_PATH_SEC2: HPF gate (not an analog mic)", TX2_PATH_SEC2, 0x01, 0x00)) {
+		return false;
+	}
+	cfg0 = get(&tx_macro, "TX2_TX_PATH_CFG0", TX2_PATH_CFG0);
+	hpf_cut_off = (cfg0 & 0x60) >> 5;
+	if (hpf_cut_off != 2) {
+		if (!put_bits(&tx_macro, "TX2_TX_PATH_CFG0: high-pass 150 Hz", TX2_PATH_CFG0, 0x60, 2u << 5) ||
+		    !put_bits(&tx_macro, "TX2_TX_PATH_SEC2: filter gate", TX2_PATH_SEC2, 0x03, 0x02)) {
+			return false;
+		}
+		sleep_ms(6);
+		if (!put_bits(&tx_macro, "TX2_TX_PATH_SEC2", TX2_PATH_SEC2, 0x03, 0x00)) {
+			return false;
+		}
+	}
+	/* mixer_paths.xml's "TX_DEC2 Volume" 90: +6 dB (the control's 84 is 0 dB) */
+	if (!put(&tx_macro, "TX2_TX_VOL_CTL: +6 dB", TX2_VOL_CTL, 6, 0xff)) {
+		return false;
+	}
+	return true;
+}
+
+static bool
+dmic_unmute(void)
+{
+	return put_bits(&tx_macro, "TX2_TX_PATH_CTL: unmuted", TX2_PATH_CTL, 0x10, 0x00);
+}
+
+static bool
+dmic_settled(void)
+{
+	return put_bits(&tx_macro, "TX2_TX_PATH_CFG0: high-pass as it was", TX2_PATH_CFG0, 0x60, (uint32_t)hpf_cut_off << 5) &&
+	       put_bits(&tx_macro, "TX2_TX_PATH_SEC2: filter gate", TX2_PATH_SEC2, 0x03, 0x02) &&
+	       (spin_us(21), put_bits(&tx_macro, "TX2_TX_PATH_SEC2", TX2_PATH_SEC2, 0x03, 0x01));
+}
+
+/* the bias off again (wcd938x_micbias_control(MICB_DISABLE)): there is no reset to put the codec back in */
+static void
+micbias1_off(void)
+{
+	if (!micbias_taken) {
+		return;
+	}
+	broken = false;
+	(void)codec_bits(WCD_ANA_MICB1, 0xc0, 0x00);
+	micbias_taken = false;
+}
+
+static void
+dmic_off(void)
+{
+	if (dmic_taken) {
+		broken = false;
+		(void)put_bits(&tx_macro, "TX2_TX_PATH_CTL: muted", TX2_PATH_CTL, 0x10, 0x10);
+		(void)put_bits(&tx_macro, "TX2_TX_PATH_CTL: off", TX2_PATH_CTL, 0x20, 0x00);
+		for (unsigned i = 0; i < sizeof(dmic_dec_regs) / sizeof(dmic_dec_regs[0]); i++) {
+			(void)put(&tx_macro, "(put back as found)", dmic_dec_regs[i], found_dmic_regs[i], 0);
+		}
+		for (unsigned i = 0; i < 2; i++) {
+			(void)put(&lpi, "a DMIC pin, as it was found", 0x1000 * dmic_pins[i].pin, found_dmic_pin[i][0], 0x3ff);
+			(void)put(&lpi, "its value, as it was found", 0x1000 * dmic_pins[i].pin + 4, found_dmic_pin[i][1], 2);
+		}
+		dmic_taken = false;
+	}
+	if (dmic_clock_taken) {
+		broken = false;
+		(void)put(&va_macro, "DMIC0_CTL, as it was found", VA_DMIC0_CTL, found_va_dmic[0], 0);
+		(void)put(&va_macro, "DMIC_CFG, as it was found", VA_DMIC_CFG, found_va_dmic[1], 0);
+		dmic_clock_taken = false;
+	}
 }
 
 /* ---- the DSP: the codec DMA port, a device path for recording, a stream that is read ------------------ */
@@ -1406,10 +1592,11 @@ dsp_port_on(void)
 	struct {
 		uint32_t version, rate;
 		uint16_t bits, format, channels, mask;
-	} __attribute__((packed)) config = { 1, MIC_RATE, 16, 0, 1, 1u << 1 };
+	} __attribute__((packed)) config = { 1, MIC_RATE, 16, 0, 1, noodle ? 1u << 2 : 1u << 1 };    /* (the decimator's bit) */
 	uint16_t start[2] = { MIC_PORT, 0 };
 
 	if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config),
+	    noodle ? "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 2" :
 	    "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 1")) {
 		return false;
 	}
@@ -1583,11 +1770,11 @@ listen(bool for_ios)
 	for (;;) {
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
 		elapsed_ms = now / NSEC_PER_MSEC;
-		if (!unmuted && elapsed_ms >= 200) {            /* TX_MACRO_AMIC_UNMUTE_DELAY_MS */
-			unmuted = dec1_unmute();
+		if (!unmuted && elapsed_ms >= (noodle ? 50 : 200)) {    /* TX_MACRO_DMIC/AMIC_UNMUTE_DELAY_MS */
+			unmuted = noodle ? dmic_unmute() : dec1_unmute();
 		}
-		if (!settled && elapsed_ms >= 300) {            /* TX_MACRO_AMIC_HPF_DELAY_MS */
-			settled = dec1_settled();
+		if (!settled && elapsed_ms >= 300) {            /* TX_MACRO_DMIC/AMIC_HPF_DELAY_MS */
+			settled = noodle ? dmic_settled() : dec1_settled();
 		}
 		if (tap && elapsed_ms >= 2000 && elapsed_ms < 3000) {
 			hk_haptic_pretend(20000);
@@ -1682,7 +1869,9 @@ undo(void)
 {
 	dsp_off();
 	dec1_off();
+	dmic_off();
 	va_mic_off();
+	micbias1_off();
 	master_off();
 	tx_clocks_off();
 	pins_restore();
@@ -1714,6 +1903,11 @@ path_up(void)
 		return true;
 	}
 	/* the stream and path, the port's format and start, the codec's widgets */
+	if (noodle) {
+		/* the codec for its bias alone; the samples from the TX macro's DMIC input */
+		micbias_taken = true;
+		return bolero_look() && codec_init() && dsp_path_on() && dsp_port_on() && micbias1_on() && dmic_on();
+	}
 	return bolero_look() && codec_init() && dsp_path_on() && dsp_port_on() && dec1_on() && (!adc_on || adc1_on()) &&
 	       datapath_on();
 }
@@ -1821,8 +2015,11 @@ hk_mic_dsp_up(void)
 		return;
 	}
 	if (instantnoodle_board()) {
-		printf("mic: mic=N is redwood's microphone path; the OnePlus 8's microphones (WCD938x) are not done\n");
-		return;
+		noodle = true;
+		reset_pin = 32;
+		tlmm.phys = INSTANTNOODLE_TLMM_SOUTH + 0x1000 * 32;    /* (GPIO32's tile, pinctrl-sm8250.c) */
+		swr_pins = noodle_swr_pins;
+		swr_pin_count = sizeof(noodle_swr_pins) / sizeof(noodle_swr_pins[0]);
 	}
 	level = level > 4 ? 4 : level;
 	PE_parse_boot_argn("mic_secs", &mic_secs, sizeof(mic_secs));
