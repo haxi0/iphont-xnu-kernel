@@ -144,6 +144,10 @@ with the phone in the menu's Developer mode (or `xl enter` from fastboot); the p
 slot. **Undo**: `fastboot flash boot_b ../ios-instantnoodle/backup/partitions/boot_b.img` -- fastboot is the
 bootloader's (key combination at power-on), never written, and TWRP is still in `recovery_a`/`_b`.
 
+A **timed** bundle (`loader_return_after=` on its command line: a test) does not reset when its kernel comes back:
+the loader brings up its USB link, so `fastboot get_staged LOG` has the run's log and `./xl health` the boot state --
+how a boot from the flash is checked with no hands on the phone. An untimed bundle (the installed one) resets.
+
 What an installed run keeps: `/private/var` (home screen, settings, app data) is saved into the var store when iOS
 restarts or shuts down (launchd's SIGTERM to `var_store watch`), and every `var_save_every=` seconds (600 in the
 profile) against a reset with the keys, which saves nothing. Shut down switches the phone off (the kernel returns

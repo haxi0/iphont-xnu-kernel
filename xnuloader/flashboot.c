@@ -734,11 +734,23 @@ static void
 fb_boot(int s)
 {
 	if (fb_load_slot(s)) {
+		struct payload_info pi;
+		int timed = 0;
+
+		/* a test bundle (loader_return_after= on its command line): after it, the USB link, not a reset */
+		parse_payload(&pi, 0);
+		for (const char *c = pi.cmdline; *c; c++) {
+			timed |= starts_with(c, "loader_return_after=") && (c == pi.cmdline || c[-1] == ' ');
+		}
 		fb_count_start(s);
 		flush_log();
 		run_kernel(0, 0);                       /* until the phone is switched off; if it comes back, reset */
 		if (loader_ctx[CTX_REASON] == 3) {
 			power_off();                    /* iOS shut down (halt_all_cpus): off, not round again */
+		}
+		if (timed && usb_start()) {
+			/* the host fetches the run's log (fastboot get_staged) and the boot state (xl health) */
+			usb_command_loop();
 		}
 		reboot();
 	}
