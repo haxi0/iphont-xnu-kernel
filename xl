@@ -24,6 +24,14 @@
 #   xl install BUNDLE   an installed phone's boot bundle (common/flash/mkbundle.py) into the boot slot of
 #                       its darwin that does not hold the newest good one, read back (common/flash/install-xl.sh)
 #   xl health           the boot slots and the boot guard, as the loader reads them (writes nothing)
+#   xl flashboot        the installed boot from the loader: its menu, then the newest good bundle from the flash,
+#                       with no reset on the way (the stock bootloader does not come back on USB after a reset
+#                       with the cable in); a timed bundle (loader_return_after=) comes back here with its log
+#   xl flashpart boot_a|boot_b IMAGE EXPECT
+#                       IMAGE into that boot partition by the loader, only if the partition's SHA-256 now is
+#                       EXPECT (a file whose SHA-256 that is -- the backup -- or 64 hex digits); read back
+#   xl lastlog [F]      the log the previous start of the loader left (a reset, a boot from the flash)
+#   xl settime          the computer's date into the installed phone (kept as an offset from the PMIC's clock)
 #   xl state            where is the phone right now
 #
 # Logs land in logs/. Environment for `run`:
@@ -251,6 +259,50 @@ install_bundle() { # install_bundle <bundle.img>
 	echo "xl: installed $1"
 }
 
+flashboot() { # the installed boot, from the loader in developer mode
+	enter || return 1
+	exec 8> $PHONE.run
+	flock -n 8 || { echo "xl: a run is in progress"; return 1; }
+	pwd > $PHONE.who
+	local log="logs/$(date +%H%M%S)-flashboot.log" result deadline=$(( $(date +%s) + ${XL_SECS:-900} + 100 ))
+	fb oem flashboot | grep -q OKAY || { echo "xl: the loader has no flashboot (an older one?)"; return 1; }
+	# the menu's countdown, then the kernel: the loader answers again once the run is under way
+	while :; do
+		sleep 5
+		result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
+		case "$result" in ""|*running*) ;; *) break ;; esac
+		[ "$(date +%s)" -ge "$deadline" ] && { echo "xl: no result in time (an untimed bundle? it runs until switched off)"; return 2; }
+	done
+	fetch_log "$log"
+	ln -sf "$(basename "$log")" logs/last.log
+	echo "$result  [$log]"
+}
+
+flashpart() { # flashpart boot_a|boot_b IMAGE EXPECT
+	case "$1" in boot_a|boot_b) ;; *) echo "xl: only boot_a or boot_b"; return 1 ;; esac
+	[ -f "$2" ] && [ "$(head -c 8 "$2")" = "ANDROID!" ] || { echo "xl: $2 is not a boot image"; return 1; }
+	local want=$3
+	[ -f "$want" ] && want=$(sha256sum "$want" | cut -d' ' -f1)
+	[[ "$want" =~ ^[0-9a-f]{64}$ ]] || { echo "xl: EXPECT is a file or 64 hex digits"; return 1; }
+	enter || return 1
+	FB_TIMEOUT=120 fb stage "$2" | grep -q OKAY || { echo "xl: upload failed"; return 1; }
+	local r; r=$(FB_TIMEOUT=120 fb oem flashpart "$1" "${want:0:16}")
+	fb oem log >/dev/null && fetch_log logs/loader.log && grep -a "^flash: $1" logs/loader.log | tail -2
+	echo "$r" | grep -q OKAY || { echo "xl: not written: $(echo "$r" | grep -m1 FAILED)"; return 1; }
+	echo "xl: $2 is in $1"
+}
+
+settime() {
+	enter || return 1
+	fb oem settime "$(date +%s)" | grep -q OKAY && echo "xl: the phone's date set" || { echo "xl: not set (an older loader?)"; return 1; }
+}
+
+lastlog() { # lastlog [file]
+	enter || return 1
+	local out=${1:-logs/lastlog.txt}
+	fb oem lastlog | grep -q OKAY && fetch_log "$out" && echo "xl: $out" || { echo "xl: the loader keeps no last log (older?)"; return 1; }
+}
+
 screenshot() { # screenshot [file.png]
 	enter || return 1
 	local out=${1:-logs/screen.png} geom
@@ -312,5 +364,9 @@ reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120;
 state) state ;;
 install) install_bundle "$2" ;;
 health) health ;;
+flashboot) flashboot ;;
+flashpart) flashpart "$2" "$3" "$4" ;;
+lastlog) lastlog "$2" ;;
+settime) settime ;;
 *) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" ;;
 esac

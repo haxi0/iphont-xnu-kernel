@@ -383,6 +383,73 @@ fb_load_slot(int s)
 	return 1;
 }
 
+/* ---- the date: the PMIC's clock and an offset kept in the boot area ------- */
+
+/*
+ * The UEFI here has no clock with the date, and Android never set the PMIC's (it counts from wherever it
+ * started). So the date is that count plus an offset, kept in darwin's block FB_CLOCK_BLOCK (in the boot
+ * area, past the boot state and a file-backed darwin's marker): "HKCLOCK1", the offset (seconds, signed),
+ * the PMIC count it was set at, and an FNV-1a 64 over those 24 bytes. xl settime writes it from the
+ * computer's clock; every boot after that has the date, the phone off in between or not.
+ */
+#define FB_CLOCK_BLOCK    (FB_STATE_BLOCK + 2)
+static int fb_write(efi_block_io *bio, uint64_t blk, const void *src, uint64_t bytes);
+static const char fb_clock_magic[8] = { 'H', 'K', 'C', 'L', 'O', 'C', 'K', '1' };
+
+struct fb_clock {
+	char magic[8];
+	int64_t offset;
+	uint64_t at_rtc;
+	uint64_t sum;
+};
+
+static uint64_t
+clock_epoch(void)
+{
+	efi_block_io *bio = fb.bio != NULL ? fb.bio : fb_find_darwin();
+	uint64_t rtc = pmic_rtc_seconds();
+	struct fb_clock c;
+
+	if (bio == NULL || rtc == 0 || !fb_read(bio, FB_CLOCK_BLOCK, ufs_buffer, FB_BLOCK)) {
+		return 0;
+	}
+	memcpy(&c, ufs_buffer, sizeof(c));
+	if (memcmp(c.magic, fb_clock_magic, 8) != 0 || fb_fnv((const uint8_t *)&c, 24, 0xcbf29ce484222325ULL) != c.sum ||
+	    rtc < c.at_rtc) {
+		return 0;                               /* never set, torn, or the PMIC's clock was reset since */
+	}
+	print("clock: %d by the PMIC's clock and the kept offset\n", (uint64_t)((int64_t)rtc + c.offset));
+	return (uint64_t)((int64_t)rtc + c.offset);
+}
+
+static const char *
+clock_set(uint64_t now)
+{
+	efi_block_io *bio = fb.bio != NULL ? fb.bio : fb_find_darwin();
+	uint64_t rtc = pmic_rtc_seconds();
+	struct fb_clock c;
+
+	if (now < 1704067200ULL || now > 4102444800ULL) {
+		return "not a date between 2024 and 2100";
+	}
+	if (bio == NULL || rtc == 0) {
+		return "no darwin, or no PMIC clock";
+	}
+	memset(&c, 0, sizeof(c));
+	memcpy(c.magic, fb_clock_magic, 8);
+	c.offset = (int64_t)now - (int64_t)rtc;
+	c.at_rtc = rtc;
+	c.sum = fb_fnv((const uint8_t *)&c, 24, 0xcbf29ce484222325ULL);
+	memset(ufs_buffer, 0, FB_BLOCK);
+	memcpy(ufs_buffer, &c, sizeof(c));
+	if (!fb_write(bio, FB_CLOCK_BLOCK, ufs_buffer, FB_BLOCK) || !fb_read(bio, FB_CLOCK_BLOCK, ufs_buffer, FB_BLOCK) ||
+	    memcmp(ufs_buffer, &c, sizeof(c)) != 0) {
+		return "the clock block did not read back";
+	}
+	print("clock: set: %d now, the PMIC's clock at %d\n", now, rtc);
+	return NULL;
+}
+
 /* ---- install over USB: a bundle into the boot area (xl install) ----------- */
 
 /* write `bytes` (whole 4 KiB blocks) at darwin's block `blk`, flushed */
@@ -457,6 +524,66 @@ fb_install(const uint8_t *data, uint64_t len)
 	}
 	print("flash: boot slot %d written and read back\n", (uint64_t)slot);
 	fb_scan();
+	return NULL;
+}
+
+/*
+ * A boot image into boot_a or boot_b, from the loader -- the stock bootloader's fastboot does the same, but
+ * reaching it means a reset, after which it does not come back on USB with the cable in. Only a boot image
+ * ("ANDROID!") that fits; only when the partition's SHA-256 now begins with want_hex (16 digits: the host
+ * says what it expects to overwrite -- the backup, or the image when putting the backup back); written,
+ * flushed and read back. Nothing else is written. NULL when done, else why not.
+ */
+static const char *
+fb_flash_boot(const char *name, const char *want_hex, const uint8_t *img, uint64_t len)
+{
+	efi_block_io *bio = part_bio(name);
+	struct sha256 h;
+	uint8_t sum[32];
+	char hex[17];
+	uint64_t bs, size;
+
+	if (bio == NULL) {
+		return "no such partition";
+	}
+	bs = bio->media->block_size;
+	size = (bio->media->last_block + 1) * bs;
+	if (len < 4096 || memcmp(img, "ANDROID!", 8) != 0 || len > size) {
+		return "not a boot image that fits";
+	}
+	sha256_init(&h);
+	for (uint64_t at = 0; at < size; at += sizeof(ufs_buffer)) {
+		uint64_t n = size - at < sizeof(ufs_buffer) ? size - at : sizeof(ufs_buffer);
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, at / bs, n, ufs_buffer))) {
+			return "read error";
+		}
+		sha256_add(&h, ufs_buffer, n);
+	}
+	sha256_end(&h, sum);
+	for (int i = 0; i < 8; i++) {
+		hex[2 * i] = "0123456789abcdef"[sum[i] >> 4];
+		hex[2 * i + 1] = "0123456789abcdef"[sum[i] & 15];
+	}
+	hex[16] = 0;
+	print("flash: %s now: sha256 %s...\n", name, hex);
+	if (str_len(want_hex) < 16 || memcmp(hex, want_hex, 16) != 0) {
+		return "the partition is not what the host expects: nothing written";
+	}
+	memset((uint8_t *)img + len, 0, (len + bs - 1) / bs * bs - len);    /* the last block's tail: zeros, not an old payload's */
+	len = (len + bs - 1) / bs * bs;
+	if (EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, 0, len, (void *)img))) {
+		return "write error";
+	}
+	if (bio->flush_blocks) {
+		bio->flush_blocks(bio);
+	}
+	for (uint64_t at = 0; at < len; at += sizeof(ufs_buffer)) {
+		uint64_t n = len - at < sizeof(ufs_buffer) ? len - at : sizeof(ufs_buffer);
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, at / bs, n, ufs_buffer)) || memcmp(ufs_buffer, img + at, n) != 0) {
+			return "READ BACK DIFFERS: put the backup back";
+		}
+	}
+	print("flash: %s written (%d bytes) and read back\n", name, len);
 	return NULL;
 }
 
@@ -748,7 +875,7 @@ fb_boot(int s)
 		if (loader_ctx[CTX_REASON] == 3) {
 			power_off();                    /* iOS shut down (halt_all_cpus): off, not round again */
 		}
-		if (timed && usb_start()) {
+		if (timed && (USB != NULL || usb_start())) {          /* (USB: started over it, xl flashboot) */
 			/* the host fetches the run's log (fastboot get_staged) and the boot state (xl health) */
 			usb_command_loop();
 		}

@@ -383,6 +383,25 @@ flush_log(void)
 	write_logs(NULL, 0);
 }
 
+/*
+ * The log the previous start left in logdump (a reset, a power-off, a boot from the flash: whatever it said
+ * last), read before this start writes its own over it: "oem lastlog", xl lastlog.
+ */
+static char last_log[2 << 20];            /* = out_buf: all a start can have written */
+
+static void
+read_last_log(void)
+{
+	efi_block_io *bio = find_log_partition();
+	uint64_t bs = bio != NULL ? bio->media->block_size : 0;
+
+	if (bs == 0 || bs > sizeof(last_log) ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, sizeof(last_log) / bs * bs, last_log))) {
+		last_log[0] = 0;
+	}
+	last_log[sizeof(last_log) - 1] = 0;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Apple device tree writer                                                 */
 /*                                                                          */
@@ -425,6 +444,7 @@ dt_prop_u64(struct dt_writer *w, const char *name, uint64_t value)
 	dt_prop(w, name, &value, sizeof(value));
 }
 
+static uint64_t clock_epoch(void);
 /* Seconds since 1970 by the firmware's real-time clock, or 0 when it has none or it is not set. */
 static uint64_t
 firmware_epoch(void)
@@ -435,7 +455,7 @@ firmware_epoch(void)
 
 	if (ST->rt == NULL || ST->rt->get_time == NULL || EFI_ERROR(ST->rt->get_time(&t, NULL)) ||
 	    t.year < 2024 || t.year > 2099 || t.month < 1 || t.month > 12) {
-		return 0;
+		return clock_epoch();           /* the PMIC's clock and the offset xl settime left (flashboot.c) */
 	}
 	days = (uint64_t)(t.year - 1970) * 365 + (t.year - 1969) / 4 + before_month[t.month - 1] + (t.day - 1);
 	if (t.month > 2 && t.year % 4 == 0) {
@@ -619,9 +639,146 @@ static const struct platform *const platforms[] = {
 
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Our USB link off (the pull-up let go, the controller stopped) before the phone is reset or switched off,
+ * as Linux stops its controller before it reboots: with the cable left in, nothing else tells the next
+ * stage that the link it finds is not its own -- the stock ABL then shows fastboot without coming up on
+ * USB, and switches itself off (seen 2026-10-24; unplugging the cable was the only cure).
+ */
+static void usb_quiesce(void);
+static const struct platform *PLAT;
+
+/*
+ * What the PMIC does when the SoC lets go of PS_HOLD (a PSCI reset or switch-off ends with that): the
+ * stock kernel sets it every time before it does (msm-poweroff.c, qpnp_pon_reset_config()), and the
+ * OnePlus 8's PON stores the reboot reason across a hard reset (qcom,store-hard-reset-reason) -- so a
+ * reboot, also one into fastboot, is a hard reset there: the PMIC and with it the USB port's attach
+ * logic start afresh, as an unplugged cable would make them. Left as whoever ran last set it, a reset
+ * may be a warm one, after which the stock ABL showed fastboot without coming up on USB and switched
+ * the phone off (2026-10-24). Through the SPMI arbiter (version 5, as bsd/dev/hk_torch.c), on the
+ * OnePlus 8 only: PM8150's PON (slave 0, peripheral 0x08), PS_HOLD_RST_CTL 0x5a [3:0] the type,
+ * PS_HOLD_RST_CTL2 0x5b [7] enable.
+ */
+#define PON_WARM_RESET   0x01
+#define PON_SHUTDOWN     0x04
+#define PON_HARD_RESET   0x07
+#define SPMI_CORE        0x0c440000ULL         /* which peripheral each channel is (0x900 + 4n, [19:8]) */
+#define SPMI_CNFG        0x0c40a000ULL         /* which system writes through channel n (0x700 + 4n, [2:0]) */
+#define SPMI_OBSERVER    0x0e600000ULL         /* reads: 0x80 per channel */
+#define SPMI_CHNLS       0x0c600000ULL         /* writes: 0x10000 per channel */
+
+static int
+spmi_done(uint64_t ch)
+{
+	for (int i = 0; i < 2000; i++) {
+		uint32_t st = *(volatile uint32_t *)(ch + 0x08);
+
+		if (st & 1) {
+			return (st & 0xe) == 0;         /* done, and not failed, denied or dropped */
+		}
+		BS->stall(1);
+	}
+	return 0;
+}
+
+static int
+pon_reg(int ch, uint8_t reg, int write, uint8_t *value)
+{
+	uint64_t r = SPMI_OBSERVER + 0x80ULL * (uint64_t)ch, w = SPMI_CHNLS + 0x10000ULL * (uint64_t)ch;
+
+	if (write) {
+		*(volatile uint32_t *)(w + 0x10) = *value;
+		*(volatile uint32_t *)(w + 0x00) = (uint32_t)reg << 4;              /* register write, 1 byte */
+		if (!spmi_done(w)) {
+			return 0;
+		}
+	}
+	*(volatile uint32_t *)(r + 0x00) = 1u << 27 | (uint32_t)reg << 4;        /* register read, 1 byte */
+	if (!spmi_done(r)) {
+		return 0;
+	}
+	if (write) {
+		return (uint8_t)*(volatile uint32_t *)(r + 0x18) == *value;          /* read back */
+	}
+	*value = (uint8_t)*(volatile uint32_t *)(r + 0x18);
+	return 1;
+}
+
+/* the arbiter's channel for peripheral id (slave << 8 | peripheral), -1: none (or not the OnePlus 8);
+ * writable: only one this system (apps, 0) owns */
+static int
+spmi_channel(uint32_t id, int writable)
+{
+	if (PLAT != &platform_instantnoodle || (*(volatile uint32_t *)SPMI_CORE >> 28) != 5) {
+		return -1;
+	}
+	for (int n = 0; n < 512; n++) {
+		uint32_t map = *(volatile uint32_t *)(SPMI_CORE + 0x900 + 4 * (uint64_t)n);
+
+		if (map != 0 && ((map >> 8) & 0xfff) == id &&
+		    (!writable || (*(volatile uint32_t *)(SPMI_CNFG + 0x700 + 4 * (uint64_t)n) & 7) == 0)) {
+			return n;
+		}
+	}
+	return -1;
+}
+
+/*
+ * The PM8150's real-time clock (slave 0, peripheral 0x60, "qcom,pm8941-rtc"): a count of seconds at 0x48..0x4b,
+ * read as rtc-pm8xxx.c does (the low byte again for a carry). Android never sets it (no allow-set-time in its
+ * tree): it is not the date, only a clock that runs with the phone off. 0: none.
+ */
+static uint64_t
+pmic_rtc_seconds(void)
+{
+	int ch = spmi_channel(0x060, 0);
+	uint8_t b[4], again;
+
+	for (int tries = 0; ch >= 0 && tries < 2; tries++) {
+		int ok = 1;
+		for (int i = 0; i < 4; i++) {
+			ok &= pon_reg(ch, (uint8_t)(0x48 + i), 0, &b[i]);
+		}
+		if (ok && pon_reg(ch, 0x48, 0, &again) && again >= b[0]) {
+			return (uint64_t)b[0] | (uint64_t)b[1] << 8 | (uint64_t)b[2] << 16 | (uint64_t)b[3] << 24;
+		}
+	}
+	return 0;
+}
+
+static void
+pon_ps_hold(uint8_t type)
+{
+	int ch = spmi_channel(0x008, 1);
+	uint8_t ctl, ctl2, off;
+
+	if (PLAT != &platform_instantnoodle) {
+		return;
+	}
+	if (ch < 0 || !pon_reg(ch, 0x5b, 0, &ctl2) || !pon_reg(ch, 0x5a, 0, &ctl)) {
+		print("pon: no channel to the power-on block: the reset type stays as it was\n");
+		return;
+	}
+	off = ctl2 & ~0x80;
+	if (!pon_reg(ch, 0x5b, 1, &off)) {
+		print("pon: PS_HOLD could not be disabled: the reset type stays as it was\n");
+		return;
+	}
+	BS->stall(500);                                 /* 10 sleep clocks, and half again (qpnp_pon_reset_config) */
+	ctl = (uint8_t)((ctl & ~0x0f) | type);
+	off |= 0x80;
+	if (!pon_reg(ch, 0x5a, 1, &ctl) || !pon_reg(ch, 0x5b, 1, &off)) {
+		print("pon: setting the PS_HOLD reset type to %x failed\n", (uint64_t)type);
+		return;
+	}
+	print("pon: PS_HOLD now means %s\n", type == PON_HARD_RESET ? "a hard reset" : type == PON_SHUTDOWN ? "switch off" : "a warm reset");
+}
+
 static void
 reboot(void)
 {
+	usb_quiesce();
+	pon_ps_hold(PON_HARD_RESET);
 	hc_take_back("before the reset");
 	flush_log();
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
@@ -629,10 +786,56 @@ reboot(void)
 	}
 }
 
+/*
+ * A reset into the stock bootloader's own mode, as Android's `reboot bootloader` / `reboot recovery` does it:
+ * the reason in the PMIC's soft spare register (Linux qpnp_pon_set_restart_reason, a gen2 PON as the
+ * PM8150's: reason << 1 under mask 0xfe; ABL's RECOVERY_MODE 1, FASTBOOT_MODE 2), then the reset reboot()
+ * makes. ABL reads the reason first thing and clears it: no stop in boot_b's kernel on the way. With no
+ * PMIC protocol (QEMU): a plain reset.
+ */
+static void
+reboot_to(uint8_t reason)
+{
+	static const efi_guid pon_guid = QCOM_PMIC_PON_GUID;
+	qcom_pmic_pon *pon;
+	uint8_t spare = 0;
+
+	if (!EFI_ERROR(BS->locate_protocol(&pon_guid, NULL, (void **)&pon)) && pon != NULL &&
+	    !EFI_ERROR(pon->set_spare_reg(0, QCOM_PON_SOFT_SPARE, (uint8_t)(reason << 1), 0xfe))) {
+		pon->get_spare_reg(0, QCOM_PON_SOFT_SPARE, &spare);
+		print("reboot: reason %d in the PMIC's soft spare register (it reads %x)\n", (uint64_t)reason, (uint64_t)spare);
+	} else {
+		print("reboot: no PMIC power-on protocol: a plain reset\n");
+	}
+	reboot();                                       /* a hard reset, as the stock kernel's (above) */
+}
+
+/* why this start happened, by the PMIC: for telling a bootloader's reset from a cable's (xl, docs/INSTALL.md) */
+static void
+pon_report(void)
+{
+	static const efi_guid pon_guid = QCOM_PMIC_PON_GUID;
+	qcom_pmic_pon *pon;
+	uint32_t reason = 0;
+	uint8_t warm = 0, spare = 0;
+
+	if (EFI_ERROR(BS->locate_protocol(&pon_guid, NULL, (void **)&pon)) || pon == NULL) {
+		return;
+	}
+	pon->get_pon_reason(0, &reason);
+	pon->warm_reset_status(0, &warm);
+	pon->get_spare_reg(0, QCOM_PON_SOFT_SPARE, &spare);
+	print("pon: power-on reason %x (1 hard reset, 2 smpl, 4 rtc, 8 dc, 10 usb, 20 pon1, 40 cable, 80 power key), "
+	    "warm reset %d, soft spare %x, rtc %d\n", (uint64_t)(reason & 0xff), (uint64_t)warm, (uint64_t)spare,
+	    pmic_rtc_seconds());
+}
+
 /* switched off (iOS shut down: the kernel came back with reason 3); a firmware that cannot, resets */
 static void
 power_off(void)
 {
+	usb_quiesce();
+	pon_ps_hold(PON_SHUTDOWN);                      /* else PSCI's switch-off is whatever reset was set last */
 	hc_take_back("before switching off");
 	flush_log();
 	ST->rt->reset_system(2 /* EfiResetShutdown */, 0, 0, NULL);
@@ -3662,6 +3865,17 @@ usb_dummy_notify(void *event, void *ctx)
 {
 }
 
+static void
+usb_quiesce(void)
+{
+	if (USB != NULL) {
+		efi_status s = USB->stop();
+
+		print("usb: stopped (%x)\n", s);
+		USB = NULL;
+	}
+}
+
 static int
 usb_start(void)
 {
@@ -3800,6 +4014,54 @@ starts_with(const char *s, const char *prefix)
 }
 
 static const char *fb_install(const uint8_t *data, uint64_t len);     /* flashboot.c */
+static void fb_standalone(void);
+static const char *clock_set(uint64_t now);
+
+static const char *fb_flash_boot(const char *name, const char *want_hex, const uint8_t *img, uint64_t len);
+
+/* a GPT partition's BlockIo by its name, NULL: none such */
+static efi_block_io *
+part_bio(const char *want)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		return NULL;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		char name[40];
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
+		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			continue;
+		}
+		ufs_name(info, name, sizeof(name));
+		if (str_eq(name, want)) {
+			return bio;
+		}
+	}
+	return NULL;
+}
+
+/* a partition by its GPT name into dst, at most max bytes: how many were read (0: none such, or an error) */
+static uint64_t
+part_read_all(const char *want, uint8_t *dst, uint64_t max)
+{
+	efi_block_io *bio = part_bio(want);
+	uint64_t bytes;
+
+	if (bio == NULL) {
+		return 0;
+	}
+	bytes = (bio->media->last_block + 1) * bio->media->block_size;
+	bytes = bytes < max ? bytes : max / bio->media->block_size * bio->media->block_size;
+	return EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, bytes, dst)) ? 0 : bytes;
+}
 static int fb_scan(void);
 static uint64_t download_len;           /* the last download into the payload window ("oem install" takes it) */
 
@@ -3816,7 +4078,8 @@ fb_command(char *cmd)
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
 		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
-		    starts_with(cmd, "oem install") || starts_with(cmd, "oem flashstate"))) {
+		    starts_with(cmd, "oem install") || starts_with(cmd, "oem flashstate") || starts_with(cmd, "oem readpart") ||
+		    starts_with(cmd, "oem flashboot") || starts_with(cmd, "oem flashpart") || starts_with(cmd, "oem settime"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3975,6 +4238,43 @@ fb_command(char *cmd)
 
 			download_len = 0;
 			fb_reply(why != NULL ? "FAIL" : "OKAY", why != NULL ? why : "");
+		} else if (starts_with(cmd, "oem flashboot")) {
+			/*
+			 * The installed boot, from here: the menu, then the bundle from the flash -- what the UEFI in
+			 * boot_b does at power-on, without the reset that takes the phone off USB on its way there
+			 * (the stock bootloader does not come back on USB after a reset with the cable in). A timed
+			 * bundle ends on this same link (flashboot.c, fb_boot); xl flashboot.
+			 */
+			fb_reply("OKAY", "");
+			set_result("running", 0, 0);
+			fb_standalone();
+		} else if (starts_with(cmd, "oem flashpart boot_a ") || starts_with(cmd, "oem flashpart boot_b ")) {
+			/* "oem flashpart boot_X <16 hex>": the last download into boot_X, when the partition's SHA-256 now
+			 * begins with those digits (its backup's, or the image's to put the backup back): xl flashpart */
+			const char *why = fb_flash_boot(starts_with(cmd, "oem flashpart boot_a ") ? "boot_a" : "boot_b", cmd + 21,
+			    (const uint8_t *)PAYLOAD_BASE, download_len);
+
+			download_len = 0;
+			fb_reply(why != NULL ? "FAIL" : "OKAY", why != NULL ? why : "");
+		} else if (starts_with(cmd, "oem settime ")) {
+			/* "oem settime SECONDS-SINCE-1970": the date, kept as an offset from the PMIC's clock (xl settime) */
+			const char *why = clock_set(parse_number(cmd + 12, 10));
+
+			fb_reply(why != NULL ? "FAIL" : "OKAY", why != NULL ? why : "");
+		} else if (starts_with(cmd, "oem lastlog")) {
+			/* what the previous start wrote into logdump (read_last_log) */
+			staged_data = last_log;
+			staged_len = str_len(last_log);
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem readpart logfs") || starts_with(cmd, "oem readpart logdump")) {
+			/* a log partition, read only, whole: logfs holds the stock UEFI's and ABL's own logs (FAT) */
+			const char *name = starts_with(cmd, "oem readpart logfs") ? "logfs" : "logdump";
+			uint64_t got = part_read_all(name, (uint8_t *)PAYLOAD_BASE, PAYLOAD_MAX_SIZE - 0x100000);
+
+			download_len = 0;
+			staged_data = (const char *)PAYLOAD_BASE;
+			staged_len = got;
+			fb_reply(got != 0 ? "OKAY" : "FAIL", got != 0 ? "" : "no such partition");
 		} else if (starts_with(cmd, "oem flashstate")) {
 			/* the boot slots and the boot guard's state into the log ("oem log" fetches it; xl health) */
 			fb_scan();
@@ -3990,10 +4290,15 @@ fb_command(char *cmd)
 				compose_logs(NULL, 0);
 			}
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "reboot-bootloader") || starts_with(cmd, "reboot-recovery")) {
+			/* `fastboot reboot bootloader` / `fastboot reboot recovery`: the stock ABL's fastboot, or TWRP */
+			fb_reply("OKAY", "");
+			BS->stall(200000);
+			reboot_to(starts_with(cmd, "reboot-bootloader") ? 2 : 1);
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
 			BS->stall(200000);
-			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+			reboot();
 		} else {
 			fb_reply("FAIL", "unknown command");
 		}
@@ -4185,7 +4490,9 @@ efi_main(efi_handle image, efi_system_table *st)
 			ramfb_phone_screen();
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
+	read_last_log();
 	print("platform %s\n", PLAT->name);
+	pon_report();
 
 	install_exception_hook();
 	wdt_arm();

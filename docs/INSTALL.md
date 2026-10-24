@@ -148,6 +148,17 @@ A **timed** bundle (`loader_return_after=` on its command line: a test) does not
 the loader brings up its USB link, so `fastboot get_staged LOG` has the run's log and `./xl health` the boot state --
 how a boot from the flash is checked with no hands on the phone. An untimed bundle (the installed one) resets.
 
+**The stock bootloader and a cable left in.** After a reset with the USB cable in, the PMIC's charger detection
+may take the computer's port for a wall charger (ABL's own log, partition `abl_log`: `usb: chgr - DCP_CHARGER`):
+ABL's fastboot then never comes up on USB and the phone switches itself off; a hard reset with the cable in also
+starts as off-mode charging (`startupmode=dc_charger`). Unplugging, getting into the mode wanted, then plugging in
+again is the cure; it is the same on OxygenOS and not something this port changes. So nothing here needs a reset into
+the stock fastboot: the loader does what it would be needed for, over a link that is already up --
+`xl install` (a bundle), `xl flashboot` (the installed boot, no reset), `xl flashpart boot_b IMAGE EXPECT` (a boot
+partition, only when its SHA-256 is EXPECT, read back), `xl lastlog` (what the previous start logged), `xl settime`
+(the date: an offset from the PMIC's clock, which Android never set). The loader's own reboots set the stock way of
+it (PS_HOLD a hard reset, the reason in the PON's soft spare register: `fastboot reboot bootloader` / `recovery`).
+
 What an installed run keeps: `/private/var` (home screen, settings, app data) is saved into the var store when iOS
 restarts or shuts down (launchd's SIGTERM to `var_store watch`), and every `var_save_every=` seconds (600 in the
 profile) against a reset with the keys, which saves nothing. Shut down switches the phone off (the kernel returns

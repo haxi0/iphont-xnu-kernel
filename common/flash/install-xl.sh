@@ -53,6 +53,7 @@ if [ "$MODE" != uefi ]; then
 	confirm "Write out/$DEVICE-bundle.img ($(( $(stat -c %s out/$DEVICE-bundle.img) >> 20 )) MB) into the boot slot of the
 phone's store (blocks 2042368..2091519) that does not hold the newest good bundle (shown above)?"
 	./xl install out/$DEVICE-bundle.img || die "the bundle was not installed (the other boot slot is untouched)"
+	./xl settime || echo "install-xl: the date was not set (iOS starts in 1970 until ./xl settime)"
 	# the UEFI with a payload of the loader alone: no kernel in it, so the loader shows the menu and boots from the
 	# flash. Made here, once: `fastboot boot` of this file is the preview, and `uefi` flashes this same file
 	python3 xnuloader/mkpayload.py -o out/$DEVICE-uefi-payload.bin loader.efi=xnuloader/loader.efi > /dev/null || die "no payload"
@@ -75,28 +76,32 @@ if [ "$MODE" = install ] || [ "$MODE" = uefi ]; then
 		[ -n "$up" ] && [ "$up" != 0 ] && grep -q "generation $up \"" out/$DEVICE-health.txt ||
 			die "no installed bundle has come up yet: fastboot boot $IMG first, wait for the home screen and a minute, then again"
 	fi
-	# the phone's own bootloader, not our loader: only it writes partitions. From the loader in RAM a reset
-	# lands there while boot_b still holds OxygenOS's kernel (as `xl reboot` always has on this phone)
 	if [ "$(./xl state)" = loader ]; then
-		echo "install-xl: the loader is running: restarting the phone into its bootloader"
-		./xl reboot > /dev/null
-		for _ in $(seq 1 45); do sleep 2; [ "$(./xl state)" = fastboot ] && break; done
-		[ "$(./xl state)" = fastboot ] || die "the phone is not in fastboot (replug the cable, or hold the key combination at power-on), then: $0 $DEVICE uefi"
-	fi
-	[ "$(fastboot devices | wc -l)" = 1 ] || die "not exactly one device in fastboot: nothing written"
-	product=$(fastboot getvar product 2>&1 | sed -n 's/^product: *//p')
-	[ "$product" = "$FASTBOOT_PRODUCT" ] || die "the fastboot device is '$product', not $FASTBOOT_PRODUCT: nothing written"
-	slot=$(fastboot getvar current-slot 2>&1 | sed -n 's/^current-slot: *//p')
-	size=$(fastboot getvar partition-size:$FLASH_BOOT_PART 2>&1 | sed -n "s/^partition-size:$FLASH_BOOT_PART: *//p")
-	[ "_$slot" = "${FLASH_BOOT_PART#boot}" ] || die "the bootloader starts slot _$slot, not ${FLASH_BOOT_PART#boot}: nothing written"
-	[ -n "$size" ] && [ $(( size )) -ge $(stat -c %s $IMG) ] || die "$FLASH_BOOT_PART ($size) is smaller than $IMG"
-	[ $(( size )) -eq $(stat -c %s "$FLASH_BOOT_BACKUP") ] || die "the backup is not the size of $FLASH_BOOT_PART ($size)"
-	echo "install-xl: backup of $FLASH_BOOT_PART: $FLASH_BOOT_BACKUP, sha256 $(sha256sum "$FLASH_BOOT_BACKUP" | cut -c1-16)..."
-	confirm "Flash $IMG ($(( $(stat -c %s $IMG) >> 10 )) KB, sha256 $(sha256sum $IMG | cut -c1-16)...) into $FLASH_BOOT_PART of
+		# the loader writes it: no reset into the stock fastboot on the way, which does not come back on USB
+		# after a reset with the cable in (2026-10-24). Only if the partition is byte for byte the backup
+		# (its SHA-256, checked by the loader), then read back (xnuloader/flashboot.c, fb_flash_boot)
+		echo "install-xl: backup of $FLASH_BOOT_PART: $FLASH_BOOT_BACKUP, sha256 $(sha256sum "$FLASH_BOOT_BACKUP" | cut -c1-16)..."
+		confirm "Write $IMG ($(( $(stat -c %s $IMG) >> 10 )) KB, sha256 $(sha256sum $IMG | cut -c1-16)...) into $FLASH_BOOT_PART by the
+loader, only if $FLASH_BOOT_PART is now exactly the backup? From then on the phone powers on into the HackiOS menu.
+Undo: ./xl flashpart $FLASH_BOOT_PART <the backup's first 44437504 bytes> <this image + backup tail>, or fastboot flash $FLASH_BOOT_PART $FLASH_BOOT_BACKUP"
+		./xl flashpart $FLASH_BOOT_PART $IMG "$FLASH_BOOT_BACKUP" || die "the loader did not write $FLASH_BOOT_PART (see above)"
+	else
+		# no loader up: the phone's own bootloader writes it (in its fastboot already: see xl state)
+		[ "$(fastboot devices | wc -l)" = 1 ] || die "not exactly one device in fastboot: nothing written"
+		product=$(fastboot getvar product 2>&1 | sed -n 's/^product: *//p')
+		[ "$product" = "$FASTBOOT_PRODUCT" ] || die "the fastboot device is '$product', not $FASTBOOT_PRODUCT: nothing written"
+		slot=$(fastboot getvar current-slot 2>&1 | sed -n 's/^current-slot: *//p')
+		size=$(fastboot getvar partition-size:$FLASH_BOOT_PART 2>&1 | sed -n "s/^partition-size:$FLASH_BOOT_PART: *//p")
+		[ "_$slot" = "${FLASH_BOOT_PART#boot}" ] || die "the bootloader starts slot _$slot, not ${FLASH_BOOT_PART#boot}: nothing written"
+		[ -n "$size" ] && [ $(( size )) -ge $(stat -c %s $IMG) ] || die "$FLASH_BOOT_PART ($size) is smaller than $IMG"
+		[ $(( size )) -eq $(stat -c %s "$FLASH_BOOT_BACKUP") ] || die "the backup is not the size of $FLASH_BOOT_PART ($size)"
+		echo "install-xl: backup of $FLASH_BOOT_PART: $FLASH_BOOT_BACKUP, sha256 $(sha256sum "$FLASH_BOOT_BACKUP" | cut -c1-16)..."
+		confirm "Flash $IMG ($(( $(stat -c %s $IMG) >> 10 )) KB, sha256 $(sha256sum $IMG | cut -c1-16)...) into $FLASH_BOOT_PART of
 $product $(fastboot devices | cut -f1), the
 partition the bootloader starts? From then on the phone powers on into the HackiOS menu.
 Undo: fastboot flash $FLASH_BOOT_PART $FLASH_BOOT_BACKUP"
-	fastboot flash $FLASH_BOOT_PART $IMG || die "fastboot flash failed: fastboot flash $FLASH_BOOT_PART $FLASH_BOOT_BACKUP puts the old one back"
+		fastboot flash $FLASH_BOOT_PART $IMG || die "fastboot flash failed: fastboot flash $FLASH_BOOT_PART $FLASH_BOOT_BACKUP puts the old one back"
+	fi
 fi
 
 [ "$MODE" = install ] || [ "$MODE" = uefi ] || exit 0

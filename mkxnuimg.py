@@ -67,7 +67,7 @@ if args.payload:
 if os.environ.get('DTB'): parts['dtb'] = os.environ['DTB']
 dtb = open(parts['dtb'], 'rb').read()
 kernel = args.output + '.kernel~'
-open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
+open(kernel, 'wb').write(gzip.compress(blob, 6, mtime=0) + dtb)   # (no build time in it: the same inputs, the same image)
 try:
     # board "HACKiOS": how the loader of an installed phone tells which A/B slot's boot partition is its own
     # (xnuloader/flashboot.c, ab_switch_back) -- an Android boot image never has that name

@@ -6,6 +6,8 @@ darwin's boot area, in 4 KiB blocks:
 
   2042368 + N * 24576   boot slot N (N = 0, 1): a header block, the "XNUP" container behind it
   2091520               the boot state: what the loader started last, how often, and what came up
+  2091521               (a file-backed darwin) its marker: common/flash/darwinid.py
+  2091522               the date: an offset from the PMIC's clock (HKCLOCK1, xl settime; xnuloader/flashboot.c)
 
 Bundle header (HKBOOT02), little endian:
 

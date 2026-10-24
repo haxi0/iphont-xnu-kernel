@@ -259,4 +259,16 @@ typedef struct {
 #define QCOM_CHARGER_EX_GUID     { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 } }
 #define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }
 
+/* the PMIC's power-on block (QcomPkg EFIPmicPon.h, the phone's own PmicDxe): why it started, and the spare
+ * register the stock ABL takes its reboot reason from */
+#define QCOM_PMIC_PON_GUID       { 0x97044b58, 0xfea4, 0x4ad0, { 0x9d, 0x0b, 0xe4, 0x17, 0xd6, 0x0f, 0x11, 0xa1 } }
+#define QCOM_PON_SOFT_SPARE      3
+typedef struct {
+	uint64_t revision;
+	efi_status (EFIAPI *get_spare_reg)(uint32_t pmic, uint32_t spare, uint8_t *data);
+	efi_status (EFIAPI *set_spare_reg)(uint32_t pmic, uint32_t spare, uint8_t value, uint8_t mask);
+	efi_status (EFIAPI *get_pon_reason)(uint32_t pmic, uint32_t *reason);   /* HARD_RESET SMPL RTC DC USB PON1 CBL KPDPWR */
+	efi_status (EFIAPI *warm_reset_status)(uint32_t pmic, uint8_t *warm);
+} qcom_pmic_pon;
+
 #endif /* XNULOADER_EFI_H */
