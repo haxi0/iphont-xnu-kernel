@@ -547,6 +547,8 @@ struct platform {
 	uint64_t store_first, store_last;
 	/* board_ arguments for this device's kernel (bsd/sys/hk_board.h): where its SoC differs from redwood's */
 	const char *board_args;
+	/* no Android left to go back to (the port took its userdata): the boot menu offers none (flashboot.c) */
+	int no_android;
 };
 
 static const struct platform platform_qemu_virt = {
@@ -559,6 +561,9 @@ static const struct platform platform_qemu_virt = {
 	 * is that of real hardware: an eighth of a second by a 24 MHz clock, a twentieth here.
 	 */
 	.timeout_scale = 20,
+#ifdef QEMU_NO_ANDROID
+	.no_android = 1,                /* a phone like the OnePlus 8 (common/flash/qemu-test.sh no-android) */
+#endif
 };
 
 static const struct platform platform_redwood = {
@@ -598,6 +603,8 @@ static const struct platform platform_instantnoodle = {
 	.store_first = 4133800, .store_last = 30513146,
 	/* SM8250's GPU sensors, by its thermal-zones: gpuss-0 sensor 15 of tsens0, gpuss-1 sensor 8 of tsens1 */
 	.board_args = "board_thermal_gpuss_0=0xf board_thermal_gpuss_1=0x108",
+	/* boot_a/boot_b still hold OxygenOS's kernels, but its data is gone: switching slots would start nothing */
+	.no_android = 1,
 };
 
 /*
@@ -622,6 +629,16 @@ reboot(void)
 	}
 }
 
+/* switched off (iOS shut down: the kernel came back with reason 3); a firmware that cannot, resets */
+static void
+power_off(void)
+{
+	hc_take_back("before switching off");
+	flush_log();
+	ST->rt->reset_system(2 /* EfiResetShutdown */, 0, 0, NULL);
+	reboot();
+}
+
 /*
  * Return-from-kernel support.
  *
@@ -629,7 +646,7 @@ reboot(void)
  * window. loader_save_ctx() records the UEFI execution environment and
  * returns 0. When the kernel is done it jumps to loader_return_stub (mapped
  * 1:1 or with the MMU off) with x0 = PA of its log, x1 = length, x2 = reason
- * (0 = orderly, 1 = early exception, then x3..x7 = ESR, ELR, FAR, LR, SP).
+ * (0 = orderly, 1 = early exception, then x3..x7 = ESR, ELR, FAR, LR, SP; 2 = checkpoint; 3 = orderly, iOS shut down).
  * The stub switches the MMU off, reinstates the saved environment and makes
  * loader_save_ctx() return a second time, with 1.
  *
@@ -3782,6 +3799,10 @@ starts_with(const char *s, const char *prefix)
 	return 1;
 }
 
+static const char *fb_install(const uint8_t *data, uint64_t len);     /* flashboot.c */
+static int fb_scan(void);
+static uint64_t download_len;           /* the last download into the payload window ("oem install" takes it) */
+
 /*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
@@ -3794,7 +3815,8 @@ fb_command(char *cmd)
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
+		    starts_with(cmd, "oem install") || starts_with(cmd, "oem flashstate"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3849,6 +3871,7 @@ fb_command(char *cmd)
 			int to_ramdisk = download_to_ramdisk;
 
 			download_to_ramdisk = 0;
+			download_len = 0;
 			if (to_ramdisk) {
 				limit = win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE;
 				dest = (uint8_t *)(win_base + RESIDENT_RD_OFFSET);
@@ -3871,6 +3894,8 @@ fb_command(char *cmd)
 			if (got == total) {
 				if (to_ramdisk) {
 					resident_rd_size = total;
+				} else {
+					download_len = total;
 				}
 				fb_reply("OKAY", "");
 			} else {
@@ -3944,6 +3969,16 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "watchdog test: not petting any more");
 			for (;;) {
 			}
+		} else if (starts_with(cmd, "oem install")) {
+			/* the last download is a boot bundle (mkbundle.py): into darwin's boot area (xl install) */
+			const char *why = fb_install((const uint8_t *)PAYLOAD_BASE, download_len);
+
+			download_len = 0;
+			fb_reply(why != NULL ? "FAIL" : "OKAY", why != NULL ? why : "");
+		} else if (starts_with(cmd, "oem flashstate")) {
+			/* the boot slots and the boot guard's state into the log ("oem log" fetches it; xl health) */
+			fb_scan();
+			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem memmap")) {
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
 			print_memory_map();

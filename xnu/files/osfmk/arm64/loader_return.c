@@ -65,6 +65,7 @@ void loader_checkpoint(uint64_t n);
 char     loader_log[LOADER_LOG_SIZE];
 uint32_t loader_log_len;
 static bool     loader_return_entered;
+static bool     loader_power_off;        /* iOS shut down, not restarted: reason 3 for the loader (flashboot.c) */
 
 /* One L1 table and one L2 table are enough to map a single 2 MB block. */
 static uint64_t loader_l1[512] __attribute__((aligned(4096)));
@@ -232,7 +233,7 @@ static_kvtophys(const void *va)
 }
 
 /*
- * Jump to the loader's return stub. reason: 0 = orderly end, 2 = checkpoint.
+ * Jump to the loader's return stub. reason: 0 = orderly end, 2 = checkpoint, 3 = orderly, shut down.
  * Returns only if no loader is listening.
  */
 static void
@@ -404,7 +405,15 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
-	loader_jump(0, 0);
+	loader_jump(loader_power_off ? 3 : 0, 0);
+}
+
+/* The way back for a system that was shut down (halt_all_cpus): reason 3, the installed loader switches off */
+void
+loader_return_power_off(void)
+{
+	loader_power_off = true;
+	loader_return();
 }
 
 /* Bring-up aid: stop here if the loader asked for checkpoint n. */

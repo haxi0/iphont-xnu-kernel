@@ -120,12 +120,18 @@ fb_name_is(const efi_partition_info *info, const char *want)
 	return str_eq(name, want);
 }
 
-/* darwin's BlockIo, wherever the firmware lists it (a phone's UFS unit, a QEMU disk) */
+/*
+ * darwin's BlockIo, wherever the firmware lists it (a phone's UFS unit, a QEMU disk). On a device whose
+ * port has a store of its own (struct platform .store: redwood's darwin, the OnePlus 8's whole userdata)
+ * that partition, and only when its GUIDs and LBAs are the ones it was set up with -- a name alone, like
+ * "userdata", says too little to write into it.
+ */
 static efi_block_io *
 fb_find_darwin(void)
 {
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	const char *want = PLAT->store != NULL ? PLAT->store : "darwin";
 	efi_handle *handles;
 	uint64_t count;
 
@@ -140,7 +146,13 @@ fb_find_darwin(void)
 		efi_block_io *bio;
 
 		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
-		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || !fb_name_is(info, "darwin")) {
+		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || !fb_name_is(info, want)) {
+			continue;
+		}
+		if (PLAT->store != NULL && (memcmp(&info->type_guid, &PLAT->store_type, sizeof(efi_guid)) != 0 ||
+		    memcmp(&info->unique_guid, &PLAT->store_uniq, sizeof(efi_guid)) != 0 ||
+		    info->start_lba != PLAT->store_first || info->end_lba != PLAT->store_last)) {
+			print("flash: %s is not the partition the port was set up with (GUIDs, LBAs): not used\n", want);
 			continue;
 		}
 		return bio;
@@ -369,6 +381,83 @@ fb_load_slot(int s)
 	print("flash: booting slot %d, generation %d \"%s\" (SHA-256 checked%s)\n", (uint64_t)s, h->generation,
 	    h->label, OWNER_KEY_PINNED ? ", signature checked" : "");
 	return 1;
+}
+
+/* ---- install over USB: a bundle into the boot area (xl install) ----------- */
+
+/* write `bytes` (whole 4 KiB blocks) at darwin's block `blk`, flushed */
+static int
+fb_write(efi_block_io *bio, uint64_t blk, const void *src, uint64_t bytes)
+{
+	uint64_t bs = bio->media->block_size, lba = blk * FB_BLOCK / bs, done = 0;
+	const uint64_t chunk = 4ULL << 20;
+
+	while (done < bytes) {
+		uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+		if (EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, lba + done / bs, n, (void *)((const uint8_t *)src + done)))) {
+			return 0;
+		}
+		done += n;
+	}
+	if (bio->flush_blocks) {
+		bio->flush_blocks(bio);
+	}
+	return 1;
+}
+
+/*
+ * A bundle from mkbundle.py (header block, container), downloaded over USB, into the slot that does not
+ * hold the newest good bundle -- the header zeroed first, the container, the header last, each read back --
+ * as flashctl.py write-bundle does from Android: a phone without one (the OnePlus 8) is installed and
+ * updated this way, from developer mode. Nothing but that slot of darwin's boot area is written; an
+ * install cut off loses itself, the other slot still boots. NULL when done, else why not.
+ */
+static const char *
+fb_install(const uint8_t *data, uint64_t len)
+{
+	const struct fb_header *h = (const struct fb_header *)data;
+	uint8_t sum[32];
+	uint64_t first;
+	int slot;
+
+	if (len < 2 * FB_BLOCK || len % FB_BLOCK != 0 || len > FB_SLOT_BLOCKS * FB_BLOCK || !fb_header_sound(h) ||
+	    h->size > len - FB_BLOCK) {
+		return "not a bundle from mkbundle.py";
+	}
+	sha256(data + FB_BLOCK, h->size, sum);
+	if (memcmp(sum, h->sha256, 32) != 0) {
+		return "the container does not match its SHA-256";
+	}
+	if (!fb_scan()) {
+		return "no darwin on this device";
+	}
+	slot = fb.newest < 0 ? 0 : 1 - fb.newest;
+	if (!fb_header_trusted(slot, h)) {
+		return "refused: not signed by the pinned owner key";
+	}
+	if (fb.newest >= 0 && h->generation <= fb.hdr[fb.newest].generation) {
+		return "not newer than the installed generation";
+	}
+	first = FB_AREA_FIRST + (uint64_t)slot * FB_SLOT_BLOCKS;
+	print("flash: installing generation %d \"%s\" into boot slot %d (blocks %d..%d)\n", h->generation, h->label,
+	    (uint64_t)slot, first, first + len / FB_BLOCK - 1);
+	memset(ufs_buffer, 0, FB_BLOCK);
+	if (!fb_write(fb.bio, first, ufs_buffer, FB_BLOCK) || !fb_write(fb.bio, first + 1, data + FB_BLOCK, len - FB_BLOCK)) {
+		return "write error (the other slot is untouched)";
+	}
+	for (uint64_t at = FB_BLOCK; at < len; at += sizeof(ufs_buffer)) {
+		uint64_t n = len - at < sizeof(ufs_buffer) ? len - at : sizeof(ufs_buffer);
+		if (!fb_read(fb.bio, first + at / FB_BLOCK, ufs_buffer, n) || memcmp(ufs_buffer, data + at, n) != 0) {
+			return "read back differs (the other slot is untouched)";
+		}
+	}
+	if (!fb_write(fb.bio, first, data, FB_BLOCK) || !fb_read(fb.bio, first, ufs_buffer, FB_BLOCK) ||
+	    memcmp(ufs_buffer, data, FB_BLOCK) != 0) {
+		return "the header did not read back (the other slot is untouched)";
+	}
+	print("flash: boot slot %d written and read back\n", (uint64_t)slot);
+	fb_scan();
+	return NULL;
 }
 
 /* ---- A/B: back to Android ------------------------------------------------ */
@@ -648,6 +737,9 @@ fb_boot(int s)
 		fb_count_start(s);
 		flush_log();
 		run_kernel(0, 0);                       /* until the phone is switched off; if it comes back, reset */
+		if (loader_ctx[CTX_REASON] == 3) {
+			power_off();                    /* iOS shut down (halt_all_cpus): off, not round again */
+		}
 		reboot();
 	}
 	fb.ok[s] = 0;
@@ -660,7 +752,7 @@ fb_standalone(void)
 	int have[MENU_ITEMS] = { 0, 0, 0, 1 };
 
 	fb_scan();
-	have[MENU_ANDROID] = ab_available();
+	have[MENU_ANDROID] = !PLAT->no_android && ab_available();
 	for (;;) {
 		int auto_slot = fb.bio ? fb_auto_slot() : -1, by_hand, choice, dflt;
 
@@ -671,11 +763,12 @@ fb_standalone(void)
 			dflt = MENU_ANDROID;
 		} else if (auto_slot >= 0) {
 			dflt = auto_slot == fb.newest ? MENU_HACKIOS : MENU_PREVIOUS;
-		} else if (have[MENU_HACKIOS] && have[MENU_ANDROID]) {
-			/* installed, and nothing installed comes up: the countdown goes back to Android */
-			print("flash: no installed HackiOS has come up in %d tries: Android is the default\n",
-			    (uint64_t)FB_MAX_TRIES);
-			dflt = MENU_ANDROID;
+		} else if (have[MENU_HACKIOS]) {
+			/* installed, and nothing installed comes up: the countdown goes back to Android -- or, on a
+			 * phone with none, waits on the USB link for a computer (the keys still start HackiOS) */
+			dflt = have[MENU_ANDROID] ? MENU_ANDROID : have[MENU_DEVELOPER] ? MENU_DEVELOPER : MENU_HACKIOS;
+			print("flash: no installed HackiOS has come up in %d tries: %s is the default\n",
+			    (uint64_t)FB_MAX_TRIES, dflt == MENU_ANDROID ? "Android" : dflt == MENU_DEVELOPER ? "developer mode" : "HackiOS");
 		} else {
 			dflt = have[MENU_HACKIOS] ? MENU_HACKIOS : have[MENU_ANDROID] ? MENU_ANDROID : MENU_DEVELOPER;
 		}

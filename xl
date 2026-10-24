@@ -21,6 +21,9 @@
 #   xl reboot           cold-reset the phone (back to Android)
 #   xl reload           restart the phone into a freshly built loader (after changing xnuloader/)
 #   xl memmap           the phone's memory map as its firmware reports it
+#   xl install BUNDLE   an installed phone's boot bundle (common/flash/mkbundle.py) into the boot slot of
+#                       its darwin that does not hold the newest good one, read back (common/flash/install-xl.sh)
+#   xl health           the boot slots and the boot guard, as the loader reads them (writes nothing)
 #   xl state            where is the phone right now
 #
 # Logs land in logs/. Environment for `run`:
@@ -232,6 +235,22 @@ ramdisk() { # ramdisk [<file>|none]
 	printf '%s\t%s\t%s\n' "$(pwd)" "$1" "$size" > $PHONE.ramdisk 2>/dev/null
 }
 
+health() { # the loader's "flash:" lines of its last look at the boot area
+	enter || return 1
+	fb oem flashstate | grep -q OKAY && fb oem log >/dev/null && fetch_log logs/loader.log || { echo "xl: no answer"; return 1; }
+	awk '/^flash: (loader|no darwin)/ { out = "" } /^flash:/ { out = out $0 "\n" } END { printf "%s", out }' logs/loader.log
+}
+
+install_bundle() { # install_bundle <bundle.img>
+	[ -f "$1" ] || { echo "xl: $1 not found"; return 1; }
+	enter || return 1
+	FB_TIMEOUT=120 fb stage "$1" | grep -q OKAY || { echo "xl: upload failed"; return 1; }
+	local r; r=$(FB_TIMEOUT=300 fb oem install)
+	health
+	echo "$r" | grep -q OKAY || { echo "xl: not installed: $(echo "$r" | grep -m1 FAILED)"; return 1; }
+	echo "xl: installed $1"
+}
+
 screenshot() { # screenshot [file.png]
 	enter || return 1
 	local out=${1:-logs/screen.png} geom
@@ -291,5 +310,7 @@ hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%
 reboot) not_anothers_run reboot && fb reboot ;;
 reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120; }; enter && echo "xl: loader is up" ;;
 state) state ;;
+install) install_bundle "$2" ;;
+health) health ;;
 *) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" ;;
 esac

@@ -10,6 +10,8 @@
 #   SKIP_BUILD=1   use the images already built (userland/flashboot.apfs, the kernel)
 . "$(dirname "$(readlink -f "$0")")/../lib.sh"
 load_device "$1"
+# a phone with no Android left (the OnePlus 8): the loader's USB link and fastboot instead of adb
+[ "$FLASH_VIA" = xl ] && exec "$(dirname "$(readlink -f "$0")")/install-xl.sh" "$@"
 MODE=${2:-install}
 [ "$KIND" = phone ] || die "$DEVICE is not a phone"
 [ -n "$FLASH_BOOTARGS" ] || die "common/devices/$DEVICE.conf has no FLASH_BOOTARGS: this device has no installed mode yet"

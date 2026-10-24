@@ -105,6 +105,50 @@ If that write is cut off (cable, battery), the phone still boots the previous bu
 Fastboot lives in the phone's own bootloader, which this install never writes: whatever happens to the UEFI or
 the loader, the phone can be brought back with a cable.
 
+## A phone without Android (OnePlus 8)
+
+The OnePlus 8's port took its whole `userdata` for the iOS volume (README, "On the phone"), so there is no Android
+to install from, to switch slots in, or to go back to. The same loader, bundles, boot guard and var store are used;
+what differs is where the UEFI goes and how things are written:
+
+| Where | What |
+|---|---|
+| `boot_b` (the slot the bootloader starts, `current-slot: b`) | the UEFI with our loader and no kernel -- replaces OxygenOS's kernel, which has no system left to run (backup: `ios-instantnoodle/backup/partitions/boot_b.img`) |
+| `userdata`, blocks 0..2042367 | the iOS volume and both cryptexes, as now (`tools/store-image.py`) |
+| `userdata`, blocks 2042368..2091519 | the boot area: two bundle slots of 96 MiB |
+| `userdata`, block 2091520 | the boot state (the boot guard) |
+| `userdata`, blocks 2097152..3145727 | the var store: `/private/var` between boots, two slots of 2 GiB |
+| `boot_a`, `recovery_a`/`_b` (TWRP), `abl`, `xbl`, the GPT, the slots' attributes | not written |
+
+The loader finds `userdata` by its name, both GUIDs and its first and last LBA (`struct platform` in
+`xnuloader/loader.c`): a different partition table and it writes nothing. The menu has no "Android" entry
+(`.no_android`), and when every installed version has failed 3 times the countdown waits in **Developer mode** for
+a computer instead of starting it a fourth time (the keys can still choose HackiOS).
+
+Writes go through the loader itself, not through Android: `xl install BUNDLE` sends a bundle over the loader's USB
+link and the loader writes it into the slot that does not hold the newest good bundle, header last, everything read
+back (`fb_install` in `xnuloader/flashboot.c`). The UEFI goes into `boot_b` by the phone's own fastboot.
+
+```sh
+. common/lib.sh && load_device instantnoodle
+common/flash/install-xl.sh instantnoodle bundle   # build, then (YES) the bundle into a boot slot; makes out/instantnoodle-uefi.img
+./xl health                                         # the boot slots and the boot guard (writes nothing)
+fastboot boot out/instantnoodle-uefi.img            # the installed boot from RAM: menu, HackiOS, a minute later "came up"
+common/flash/install-xl.sh instantnoodle uefi     # (YES) fastboot flash boot_b with that same file
+```
+
+The `uefi` step refuses until a bundle has come up once (the boot state's "last up", which the preview writes), on
+any fastboot device but one `kona`, and for any partition but `boot_a`/`boot_b`. `common/hackios install instantnoodle`
+runs the bundle step and stops there until the preview. **Update**: `common/flash/install-xl.sh instantnoodle update`
+with the phone in the menu's Developer mode (or `xl enter` from fastboot); the previous version stays in the other
+slot. **Undo**: `fastboot flash boot_b ../ios-instantnoodle/backup/partitions/boot_b.img` -- fastboot is the
+bootloader's (key combination at power-on), never written, and TWRP is still in `recovery_a`/`_b`.
+
+What an installed run keeps: `/private/var` (home screen, settings, app data) is saved into the var store when iOS
+restarts or shuts down (launchd's SIGTERM to `var_store watch`), and every `var_save_every=` seconds (600 in the
+profile) against a reset with the keys, which saves nothing. Shut down switches the phone off (the kernel returns
+reason 3, the loader calls `ResetSystem(EfiResetShutdown)`); restart starts it again through the menu.
+
 ## Things to know
 
 * **Android updates (OTA)** write the spare slot -- they overwrite the UEFI, and for a while after an update the

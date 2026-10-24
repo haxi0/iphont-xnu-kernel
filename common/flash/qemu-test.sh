@@ -22,6 +22,8 @@
 #               a disk of 512-byte sectors; the bundle boots through the map, the boot state is written through
 #               it, and not one byte of userdata outside the file changes
 #   file-nomark the same file without its marker (deleted and made again, say): no darwin at all, nothing written
+#   no-android  a phone with no Android (the OnePlus 8): no Android in the menu, and with every generation given up
+#               on the countdown tries the USB link first (none in QEMU), then HackiOS; the A/B bytes never change
 #
 # Each bundle runs the prebuilt kernel with userland's `hello` as its root, so the test needs no files of iOS.
 set -u
@@ -218,11 +220,21 @@ s = f.parse_state(sys.stdin.buffer.read()); print('none' if s is None else 'tryi
 			run $W/loader-pinned.efi "" "menu: no USB link|resetting|Developer mode \(USB, xl\) in 1 s"
 			expect forged "boot slot 0: the signature is not by key .*REFUSED" "!flash: booting slot"
 		fi ;;
+	no-android)
+		rm -f $W/loader-noandroid.efi
+		LOADER_DEFS=-DQEMU_NO_ANDROID OUT=../$W/loader-noandroid.efi xnuloader/build.sh > /dev/null ||
+			{ echo "   the loader did not build"; FAIL=$((FAIL+1)); return; }
+		disk; slot $W/gen1.img 0; slot $W/gen2.img 1; state 2 3 0 1
+		before=$(ab)
+		run $W/loader-noandroid.efi "" "flash: booting slot|ab: "
+		expect no-android "developer mode is the default" "menu: no USB link here" "HackiOS is the default" "booting slot 1, generation 2" \
+			"!(>| ) Android" "!ab: "
+		[ "$(ab)" = "$before" ] || { echo "   the A/B bytes changed: $(ab)"; FAIL=$((FAIL+1)); FAILED="$FAILED no-android-ab"; } ;;
 	*) echo "unknown scenario $1"; exit 2 ;;
 	esac
 }
 
-ALL="boot previous guard fallback android remembered not-ours tampered signed forged file file-nomark"
+ALL="boot previous guard fallback android remembered not-ours tampered signed forged file file-nomark no-android"
 [ $# -gt 0 ] || set -- $ALL
 for s in "$@"; do scenario "$s"; done
 echo "qemu-test: $PASS passed, $FAIL failed${FAILED:+:$FAILED}"
