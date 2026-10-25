@@ -114,7 +114,7 @@ if [ ! -d gen ]; then
 fi
 
 # --- compile: the driver's files that are built so far, and ours
-DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
+DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p pci pcic mhi"
 CC="clang -target arm64-apple-ios16.5"
 LD=$ROOT/xnu-deps/host/bin/ld64
 CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing

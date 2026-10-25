@@ -92,6 +92,7 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/hk_audio.h>
 #include <sys/instantnoodle.h>
@@ -1172,11 +1173,22 @@ play(uint32_t ms, bool amplifiers)
 #define RING_FRAMES             32768           /* 0.68 s; a power of two, the indices run on and wrap */
 #define SILENCE                 8               /* samples no larger than this are silence (as hk_audio.c's) */
 #define QUIET_BEFORE_OFF_US     3000000ull
+/*
+ * Parked: after PARK_AFTER_US of silence with the amplifiers off, the whole path to the speakers stops -- the feeder,
+ * the stream and the device path (ASM, ADM), the port and its bit clock (AFE) -- instead of 50 periods a second of
+ * silence through the DSP for as long as the system runs; and before the system's sleep (hk_sound_park()). The first
+ * write that is not silence starts it all again; the sink keeps the newest RING_FRAMES meanwhile (0.68 s), so what
+ * iOS plays first is late by the start (some tens of ms), not lost. sound_park=0: never parked.
+ */
+#define PARK_AFTER_US           10000000ull
 
 static int16_t ring[RING_FRAMES * 2];
 static volatile uint32_t ring_head, ring_tail;  /* frames: written by the sink, taken by the feeder */
 static volatile uint64_t last_sound_us;         /* when the latest write that was not silence came */
 static volatile bool feeder_runs, watcher_runs;
+extern int hz;                          /* (bsd/kern/kern_clock.c) */
+static volatile bool parked, parking, park_wanted;
+static uint32_t park_on = 1, parks;
 static uint64_t fed_frames, silent_frames, ios_frames;
 static volatile uint32_t ios_peak;              /* the largest sample since the amplifiers last started */
 
@@ -1184,8 +1196,15 @@ static volatile uint32_t ios_peak;              /* the largest sample since the 
 static uint32_t
 ios_sink(const int16_t *frames, uint32_t count)
 {
-	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken = count < room ? count : room;
+	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken;
 	bool sound = false;
+
+	if (parked && room < count) {
+		/* (nobody takes from the ring while parked: the oldest go, the newest -- the sound that unparks -- stay) */
+		ring_tail += MIN(count, RING_FRAMES) - room;
+		room = MIN(count, RING_FRAMES);
+	}
+	taken = count < room ? count : room;
 
 	for (uint32_t i = 0; i < taken; i++) {
 		int16_t left = frames[2 * i], right = frames[2 * i + 1];
@@ -1203,6 +1222,9 @@ ios_sink(const int16_t *frames, uint32_t count)
 	ios_frames += taken;
 	if (sound) {
 		last_sound_us = now_us();
+		if (parked) {
+			wakeup((caddr_t)&last_sound_us);        /* (the watcher sleeps while parked: this is its sound to play) */
+		}
 	}
 	return taken;
 }
@@ -1278,7 +1300,7 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 		period_fill_ios(p);
 		sent += period_write(p);
 	}
-	while (!stopping) {
+	while (!stopping && !parking) {
 		uint32_t back = returned;
 		static bool was_on;
 
@@ -1349,11 +1371,56 @@ watch(void)
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
 
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
+	pause_ms = 0;                           /* (the bring-up's pauses: a start after parking is to be quick) */
+
+	uint64_t quiet_since = now_us();
 
 	while (!stopping) {
 		uint64_t now = now_us(), sounded = last_sound_us;
 		uint32_t extra_now, generation_now;
 		bool muted_now;
+
+		if (parked && sounded != 0 && now - sounded < 100000) {
+			/* sound to play: the path to the speakers started again, the amplifiers below as before */
+			uint64_t began = now_us();
+			thread_t feeder;
+			bool up = afe_on() && stream_on();
+
+			if (up) {
+				parked = false;
+				parking = false;
+				feeder_runs = true;
+				if (kernel_thread_start(feeder_thread, NULL, &feeder) == KERN_SUCCESS) {
+					thread_deallocate(feeder);
+				} else {
+					feeder_runs = false;
+					up = false;
+				}
+			}
+			say("sound: unparked for sound%s in %llu ms\n", up ? "" : ": FAILED, iOS's sound goes nowhere",
+			    (now_us() - began) / 1000);
+			if (!up) {
+				given_up = true;
+				parked = false;
+			}
+			now = now_us();
+		}
+		if (!on && sounded > quiet_since) {
+			quiet_since = sounded;
+		}
+		if (!parked && !on && park_on && (park_wanted || now - quiet_since > PARK_AFTER_US)) {
+			parking = true;
+			for (unsigned ms = 0; ms < 200 && feeder_runs; ms++) {
+				sleep_ms(1);
+			}
+			stream_off();
+			afe_off();
+			parked = true;
+			parks++;
+			park_wanted = false;
+			say("sound: parked (%u times): the stream, the port and its clock stopped until iOS plays\n", parks);
+		}
+		park_wanted = false;
 
 		if (hk_audio_volume(&extra_now, &muted_now, &generation_now) && generation_now != generation) {
 			generation = generation_now;
@@ -1428,7 +1495,11 @@ watch(void)
 				}
 			}
 		}
-		sleep_ms(5);
+		if (parked) {
+			tsleep((caddr_t)&last_sound_us, PZERO, "sound parked", hz);  /* (ios_sink() wakes it) */
+		} else {
+			sleep_ms(5);
+		}
 	}
 	guard_off(true);
 	say("sound: the watcher stops; the amplifiers were started %u times, iOS set the volume %u times%s\n", starts, changes,
@@ -1613,6 +1684,7 @@ hk_sound_dsp_up(void)
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
+	PE_parse_boot_argn("sound_park", &park_on, sizeof(park_on));
 	if (gain > HK_GUARD_MAX_GAIN) {
 		gain = HK_GUARD_MAX_GAIN;
 	}
@@ -1640,6 +1712,24 @@ hk_sound_dsp_up(void)
 		return;
 	}
 	thread_deallocate(thread);
+}
+
+/*
+ * Before the system's sleep (bsd/dev/hk_power.c), in thread context: the path to the speakers parked if it is not
+ * playing, so the DSP and the port do not run on through the sleep. Waits for the watcher half a second at most.
+ */
+void hk_sound_park(void);
+
+void
+hk_sound_park(void)
+{
+	if (!running || level != 4 || !park_on || parked || !watcher_runs) {
+		return;
+	}
+	park_wanted = true;
+	for (unsigned ms = 0; ms < 500 && !parked && park_wanted; ms++) {
+		sleep_ms(1);
+	}
 }
 
 void

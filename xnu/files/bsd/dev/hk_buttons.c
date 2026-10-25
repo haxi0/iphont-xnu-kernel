@@ -44,6 +44,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -365,7 +366,8 @@ hk_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count)
 #define GPIO_REG_ENABLE         0x46            /* [7] */
 
 #define POLL_MS                 16
-#define MINUTE_TICKS            (60 * 1000 / POLL_MS)
+#define DARK_POLL_MS            250             /* the screen dark and the keys' interrupts armed: a look this often */
+#define AFTER_IRQ_MS            500             /* ... and every POLL_MS for this long after one of them */
 
 static struct button {
 	const char *    name;
@@ -557,6 +559,425 @@ pin_input(const struct peripheral *pin, struct button *key)
 	key->last = !(status & GPIO_LEVEL);
 }
 
+/* ---- the power key as the system's wake (bsd/dev/hk_power.c) ------------------------------------- */
+
+/*
+ * The system sleeps with every processor but one switched off and that one in WFI; nothing polls the keys then.
+ * What wakes it is the power key's interrupt, as on Android (qpnp-power-on's "kpdpwr", both edges):
+ *   - the power-on block raises it: interrupt type edge, polarity high and low, enabled, for KPDPWR (bit 0 of
+ *     0x0811, 0x0812, 0x0813, 0x0815); after one its latched status is cleared (0x0814). Writes to the PMIC,
+ *     the only ones this driver makes, through the channel apps owns (13 on the OnePlus 8: "written by system
+ *     0, which also gets its interrupts"), each read back;
+ *   - the arbiter passes it on: the channel's ACC_ENABLE (chnls, 0x100 of its 0x10000), its status and clear
+ *     (0x104, 0x108), and apps' summary of the channels that have one (intr, 4 bytes per 32 channels);
+ *   - the power domain controller (PDC, 0x0b220000) forwards the arbiter's one line ("periph_irq", its pin 1) to
+ *     the interrupt controller as SPI 481: pin 1 enabled (IRQ_ENABLE_BANK 0x10), level high (IRQ_i_CFG 0x110 +
+ *     4 n, 0b100), as Linux's qcom-pdc.c sets it -- unless the firmware has already;
+ *   - SPI 481 (interrupt 513), level, taken by this driver: awake, it acknowledges and wakes the thread, which looks
+ *     at the keys (every POLL_MS while the screen is lit; dark, DARK_POLL_MS unless an interrupt came); asleep,
+ *     hk_power.c sees it pending and asks hk_buttons_wake_check().
+ * The volume keys' pins (GPIO6/GPIO7 on the OnePlus 8) the same way, both edges of their input (bit 0 of their
+ * 0x11..0x15), through their own channels -- if those are apps' with interrupts, as Android's gpio_keys has them.
+ * Only so does the thread wait in the dark; a key seen to change with no interrupt for it ends that (polled again).
+ * Only on the OnePlus 8 (its PON at 0x0800, no HLOS half), and only if every step reads back as written:
+ * otherwise hk_power.c looks at the key itself while asleep.
+ */
+#define ARB_CHNLS_PHYS          hk_board_addr("spmi_chnls", 0x0c600000UL)
+#define ARB_INTR_PHYS           hk_board_addr("spmi_intr", 0x0e700000UL)
+#define ARB_ACC_ENABLE          0x100
+#define ARB_IRQ_STATUS          0x104
+#define ARB_IRQ_CLEAR           0x108
+#define CHNL_CMD                0x00
+#define CHNL_STATUS             0x08
+#define CHNL_WDATA0             0x10
+#define PDC_PHYS                hk_board_addr("pdc", 0x0b220000UL)
+#define PDC_ENABLE_BANK(n)      (0x10 + 4 * (n))
+#define PDC_CFG(pin)            (0x110 + 4 * (pin))
+#define PDC_LEVEL_HIGH          0x4
+#define PDC_ARB_PIN             1
+#define ARB_INTID               (481 + 32)
+#define REG_INT_LATCHED_CLR     0x14
+#define REG_INT_EN_SET          0x15
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern bool hk_display_on(void);
+int hk_buttons_wake_check(void);
+bool hk_buttons_wake_armed(void);
+bool hk_buttons_power_held(void);
+void hk_buttons_woken(void);
+
+static vm_offset_t wake_chnl, wake_intr, pin_chnl, pin_down_chnl;
+static bool wake_armed, pins_armed;
+static volatile uint32_t keys_irq;      /* interrupts of the keys so far: the thread's wait (buttons_thread) */
+static volatile bool wake_pressed;      /* woken by the power key: the press is told to iOS once the thread runs again */
+static uint64_t wake_irqs, wake_others;
+
+/*
+ * One register written through the power key's channel, and the arbiter's answer waited for: a command given while
+ * the one before is still going is dropped (the enable after the latched status's clear was, on the phone). The
+ * status word as the arbiter left it; STATUS_DONE alone: written. Any context.
+ */
+static uint32_t
+chnl_write(vm_offset_t chnl, uint8_t reg, uint8_t value)
+{
+	uint64_t start = mach_absolute_time(), interval;
+	uint32_t status;
+
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	hk_spmi_lock();
+	wr(chnl + CHNL_WDATA0, value);
+	wr(chnl + CHNL_CMD, (uint32_t)reg << 4);       /* register write, 1 byte */
+	do {
+		status = rd(chnl + CHNL_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	hk_spmi_unlock();
+	return status;
+}
+
+static const char *
+spmi_write(const struct peripheral *p, vm_offset_t chnl, uint8_t reg, uint8_t value)
+{
+	static char why[48];
+	uint32_t status = chnl_write(chnl, reg, value);
+	uint8_t back = 0;
+	const char *problem;
+
+	if (status != STATUS_DONE) {
+		snprintf(why, sizeof(why), "the write was not done (status %#x)", status);
+		return why;
+	}
+	problem = spmi_read(p, reg, &back, 1);
+	return problem != NULL ? problem : back != value ? "it reads back otherwise" : NULL;
+}
+
+/*
+ * Awake: the power key's interrupt only acknowledged (its press is seen by the next look). One that keeps coming with
+ * nothing of the power key's in it (a register of the arbiter not as read here) is given up after 16 in a row: the
+ * line is level-triggered, and it would never stop.
+ */
+static uint32_t wake_empty;
+
+static void
+wake_interrupt(void *context __unused, uint32_t intid)
+{
+	wake_irqs++;
+	if (hk_buttons_wake_check()) {
+		wake_empty = 0;
+		thread_wakeup((event_t)&keys_irq);
+	} else if (++wake_empty == 16 && wake_armed) {
+		const char *line = "buttons: the arbiter's interrupt keeps coming with nothing of the power key's: given up\n";
+
+		gic_v3_spi_mask(intid);
+		wake_armed = false;
+		for (const char *c = line; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+	}
+}
+
+/* a volume key's pin, if its channel has an interrupt: acknowledged (arbiter and PMIC). true: it had one */
+static bool
+pin_ack(const struct peripheral *p, vm_offset_t chnl, uint32_t word, uint32_t *pending)
+{
+	uint32_t bit = 1u << (p->channel % 32);
+
+	if (chnl == 0 || word != p->channel / 32 || !(*pending & bit)) {
+		return false;
+	}
+	wr(chnl + ARB_IRQ_CLEAR, rd(chnl + ARB_IRQ_STATUS));
+	(void)chnl_write(chnl, REG_INT_LATCHED_CLR, 1);
+	*pending &= ~bit;
+	return true;
+}
+
+/*
+ * After an interrupt of the arbiter, with the interrupt masked or taken: the keys' acknowledged. 1: it was the power
+ * key's; 2: only a volume key's (no reason to end a sleep: an iPhone's volume keys do not wake it); 0: none. Another channel with one (enabled by somebody else; nobody here would quiet it, and the line is
+ * level-triggered) has the interrupt given up: the sleep looks at the key itself from then on. Any context.
+ */
+int
+hk_buttons_wake_check(void)
+{
+	int power_key = 0;
+	bool volume = false;
+
+	if (!wake_armed) {
+		return 0;
+	}
+	for (uint32_t word = 0; word < ARB_MAX_CHANNELS / 32; word++) {
+		uint32_t pending = rd(wake_intr + 4 * word);
+
+		volume |= pin_ack(&pin, pin_chnl, word, &pending);
+		volume |= pin_ack(&pin_down, pin_down_chnl, word, &pending);
+
+		if (word == pon.channel / 32 && (pending & (1u << (pon.channel % 32)))) {
+			uint32_t status = rd(wake_chnl + ARB_IRQ_STATUS);
+
+			wr(wake_chnl + ARB_IRQ_CLEAR, status);
+			power_key |= (status & keys.power_bit) != 0;
+			pending &= ~(1u << (pon.channel % 32));
+		}
+		if (pending != 0 && wake_others++ == 0) {
+			char line[128];
+
+			gic_v3_spi_mask(ARB_INTID);
+			wake_armed = false;
+			/* (interrupts may be off here: the loader's log only, no console) */
+			snprintf(line, sizeof(line), "buttons: the arbiter has interrupts of other channels (%#x in word %u): "
+			    "its interrupt given up\n", pending, word);
+			for (const char *c = line; *c != 0; c++) {
+				loader_log_putc(*c);
+			}
+		}
+	}
+	if (power_key) {
+		(void)chnl_write(wake_chnl, REG_INT_LATCHED_CLR, keys.power_bit);
+	}
+	if (power_key || volume) {
+		keys_irq++;
+	}
+	return power_key ? 1 : volume ? 2 : 0;
+}
+
+/*
+ * A volume key's pin as an interrupt (wake_arm, before the arbiter lets any through): both edges of its input, its
+ * latched status cleared, enabled -- each read back. The channel's ACC_ENABLE is the caller's. false: polled.
+ */
+static bool
+pin_arm(const struct peripheral *p, vm_offset_t *chnl)
+{
+	static const uint8_t regs[] = { REG_INT_SET_TYPE, REG_INT_POLARITY_HIGH, REG_INT_POLARITY_LOW };
+	const char *problem = NULL;
+	uint8_t r = 0;
+
+	if (!p->found || (rd(arb_core + ARB_CHANNEL(p->channel)) & ARB_CHANNEL_INTERRUPTS) == 0 ||
+	    (rd(arb_cnfg + ARB_OWNER(p->channel)) & 7) != ARB_SYSTEM) {
+		printf("buttons: %s's interrupt is not this system's to take: the keys are polled\n", p->name);
+		return false;
+	}
+	*chnl = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * p->channel, 0x1000);
+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]) && problem == NULL; i++) {
+		problem = spmi_read(p, regs[i], &r, 1);
+		if (problem == NULL && !(r & 1)) {
+			problem = spmi_write(p, *chnl, regs[i], r | 1);
+		}
+	}
+	if (problem == NULL) {
+		wr(*chnl + ARB_IRQ_CLEAR, 0xff);
+		(void)chnl_write(*chnl, REG_INT_LATCHED_CLR, 1);
+		if (spmi_write(p, *chnl, REG_INT_EN_SET, 1) != NULL &&
+		    (spmi_read(p, REG_INT_ENABLED, &r, 1) != NULL || !(r & 1))) {
+			problem = "not enabled";
+		}
+	}
+	if (problem != NULL) {
+		printf("buttons: %s's interrupt: %s: the keys are polled\n", p->name, problem);
+		*chnl = 0;
+		return false;
+	}
+	return true;
+}
+
+/* Set the power key's interrupt up, once, after step 4 (the thread). true: it works all the way to SPI 481. */
+static bool
+wake_arm(void)
+{
+	static const struct {
+		uint8_t reg;
+		const char *what;
+	} steps[] = {
+		{ REG_INT_SET_TYPE, "type edge" }, { REG_INT_POLARITY_HIGH, "polarity high" },
+		{ REG_INT_POLARITY_LOW, "polarity low" },
+	};
+	uint8_t r = 0;
+	const char *problem = NULL;
+	vm_offset_t pdc;
+	uint32_t bank, cfg;
+	char board[32] = "";
+
+	if (!PE_parse_boot_argn("board", board, sizeof(board)) || strcmp(board, "instantnoodle") != 0 || !power.usable ||
+	    (rd(arb_core + ARB_CHANNEL(pon.channel)) & ARB_CHANNEL_INTERRUPTS) == 0 ||
+	    (rd(arb_cnfg + ARB_OWNER(pon.channel)) & 7) != ARB_SYSTEM) {
+		printf("buttons: the power key's interrupt is not this system's to take: the sleep looks at the key itself\n");
+		return false;
+	}
+	wake_chnl = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * pon.channel, 0x1000);
+	wake_intr = ml_io_map(ARB_INTR_PHYS + 0x10000UL * ARB_SYSTEM, 0x1000);
+	for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]) && problem == NULL; i++) {
+		problem = spmi_read(&pon, steps[i].reg, &r, 1);
+		if (problem == NULL && !(r & keys.power_bit)) {
+			problem = spmi_write(&pon, wake_chnl, steps[i].reg, r | keys.power_bit);
+		}
+		if (problem != NULL) {
+			printf("buttons: the power key's interrupt, %s: %s\n", steps[i].what, problem);
+		}
+	}
+	if (problem != NULL) {
+		return false;
+	}
+	wr(wake_chnl + ARB_IRQ_CLEAR, 0xff);
+	(void)chnl_write(wake_chnl, REG_INT_LATCHED_CLR, keys.power_bit);
+	if ((problem = spmi_write(&pon, wake_chnl, REG_INT_EN_SET, keys.power_bit)) != NULL &&
+	    (spmi_read(&pon, REG_INT_ENABLED, &r, 1) != NULL || !(r & keys.power_bit))) {
+		printf("buttons: the power key's interrupt, enable: %s\n", problem);
+		return false;
+	}
+	/*
+	 * Channels of ours with an interrupt let through already (the firmware's: nobody here would take it, and the line
+	 * would stay raised): theirs taken away -- ACC_ENABLE cleared, the status acknowledged --, each said once.
+	 */
+	for (uint32_t word = 0; word < ARB_MAX_CHANNELS / 32; word++) {
+		uint32_t pending = rd(wake_intr + 4 * word) & ~(word == pon.channel / 32 ? 1u << (pon.channel % 32) : 0);
+
+		while (pending != 0) {
+			uint32_t n = word * 32 + (uint32_t)__builtin_ctz(pending);
+			vm_offset_t chnl;
+
+			pending &= pending - 1;
+			if ((rd(arb_cnfg + ARB_OWNER(n)) & 7) != ARB_SYSTEM) {
+				printf("buttons: channel %u (%#x) has an interrupt and is not ours: the sleep looks at the key itself\n",
+				    n, rd(arb_core + ARB_CHANNEL(n)));
+				return false;
+			}
+			chnl = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * n, 0x1000);
+			wr(chnl + ARB_ACC_ENABLE, 0);
+			wr(chnl + ARB_IRQ_CLEAR, rd(chnl + ARB_IRQ_STATUS));
+			printf("buttons: channel %u (peripheral %#x) had its interrupt let through, by the firmware: taken away\n", n,
+			    (rd(arb_core + ARB_CHANNEL(n)) >> 8) & 0xfff);
+		}
+		if ((rd(wake_intr + 4 * word) & ~(word == pon.channel / 32 ? 1u << (pon.channel % 32) : 0)) != 0) {
+			printf("buttons: the arbiter's interrupts of other channels stay (word %u): the sleep looks at the key itself\n",
+			    word);
+			return false;
+		}
+	}
+	pins_armed = (!volume_up.usable || pin_arm(&pin, &pin_chnl)) &&
+	    (!volume_down.usable || keys.volume_down_bit || pin_arm(&pin_down, &pin_down_chnl));
+	if (pins_armed) {
+		if (pin_chnl != 0) {
+			wr(pin_chnl + ARB_ACC_ENABLE, 1);
+		}
+		if (pin_down_chnl != 0) {
+			wr(pin_down_chnl + ARB_ACC_ENABLE, 1);
+		}
+	} else {
+		pin_chnl = pin_down_chnl = 0;
+	}
+	wr(wake_chnl + ARB_ACC_ENABLE, 1);
+	pdc = ml_io_map(PDC_PHYS, 0x1000);
+	bank = rd(pdc + PDC_ENABLE_BANK(PDC_ARB_PIN / 32));
+	cfg = rd(pdc + PDC_CFG(PDC_ARB_PIN));
+	if (!(bank & (1u << (PDC_ARB_PIN % 32))) || (cfg & 7) != PDC_LEVEL_HIGH) {
+		wr(pdc + PDC_CFG(PDC_ARB_PIN), PDC_LEVEL_HIGH);
+		wr(pdc + PDC_ENABLE_BANK(PDC_ARB_PIN / 32), bank | 1u << (PDC_ARB_PIN % 32));
+	}
+	printf("buttons: the power key's interrupt: PON %s, arbiter channel %u, PDC pin %u (was enabled %u, type %#x; now %u, %#x), "
+	    "SPI %u; the volume keys' %s\n", pon.name, pon.channel, PDC_ARB_PIN, (bank >> (PDC_ARB_PIN % 32)) & 1, cfg & 7,
+	    (rd(pdc + PDC_ENABLE_BANK(PDC_ARB_PIN / 32)) >> (PDC_ARB_PIN % 32)) & 1, rd(pdc + PDC_CFG(PDC_ARB_PIN)) & 7, ARB_INTID - 32,
+	    pins_armed ? "too (channels of the pins)" : "not: polled");
+	wake_armed = true;
+	if (gic_v3_spi_attach(ARB_INTID, false, wake_interrupt, NULL) != KERN_SUCCESS) {
+		printf("buttons: interrupt %u is taken: the sleep looks at the key itself\n", ARB_INTID);
+		wake_armed = pins_armed = false;
+	}
+	return wake_armed;
+}
+
+/* For hk_power.c: whether the sleep can wait for the interrupt (else it looks at the key itself) */
+bool
+hk_buttons_wake_armed(void)
+{
+	return wake_armed;
+}
+
+/* ... the key itself, for that: held now. Any context. */
+bool
+hk_buttons_power_held(void)
+{
+	uint8_t status = 0;
+
+	return power.usable && spmi_read(&pon, REG_RT_STATUS, &status, 1) == NULL && (status & keys.power_bit);
+}
+
+/* Woken by the power key: if its press is over by the time the thread looks again, the press is told all the same. */
+void
+hk_buttons_woken(void)
+{
+	wake_pressed = true;
+}
+
+/* After a wake, every processor back (hk_power_did_wake): the thread looks at once, not after its dark wait. */
+void hk_buttons_kick(void);
+
+void
+hk_buttons_kick(void)
+{
+	keys_irq++;
+	thread_wakeup((event_t)&keys_irq);
+}
+
+/*
+ * A write for another driver (sys/hk_input.h): one register of any peripheral, through the channel this system owns
+ * for it (none: ENXIO -- a peripheral owned by another system is not ours to write), waited for and read back.
+ * 0, or ENXIO / EIO. Thread context (the channel's page is mapped the first time). Up to four peripherals.
+ */
+int
+hk_spmi_write(uint16_t id, uint8_t reg, uint8_t value)
+{
+	static struct {
+		uint16_t id;
+		uint16_t channel;
+		vm_offset_t chnl;
+	} known[4];
+	static vm_offset_t core, cnfg;
+	vm_offset_t chnl = 0;
+	uint64_t start, interval;
+	uint32_t status;
+	uint8_t back = 0;
+
+	if (core == 0) {
+		core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+		cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+		if (rd(core + ARB_VERSION) < ARB_VERSION_5 || rd(core + ARB_VERSION) >= ARB_VERSION_7) {
+			return ENXIO;
+		}
+	}
+	for (unsigned i = 0; i < 4 && chnl == 0; i++) {
+		if (known[i].chnl != 0 && known[i].id == id) {
+			chnl = known[i].chnl;
+		} else if (known[i].chnl == 0) {
+			for (uint32_t n = 0; n < ARB_MAX_CHANNELS; n++) {
+				if (((rd(core + ARB_CHANNEL(n)) >> 8) & 0xfff) == id && (rd(cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
+					known[i].id = id;
+					known[i].channel = (uint16_t)n;
+					known[i].chnl = chnl = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * n, 0x1000);
+					break;
+				}
+			}
+			if (chnl == 0) {
+				return ENXIO;
+			}
+		}
+	}
+	if (chnl == 0) {
+		return ENXIO;
+	}
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	start = mach_absolute_time();
+	hk_spmi_lock();
+	wr(chnl + CHNL_WDATA0, value);
+	wr(chnl + CHNL_CMD, (uint32_t)reg << 4);       /* register write, 1 byte */
+	do {
+		status = rd(chnl + CHNL_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	hk_spmi_unlock();
+	if (status != STATUS_DONE || hk_spmi_read(id, reg, &back, 1) != 0 || back != value) {
+		return EIO;
+	}
+	return 0;
+}
+
 static void
 say_summary(void)
 {
@@ -639,19 +1060,68 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 		goto out;
 	}
 
-	printf("buttons: step 5: watching%s%s%s, every %u ms: power is the side button\n", power.usable ? " power" : "",
-	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
-	for (unsigned tick = 1;; tick++) {
+	{
+		uint32_t wake = 1;
+
+		/* buttons_wake=0: the system's sleep looks at the key itself (hk_power.c) */
+		PE_parse_boot_argn("buttons_wake", &wake, sizeof(wake));
+		if (wake) {
+			wake_arm();
+		}
+	}
+	printf("buttons: step 5: watching%s%s%s, every %u ms%s: power is the side button\n", power.usable ? " power" : "",
+	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS,
+	    wake_armed && pins_armed ? " (screen dark: on their interrupts)" : "");
+	uint32_t seen = keys_irq;
+	for (uint64_t start = mach_absolute_time(), said = start, busy_until = 0, now, ns;;) {
+		bool before[3] = { power.last, volume_up.last, volume_down.last }, waited = false;
+
+		if (wake_armed && pins_armed && !hk_display_on() && !power.last && !volume_up.last && !volume_down.last &&
+		    mach_absolute_time() >= busy_until) {
+			/* dark and nothing held: until a key's interrupt (DARK_POLL_MS at most) */
+			assert_wait_timeout((event_t)&keys_irq, THREAD_UNINT, DARK_POLL_MS, NSEC_PER_MSEC);
+			if (keys_irq != seen) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+			waited = keys_irq == seen;
+		} else {
+			delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+		}
+		if (keys_irq != seen) {
+			nanoseconds_to_absolutetime(AFTER_IRQ_MS * NSEC_PER_MSEC, &ns);
+			busy_until = mach_absolute_time() + ns;
+		}
+		seen = keys_irq;                        /* (one after this is seen by the next wait) */
+		if (wake_pressed) {
+			/* the press that woke the system, over before this thread ran again: told as it was */
+			wake_pressed = false;
+			if (power.live && !power.down && !hk_buttons_power_held()) {
+				power.presses++;
+				printf("buttons: power pressed and released while the system woke: told now\n");
+				hk_touch_post(HK_BUTTON_DOWN, power.record, 0, 0);
+				delay_for_interval(80, NSEC_PER_MSEC);  /* (a press as a hand makes one: 80 ms in the logs) */
+				hk_touch_post(HK_BUTTON_UP, power.record, 0, 0);
+			}
+		}
 		buttons_poll();
-		/* once early on as well: a short run is to say what the reads cost too */
-		if (tick % MINUTE_TICKS == 0 || tick == 10 * 1000 / POLL_MS) {
+		if (waited && keys_irq == seen &&
+		    (power.last != before[0] || volume_up.last != before[1] || volume_down.last != before[2])) {
+			pins_armed = false;
+			printf("buttons: a key changed with no interrupt for it: polled every %u ms from here on\n", POLL_MS);
+		}
+		/* once a minute, and once early on as well: a short run is to say what the reads cost too */
+		now = mach_absolute_time();
+		absolutetime_to_nanoseconds(now - said, &ns);
+		if (ns >= 60 * NSEC_PER_SEC || (said == start && ns >= 10 * NSEC_PER_SEC)) {
+			said = now;
 			say_summary();
 		}
 		if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
 			printf("buttons: more than half of %llu reads have failed: giving up\n", bus.reads);
 			break;
 		}
-		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
 	}
 out:
 	if (steps < 5) {

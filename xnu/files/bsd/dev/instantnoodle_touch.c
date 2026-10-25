@@ -85,6 +85,14 @@ extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation
 
 static vm_offset_t irq_pin;
 static uint64_t irq_time;
+/*
+ * The screen off (bsd/dev/hk_power.c): iOS turns the digitizer off with it, and the chip is held in reset for as
+ * long -- no scanning, no report line, no look every 100 ms --, then started again as at the beginning (reset let go,
+ * 140 ms, its boot-complete event, the touch function and sense on), which takes some 200 ms of the screen's wake.
+ */
+static volatile bool touch_dark_wanted;
+static bool touch_dark;
+static uint32_t touch_darks;
 /* touch_irq=0: the old 10 ms polling, for recovery (the interrupt path: verified on the phone 2026-10-23) */
 static uint32_t trace_latency, use_irq = 1;
 
@@ -112,15 +120,29 @@ wait_report(void)
 	for (;;) {
 		uint64_t at, deadline;
 
+		if (touch_dark_wanted != touch_dark) {
+			return 0;               /* (the screen went off or came on: the loop does the rest) */
+		}
 		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
-		assert_wait_deadline((event_t)&irq_time, THREAD_UNINT, deadline);
+		assert_wait_deadline((event_t)&irq_time, THREAD_UNINT, touch_dark ? 0 : deadline);
 		at = __atomic_exchange_n(&irq_time, 0, __ATOMIC_ACQUIRE);
-		if (at != 0 || !instantnoodle_gpio_level(PIN_IRQ)) {
+		if (touch_dark_wanted != touch_dark ||
+		    (!touch_dark && (at != 0 || !instantnoodle_gpio_level(PIN_IRQ)))) {
 			clear_wait(current_thread(), THREAD_AWAKENED);
 			return at;
 		}
 		thread_block(THREAD_CONTINUE_NULL);
 	}
+}
+
+/* The screen off or on (bsd/dev/hk_power.c): the worker puts the chip into reset, or starts it again. */
+void instantnoodle_touch_display(bool on);
+
+void
+instantnoodle_touch_display(bool on)
+{
+	touch_dark_wanted = !on;
+	thread_wakeup((event_t)&irq_time);
 }
 
 static struct instantnoodle_i2c bus = { .name = "se13", .sda = PIN(36), .scl = PIN(37) };
@@ -470,10 +492,45 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 	report_since = mach_absolute_time();
 
 	for (;;) {
-		uint64_t detected = use_irq ? wait_report() : mach_absolute_time();
+		uint64_t detected = use_irq || touch_dark ? wait_report() : mach_absolute_time();
 		uint64_t began = mach_absolute_time(), done, ns;
 		unsigned before = events;
 		int err;
+
+		if (touch_dark_wanted && !touch_dark) {
+			release_all();
+			if (use_irq) {
+				wr(irq_pin + IRQ_CONFIG, rd(irq_pin + IRQ_CONFIG) & ~IRQ_ENABLE);
+				gic_v3_spi_mask(TLMM_IRQ);
+			}
+			instantnoodle_gpio_output(PIN_RESET, false, INSTANTNOODLE_PULL_UP, 8);
+			touch_dark = true;
+			touch_darks++;
+			continue;
+		}
+		if (!touch_dark_wanted && touch_dark) {
+			int booted;
+
+			instantnoodle_gpio_output(PIN_RESET, true, INSTANTNOODLE_PULL_UP, 8);
+			sleep_ms(140);
+			instantnoodle_i2c_recover(&bus);
+			booted = wait_boot_complete();
+			ts_write(func, 3);
+			ts_write(&sense, 1);
+			if (use_irq) {
+				wr(irq_pin + IRQ_STATUS, 0);
+				wr(irq_pin + IRQ_CONFIG, rd(irq_pin + IRQ_CONFIG) | IRQ_ENABLE);
+				gic_v3_spi_unmask(TLMM_IRQ);
+			}
+			touch_dark = false;
+			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+			printf("touch: the screen is on: the chip started again in %llu ms (%s; %u times off)\n", ns / NSEC_PER_MSEC,
+			    booted == 0 ? "boot-complete seen" : "no boot-complete event", touch_darks);
+			continue;
+		}
+		if (touch_dark) {
+			continue;
+		}
 
 		if (use_irq && detected != 0 && !(rd(irq_pin + IRQ_STATUS) & 1) && instantnoodle_gpio_level(PIN_IRQ)) {
 			unowned++;

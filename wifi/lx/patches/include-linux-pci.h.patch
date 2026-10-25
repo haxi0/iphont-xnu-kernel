@@ -1,0 +1,31 @@
+--- a/sys/compat/linuxkpi/common/include/linux/pci.h
++++ b/sys/compat/linuxkpi/common/include/linux/pci.h
+@@ -73,6 +73,28 @@
+ 
+ #include <linux/kernel.h>	/* pr_debug */
+ 
++/*
++ * Under XNU (wifi/lx): FreeBSD's device framework is not there. A PCI device's "bsddev" is the
++ * pci_dev itself, and what the functions below ask of FreeBSD's PCI bus is answered by
++ * wifi/lx/src/lx_pci.c, on the kernel's own host bridge.
++ */
++uint32_t lx_pci_read_config(device_t dev, int reg, int width);
++void lx_pci_write_config(device_t dev, int reg, uint32_t value, int width);
++int lx_pci_enable_io(device_t dev, int space);
++int lx_pci_enable_busmaster(device_t dev);
++int lx_pci_disable_busmaster(device_t dev);
++int lx_pci_release_msi(device_t dev);
++int lx_pci_find_cap(device_t dev, int capability, int *where);
++int lx_pci_find_extcap(device_t dev, int capability, int *where);
++#define	pci_read_config		lx_pci_read_config
++#define	pci_write_config	lx_pci_write_config
++#define	pci_enable_io		lx_pci_enable_io
++#define	pci_enable_busmaster	lx_pci_enable_busmaster
++#define	pci_disable_busmaster	lx_pci_disable_busmaster
++#define	pci_release_msi		lx_pci_release_msi
++#define	pci_find_cap		lx_pci_find_cap
++#define	pci_find_extcap		lx_pci_find_extcap
++
+ struct pci_device_id {
+ 	uint32_t	vendor;
+ 	uint32_t	device;

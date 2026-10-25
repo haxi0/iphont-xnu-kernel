@@ -31,6 +31,7 @@
 #include <sys/instantnoodle.h>
 
 extern kern_return_t thread_terminate(thread_t thread);
+extern bool hk_display_on(void);
 extern void loader_log_putc(char c);
 
 /* to the loader's log as well: the start of a run's kernel log may not reach the host */
@@ -247,7 +248,8 @@ slider_thread(__unused void *parameter, __unused wait_result_t result)
 			hk_touch_post(HK_SLIDER, now, 0, 0);
 		}
 		candidate = now;
-		delay_for_interval(100, NSEC_PER_MSEC);
+		/* dark: a third as often (a move is still seen in under a second: two readings in a row decide it) */
+		delay_for_interval(hk_display_on() ? 100 : 300, NSEC_PER_MSEC);
 	}
 }
 

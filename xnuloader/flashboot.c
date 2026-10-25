@@ -57,6 +57,7 @@
 #define FB_SIGNED         1ULL
 #define FB_HOLD           1u
 #define FB_LAST_ANDROID   2u                      /* the last choice was Android: the countdown offers it again */
+#define FB_OFF_CHARGING   4u                      /* switched off with the cable in: see fb_offmode() */
 
 static const char fb_magic[8] = { 'H', 'K', 'B', 'O', 'O', 'T', '0', '2' };
 static const char fb_state_magic[8] = { 'H', 'K', 'S', 'T', 'A', 'T', 'E', '1' };
@@ -77,7 +78,8 @@ struct fb_state {
 	uint64_t trying;                        /* the generation started last */
 	uint32_t tries;                         /* started that many times in a row, not come up */
 	uint32_t flags;                         /* FB_HOLD: the previous version, asked for (flashctl rollback);
-	                                         * FB_LAST_ANDROID: the last choice, for the countdown's default */
+	                                         * FB_LAST_ANDROID: the last choice, for the countdown's default;
+	                                         * FB_OFF_CHARGING: switched off with the cable in */
 	uint64_t good;                          /* the last generation that came up */
 	uint64_t boots;                         /* starts of HackiOS */
 	uint64_t bad;                           /* a generation given up on: the countdown skips it */
@@ -789,9 +791,10 @@ ab_available(void)
 
 /* ---- the menu ------------------------------------------------------------ */
 
-enum { MENU_HACKIOS, MENU_PREVIOUS, MENU_ANDROID, MENU_DEVELOPER, MENU_ITEMS };
+enum { MENU_HACKIOS, MENU_PREVIOUS, MENU_ANDROID, MENU_DEVELOPER, MENU_RECOVERY, MENU_BOOTLOADER, MENU_POWER_OFF,
+	MENU_ITEMS };
 static const char *const menu_names[MENU_ITEMS] = { "HackiOS", "HackiOS, previous version", "Android",
-	"Developer mode (USB, xl)" };
+	"Developer mode (USB, xl)", "Recovery (TWRP)", "Bootloader (fastboot)", "Power off" };
 
 static const char *
 menu_detail(int i)
@@ -856,6 +859,92 @@ fb_menu(int have[MENU_ITEMS], int dflt, int *by_hand)
 	}
 }
 
+/*
+ * Off-mode charging (the OnePlus 8). Switched off with the cable in, the PMIC starts the phone again by the cable
+ * (docs/INSTALL.md: startupmode=dc_charger), and the countdown would start HackiOS: a phone that cannot be switched
+ * off on its charger. An iPhone stays off and charges. So a switch-off with the cable in leaves FB_OFF_CHARGING in
+ * the boot state, and the next start -- by the cable, not the power key -- waits here, the screen dark: the PMIC
+ * charges by itself (its own JEITA limits), at the wall charger's input limit (charger_icl_raise); the power key
+ * starts the menu, as it would start an iPhone; the cable out switches the phone off. A cable put into a phone that
+ * was switched off without one still starts it (as an iPhone does). The flag counts once: it is cleared here.
+ */
+#define FB_OFF_SHOW_SECONDS 5
+
+static void
+fb_power_off(void)
+{
+	if (cable_in() == 1 && fb.bio != NULL) {
+		hc_take_back("before the boot state");          /* (the kernel's transfer list may still be in) */
+		fb.st.flags |= FB_OFF_CHARGING;
+		fb_state_write();
+	}
+	power_off();
+}
+
+static void
+fb_offmode_show(void)
+{
+	static const char *const state[8] = { "inhibited", "trickle", "pre-charge", "charging", "charging (taper)",
+		"charged", "paused", "disabled" };
+	int ch = spmi_channel(0x210, 0);
+	uint8_t st = 0;
+
+	print("\n  Switched off, on the charger: %s.\n  Power key: switch on.\n",
+	    ch >= 0 && pon_reg(ch, 0x06, 0, &st) ? state[st & 7] : "state not known");
+	flush_log();
+}
+
+static void
+fb_offmode(void)
+{
+	efi_simple_text_in *in = (efi_simple_text_in *)ST->con_in;
+	uint64_t cntkctl = READ_SYSREG(CNTKCTL_EL1), shown = READ_SYSREG(CNTVCT_EL0), tick = READ_SYSREG(CNTFRQ_EL0) / 4;
+	int dark = 0;
+
+	if (!(fb.st.flags & FB_OFF_CHARGING)) {
+		return;
+	}
+	fb.st.flags &= ~FB_OFF_CHARGING;
+	fb_state_write();
+	if (pon_reason == 0xffffffffu || (pon_reason & PON_REASON_KPDPWR) || !(pon_reason & PON_REASON_CHARGER) ||
+	    cable_in() != 1) {
+		print("flash: switched off on the charger last time; this start is not the cable's (%x): the menu\n",
+		    (uint64_t)pon_reason);
+		return;
+	}
+	print("flash: off-mode charging (started by the cable, %x)\n", (uint64_t)pon_reason);
+	charger_icl_raise();
+	fb_offmode_show();
+	/* WFE with the timer's event stream (as run_on_other_cpu): a look at the keys and the cable every 250 ms */
+	__asm__ volatile ("msr CNTKCTL_EL1, %0\nisb" : : "r" ((cntkctl & ~0xfcULL) | 1ULL << 2 | 10ULL << 4));
+	for (;;) {
+		efi_input_key key;
+
+		for (uint64_t t = READ_SYSREG(CNTVCT_EL0); READ_SYSREG(CNTVCT_EL0) - t < tick;) {
+			__asm__ volatile ("dsb sy\n\twfe" ::: "memory");
+		}
+		if (cable_in() == 0) {
+			print("flash: the cable is out: switching off\n");
+			power_off();
+		}
+		if (in != NULL && !EFI_ERROR(in->read_key_stroke(in, &key))) {
+			if (key.scan != 1 && key.scan != 2) {          /* not volume: the power key */
+				break;
+			}
+			dark = 0;                               /* volume: the state again */
+			shown = READ_SYSREG(CNTVCT_EL0);
+			fb_offmode_show();
+		}
+		if (!dark && seconds_since(shown) >= FB_OFF_SHOW_SECONDS && SCREEN.base != 0) {
+			memset((void *)(uintptr_t)SCREEN.base, 0, (size_t)SCREEN.stride * SCREEN.height);
+			dark = 1;
+		}
+	}
+	__asm__ volatile ("msr CNTKCTL_EL1, %0\nisb" : : "r" (cntkctl));
+	charger_icl_restore();                          /* the kernel sets its own (instantnoodle_battery.c) */
+	print("flash: the power key: switching on\n");
+}
+
 /* run slot s; returns only when it could not be loaded */
 static void
 fb_boot(int s)
@@ -873,7 +962,7 @@ fb_boot(int s)
 		flush_log();
 		run_kernel(0, 0);                       /* until the phone is switched off; if it comes back, reset */
 		if (loader_ctx[CTX_REASON] == 3) {
-			power_off();                    /* iOS shut down (halt_all_cpus): off, not round again */
+			fb_power_off();                 /* iOS shut down (halt_all_cpus): off, not round again */
 		}
 		if (timed && (USB != NULL || usb_start())) {          /* (USB: started over it, xl flashboot) */
 			/* the host fetches the run's log (fastboot get_staged) and the boot state (xl health) */
@@ -891,7 +980,10 @@ fb_standalone(void)
 	int have[MENU_ITEMS] = { 0, 0, 0, 1 };
 
 	fb_scan();
+	fb_offmode();
 	have[MENU_ANDROID] = !PLAT->no_android && ab_available();
+	/* the phone's own modes, by the reason in its PMIC (reboot_to()): never the countdown's choice */
+	have[MENU_RECOVERY] = have[MENU_BOOTLOADER] = have[MENU_POWER_OFF] = PLAT == &platform_instantnoodle;
 	for (;;) {
 		int auto_slot = fb.bio ? fb_auto_slot() : -1, by_hand, choice, dflt;
 
@@ -924,6 +1016,12 @@ fb_standalone(void)
 				reboot();
 			}
 			have[MENU_ANDROID] = 0;
+		} else if (choice == MENU_RECOVERY) {
+			reboot_to(1);
+		} else if (choice == MENU_BOOTLOADER) {
+			reboot_to_fastboot();
+		} else if (choice == MENU_POWER_OFF) {
+			fb_power_off();
 		} else {
 			if (usb_start()) {
 				flush_log();

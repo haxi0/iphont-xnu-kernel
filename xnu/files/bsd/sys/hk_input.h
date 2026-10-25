@@ -48,6 +48,7 @@ void hk_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio poi
 void hk_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void instantnoodle_touch_init(void);   /* board=instantnoodle: the OnePlus 8's S6SY761 touch screen */
 int hk_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count); /* id: slave << 8 | peripheral */
+int hk_spmi_write(uint16_t id, uint8_t reg, uint8_t value);  /* through the channel this system owns, read back */
 void hk_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void hk_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void hk_ufs_report(const char *when); /* where reading the storage has spent its time so far */
@@ -81,7 +82,9 @@ void hk_net_init(void);            /* en0, if there is something to carry its fr
 void hk_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 int hk_cpufreq_top(uint32_t domain);                 /* a group's highest row, -1 if not raised */
 uint32_t hk_cpufreq_khz(uint32_t domain, int row);   /* how fast that row is, 0 if there is none */
-void hk_cpufreq_cap(uint32_t domain, int row);       /* run the group at that row (the thermal service) */
+void hk_cpufreq_cap(uint32_t domain, int row);       /* the group at that row at most (the thermal service) */
+void hk_cpufreq_boost(void);       /* a touch or a key: every group at its top for a moment (the governor) */
+void hk_cpufreq_display(bool on);  /* the screen off or on: the memory's bandwidth follows (bsd/dev/hk_power.c) */
 void hk_thermal_init(void);        /* the thermal service: on with cpufreq=1 unless thermal=0 (bsd/dev/hk_thermal.c) */
 void hk_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void hk_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */

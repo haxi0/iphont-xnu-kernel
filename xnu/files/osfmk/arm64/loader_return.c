@@ -226,6 +226,18 @@ struct loader_live loader_live = {
 	.magic3 = 0x334556494c554e58ULL, .screen = loader_screen,
 };
 
+/*
+ * A sign of life from the system's sleep (bsd/dev/hk_power.c), where no timer of the kernel runs: a watching loader
+ * takes a kernel whose heartbeat stands still for 50 s as hung, and resets the phone.
+ */
+void loader_live_beat(void);
+
+void
+loader_live_beat(void)
+{
+	loader_live.heartbeat++;
+}
+
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
 static inline uint64_t
 static_kvtophys(const void *va)

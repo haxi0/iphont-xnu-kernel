@@ -361,7 +361,8 @@ ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *d
 	ufs_page->ask.op = op;
 	__asm__ volatile ("dmb sy" ::: "memory");
 	ufs_page->ask.request = seq;
-	__asm__ volatile ("dmb sy" ::: "memory");
+	/* the loader's core 0 waits in WFE between looks (xnuloader/loader.c, run_on_other_cpu()): this wakes it */
+	__asm__ volatile ("dsb sy\n\tsev" ::: "memory");
 
 	started = mach_absolute_time();
 	while (ufs_page->answer.answered != seq) {

@@ -774,9 +774,69 @@ pon_ps_hold(uint8_t type)
 	print("pon: PS_HOLD now means %s\n", type == PON_HARD_RESET ? "a hard reset" : type == PON_SHUTDOWN ? "switch off" : "a warm reset");
 }
 
+/*
+ * The charger's input limit (PM8150B USBIN 0x1342/0x1365/0x1366/0x1370; why and how: the kernel's
+ * instantnoodle_battery.c, icl_follow). The firmware's four values as this start found them are put back before
+ * every switch-off and reset: a limit raised for a wall charger (by the kernel, or by off-mode charging here) must
+ * never meet the next cable, which may be a computer's port.
+ */
+static const uint8_t icl_regs[4] = { 0x70 /* cfg */, 0x65 /* load cfg */, 0x42 /* cmd override */, 0x66 /* options */ };
+static int icl_saved;
+static uint8_t icl_firmware[4];
+
+static void
+charger_icl_save(void)
+{
+	int ch = spmi_channel(0x213, 1);
+
+	icl_saved = ch >= 0;
+	for (int i = 0; icl_saved && i < 4; i++) {
+		icl_saved = pon_reg(ch, icl_regs[i], 0, &icl_firmware[i]);
+	}
+}
+
+/* write the four (icl_regs order); 0: not all written */
+static int
+charger_icl_write(const uint8_t v[4])
+{
+	int ch = spmi_channel(0x213, 1), ok = ch >= 0;
+
+	for (int i = 0; ok && i < 4; i++) {
+		uint8_t b = v[i];
+		ok = pon_reg(ch, icl_regs[i], 1, &b);
+	}
+	return ok;
+}
+
+static void
+charger_icl_restore(void)
+{
+	if (icl_saved && !charger_icl_write(icl_firmware)) {
+		print("charger: the firmware's input limit could not be put back\n");
+	}
+}
+
+/* as stock smb5 for the port APSD found: 2000 mA a wall charger, 1500 mA a charging port, a computer's left alone */
+static void
+charger_icl_raise(void)
+{
+	int ch = spmi_channel(0x213, 0);
+	uint8_t apsd = 0;
+
+	if (!icl_saved || ch < 0 || !pon_reg(ch, 0x08, 0, &apsd) || !(apsd & 0x0c)) {
+		print("charger: port %x: the input limit stays the firmware's\n", (uint64_t)apsd);
+		return;
+	}
+	uint32_t ma = (apsd & 0x08) ? 2000 : 1500;
+	const uint8_t v[4] = { (uint8_t)(ma / 50), icl_firmware[1] | 0x10, icl_firmware[2] & ~1, icl_firmware[3] | 1 };
+	print("charger: a %s: input limit %d mA%s\n", (apsd & 0x08) ? "wall charger" : "charging port", (uint64_t)ma,
+	    charger_icl_write(v) ? "" : ": NOT ALL WRITTEN");
+}
+
 static void
 reboot(void)
 {
+	charger_icl_restore();
 	usb_quiesce();
 	pon_ps_hold(PON_HARD_RESET);
 	hc_take_back("before the reset");
@@ -810,7 +870,58 @@ reboot_to(uint8_t reason)
 	reboot();                                       /* a hard reset, as the stock kernel's (above) */
 }
 
+/* The USB cable, by the PM8150B's USBIN status (0x1310 bit 4): 1 in, 0 out, -1 not known (not the OnePlus 8). */
+static int
+cable_in(void)
+{
+	int ch = spmi_channel(0x213, 0);
+	uint8_t status = 0;
+
+	if (ch < 0 || !pon_reg(ch, 0x10, 0, &status)) {
+		return -1;
+	}
+	return (status & 0x10) != 0;
+}
+
+/*
+ * The stock bootloader's fastboot (the menu's "Bootloader", `fastboot reboot bootloader`). After a reset with the
+ * cable in, the stock ABL takes the computer's port for a wall charger ("usb: chgr - DCP_CHARGER" in abl_log),
+ * shows fastboot without ever coming up on USB, and switches the phone off -- after which the cable starts it again,
+ * through this menu: the round of resets that looks like a loop. It is the same on OxygenOS and ABL is not ours to
+ * change, so the reset waits for the cable to come out (said on the screen; CABLE_OUT_SECONDS at most, then it
+ * resets all the same): ABL then starts without one, and its fastboot is on USB once the cable goes in again.
+ */
+#define CABLE_OUT_SECONDS       60
+
+static void
+reboot_to_fastboot(void)
+{
+	int left = CABLE_OUT_SECONDS * 10;
+
+	if (cable_in() == 1) {
+		usb_quiesce();
+		print("\n  Unplug the USB cable now: the stock bootloader's fastboot does not come up on USB\n"
+		    "  after a reset with the cable in. The phone goes into the bootloader once it is out;\n"
+		    "  plug the cable in again there.\n");
+		flush_log();
+		while (cable_in() == 1 && left-- > 0) {
+			BS->stall(100000);
+			if (left % 100 == 0 && left > 0) {
+				print("  waiting for the cable to come out: %d s\n", (uint64_t)(left / 10));
+			}
+		}
+		print(cable_in() == 1 ? "reboot: the cable is still in after %d s: into the bootloader all the same\n" :
+		    "reboot: the cable is out: into the bootloader\n", (uint64_t)CABLE_OUT_SECONDS);
+		BS->stall(300000);
+	}
+	reboot_to(2);
+}
+
 /* why this start happened, by the PMIC: for telling a bootloader's reset from a cable's (xl, docs/INSTALL.md) */
+#define PON_REASON_KPDPWR       0x80
+#define PON_REASON_CHARGER      0x58            /* cable, usb, dc */
+static uint32_t pon_reason = 0xffffffffu;       /* not known */
+
 static void
 pon_report(void)
 {
@@ -822,7 +933,9 @@ pon_report(void)
 	if (EFI_ERROR(BS->locate_protocol(&pon_guid, NULL, (void **)&pon)) || pon == NULL) {
 		return;
 	}
-	pon->get_pon_reason(0, &reason);
+	if (!EFI_ERROR(pon->get_pon_reason(0, &reason))) {
+		pon_reason = reason & 0xff;
+	}
 	pon->warm_reset_status(0, &warm);
 	pon->get_spare_reg(0, QCOM_PON_SOFT_SPARE, &spare);
 	print("pon: power-on reason %x (1 hard reset, 2 smpl, 4 rtc, 8 dc, 10 usb, 20 pon1, 40 cable, 80 power key), "
@@ -834,6 +947,7 @@ pon_report(void)
 static void
 power_off(void)
 {
+	charger_icl_restore();
 	usb_quiesce();
 	pon_ps_hold(PON_SHUTDOWN);                      /* else PSCI's switch-off is whatever reset was set last */
 	hc_take_back("before switching off");
@@ -2566,7 +2680,7 @@ static int64_t
 run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide,
     uint64_t budget)
 {
-	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
+	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0, cntkctl;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
@@ -2590,6 +2704,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 
 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
+	/* this core's event stream for the WFE below: EVNTEN, on bit 10 of the virtual count going 0 to 1 (2048 ticks) */
+	cntkctl = READ_SYSREG(CNTKCTL_EL1);
+	__asm__ volatile ("msr CNTKCTL_EL1, %0\nisb" : : "r" ((cntkctl & ~0xfcULL) | 1ULL << 2 | 10ULL << 4));
 	if (PLAT->log_other_cpu) {
 		flush_log();
 	}
@@ -2664,23 +2781,20 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			block_poll();
 		}
 		usb_poll_command();
+		/*
+		 * The pause, in WFE instead of a loop: this core spent the whole of every run at full speed doing nothing,
+		 * the screen off and the system asleep included. It wakes for the kernel's SEV right after a request in the
+		 * mailbox (bsd/dev/hk_ufs.c), for the timer's event stream (every 2048 ticks, 107 us: the USB link and the
+		 * rest of this loop), or for an interrupt. A kernel that does not SEV waits 107 us at most for its request
+		 * to be seen; with one look a pass of the old loop it waited 60-75 us.
+		 */
+		__asm__ volatile ("dsb sy\n\twfe" ::: "memory");
 		if (block_enabled) {
-			/*
-			 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
-			 * request waited 60-75 us on average before this core noticed it, more than a
-			 * 4 KB ReadBlocks takes (27 us). Same length of pause as below.
-			 */
-			for (int k = 0; k < 64; k++) {
-				block_poll();
-				for (volatile int i = 0; i < 300; i++) {
-				}
-			}
-		} else {
-			for (volatile int i = 0; i < 20000; i++) {
-			}
+			block_poll();
 		}
 	}
 	running_live = NULL;
+	__asm__ volatile ("msr CNTKCTL_EL1, %0\nisb" : : "r" (cntkctl));
 
 	if (watching_only) {
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
@@ -3942,6 +4056,11 @@ usb_wait(uint8_t endpoint)
 		}
 		/* with a kernel running, a host that went away must not keep this core from watching it */
 		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
+			/*
+			 * ... and the transfer goes with it: left with the controller, a reply nobody took was what the
+			 * host read first after the cable came back, and every answer after it was the one before (2026-10-25)
+			 */
+			USB->abort_xfer(endpoint);
 			return -1;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
@@ -4294,7 +4413,10 @@ fb_command(char *cmd)
 			/* `fastboot reboot bootloader` / `fastboot reboot recovery`: the stock ABL's fastboot, or TWRP */
 			fb_reply("OKAY", "");
 			BS->stall(200000);
-			reboot_to(starts_with(cmd, "reboot-bootloader") ? 2 : 1);
+			if (starts_with(cmd, "reboot-bootloader")) {
+				reboot_to_fastboot();
+			}
+			reboot_to(1);
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
 			BS->stall(200000);
@@ -4327,6 +4449,9 @@ usb_poll_command(void)
 	USB->handle_event(&msg, &size, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_connected = (data.device_state == UsbDeviceStateConnected);
+		/* (the cable out or in: nothing queued before it is anyone's any more -- see usb_wait()) */
+		USB->abort_xfer(USB_EP_OUT);
+		USB->abort_xfer(USB_EP_IN);
 		usb_rx_queued = 0;
 		return;
 	}
@@ -4493,6 +4618,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	read_last_log();
 	print("platform %s\n", PLAT->name);
 	pon_report();
+	charger_icl_save();
 
 	install_exception_hook();
 	wdt_arm();

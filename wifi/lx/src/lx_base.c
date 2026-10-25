@@ -752,18 +752,31 @@ iounmap(void *address)
  * else; so all such memory comes out of one piece, taken once, which the kernel's side shows
  * the radio and says the radio's address of (lx_os_radio_memory()). That piece is not behind
  * the processor's cache: there is nothing to do between our writing and the radio's reading,
- * or the other way round. The first part of it is handed out for good, a stretch at a time
- * (rings); the rest is slots of one size, taken and given back (buffers).
+ * or the other way round. The first part of it is for what the driver asks of dma_alloc_coherent()
+ * (rings, and on PCI the memory its firmware asks for and the MHI host's), handed out first fit
+ * and given back by dma_free_coherent(): the driver frees and makes them again whenever its
+ * firmware is started anew (a suspend, a recovery). The rest is slots of one size, taken and given
+ * back (buffers).
+ *
+ * The first part is 12 MB for the WCN6750 (the data path's rings and link descriptors come to
+ * about 6 MB) and 32 MB on PCI, where the QCA6390's firmware asks for 6.8 MB of the host's
+ * memory and its image (4.3 MB) stays where the MHI host put it while the firmware runs.
  */
-#define POOL_SIZE	(44u << 20)
-#define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
+#define POOL_BUFFERS	(32u << 20)
 #define POOL_SLOT	4096u
-#define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
+#define POOL_SLOTS	(POOL_BUFFERS / POOL_SLOT)
+#define POOL_GRAIN	64u
+#define POOL_EXTENTS	512			/* the most pieces the first part's free space is in */
 
 static struct {
 	uint8_t *memory;
 	unsigned long long address;		/* the radio's, of the first byte */
+	uint32_t size, rings;			/* all of it, and its first part (bytes) */
 	uint32_t rings_used;
+	struct {
+		uint32_t at, size;		/* free, sorted by where they are, never touching each other */
+	} free[POOL_EXTENTS];
+	unsigned extents;
 	uint32_t free_slots[POOL_SLOTS], free_count;
 } pool;
 
@@ -773,54 +786,146 @@ lx_pool_init(void)
 	if (pool.memory != NULL) {
 		return (0);
 	}
-	pool.memory = lx_os_radio_memory(POOL_SIZE, &pool.address);
+	pool.rings = (lx_os_bus() == LX_BUS_PCI ? 32u : 12u) << 20;
+	pool.size = pool.rings + POOL_BUFFERS;
+	pool.memory = lx_os_radio_memory(pool.size, &pool.address);
 	if (pool.memory == NULL) {
 		return (ENOMEM);
 	}
+	pool.free[0].at = 0;
+	pool.free[0].size = pool.rings;
+	pool.extents = 1;
 	for (uint32_t i = 0; i < POOL_SLOTS; i++) {
 		pool.free_slots[i] = POOL_SLOTS - 1 - i;
 	}
 	pool.free_count = POOL_SLOTS;
-	printf("lx: %u MB for the radio to read and write; it knows them from %#llx on\n", POOL_SIZE >> 20, pool.address);
+	printf("lx: %u MB for the radio to read and write; it knows them from %#llx on\n", pool.size >> 20, pool.address);
 	return (0);
 }
 
 static bool
 in_pool(const void *memory, size_t size)
 {
-	return ((const uint8_t *)memory >= pool.memory && (const uint8_t *)memory + size <= pool.memory + POOL_SIZE);
+	return ((const uint8_t *)memory >= pool.memory && (const uint8_t *)memory + size <= pool.memory + pool.size);
 }
 
+/* A piece of the first part, aligned to `align` (a power of two, at least POOL_GRAIN): its offset, or ~0u. Under the lock. */
+static uint32_t
+pool_take(uint32_t size, uint32_t align)
+{
+	for (unsigned i = 0; i < pool.extents; i++) {
+		uint32_t at = roundup2(pool.free[i].at, align), end = pool.free[i].at + pool.free[i].size;
+
+		if (at + size > end) {
+			continue;
+		}
+		/* what is left before and after the piece stays free: the extent shrinks, or splits in two */
+		if (at + size < end && at > pool.free[i].at) {
+			if (pool.extents == POOL_EXTENTS) {
+				continue;
+			}
+			memmove(&pool.free[i + 2], &pool.free[i + 1], (pool.extents - i - 1) * sizeof(pool.free[0]));
+			pool.extents++;
+			pool.free[i + 1].at = at + size;
+			pool.free[i + 1].size = end - (at + size);
+			pool.free[i].size = at - pool.free[i].at;
+		} else if (at > pool.free[i].at) {
+			pool.free[i].size = at - pool.free[i].at;
+		} else if (at + size < end) {
+			pool.free[i].at = at + size;
+			pool.free[i].size = end - (at + size);
+		} else {
+			memmove(&pool.free[i], &pool.free[i + 1], (pool.extents - i - 1) * sizeof(pool.free[0]));
+			pool.extents--;
+		}
+		pool.rings_used += size;
+		return (at);
+	}
+	return (~0u);
+}
+
+/* A piece given back, joined to its free neighbours. Under the lock. */
+static void
+pool_give(uint32_t at, uint32_t size)
+{
+	unsigned i = 0;
+
+	while (i < pool.extents && pool.free[i].at < at) {
+		i++;
+	}
+	pool.rings_used -= size;
+	if (i > 0 && pool.free[i - 1].at + pool.free[i - 1].size == at) {
+		pool.free[i - 1].size += size;
+		if (i < pool.extents && at + size == pool.free[i].at) {
+			pool.free[i - 1].size += pool.free[i].size;
+			memmove(&pool.free[i], &pool.free[i + 1], (pool.extents - i - 1) * sizeof(pool.free[0]));
+			pool.extents--;
+		}
+		return;
+	}
+	if (i < pool.extents && at + size == pool.free[i].at) {
+		pool.free[i].at = at;
+		pool.free[i].size += size;
+		return;
+	}
+	if (pool.extents == POOL_EXTENTS) {
+		printf("lx: the radio's free memory is in too many pieces: %u bytes are lost\n", size);
+		return;
+	}
+	memmove(&pool.free[i + 1], &pool.free[i], (pool.extents - i) * sizeof(pool.free[0]));
+	pool.extents++;
+	pool.free[i].at = at;
+	pool.free[i].size = size;
+}
+
+/* Of the first part, zeroed, aligned to `align` bytes (0: POOL_GRAIN); the radio's address in *dma_handle. */
 void *
-linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag)
+lx_dma_alloc(size_t size, size_t align, dma_addr_t *dma_handle)
 {
 	uint32_t at;
 
-	size = roundup2(size, 64);
+	size = roundup2(size, POOL_GRAIN);
+	align = align < POOL_GRAIN ? POOL_GRAIN : align;
 	lx_os_lock();
-	at = pool.rings_used;
-	if (pool.memory == NULL || at + size > POOL_RINGS) {
-		lx_os_unlock();
-		printf("lx: no room for %zu more bytes of rings\n", size);
+	at = pool.memory == NULL || size > pool.rings ? ~0u : pool_take((uint32_t)size, (uint32_t)align);
+	lx_os_unlock();
+	if (at == ~0u) {
+		printf("lx: no room for %zu more bytes of rings (%u KB of %u used)\n", size, pool.rings_used >> 10, pool.rings >> 10);
 		return (NULL);
 	}
-	pool.rings_used += size;
-	lx_os_unlock();
 	bzero(pool.memory + at, size);
 	*dma_handle = pool.address + at;
 	return (pool.memory + at);
 }
 
 void
+lx_dma_free(void *memory, size_t size)
+{
+	if (memory == NULL || !in_pool(memory, 1) || (uint8_t *)memory >= pool.memory + pool.rings) {
+		return;
+	}
+	lx_os_lock();
+	pool_give((uint32_t)((uint8_t *)memory - pool.memory), (uint32_t)roundup2(size, POOL_GRAIN));
+	lx_os_unlock();
+}
+
+void *
+linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag)
+{
+	return (lx_dma_alloc(size, 0, dma_handle));
+}
+
+/* (dma_free_coherent() ends here) */
+void
 kmem_free(void *address, vm_size_t size)
 {
-	/* (dma_free_coherent() ends here: rings are not given back) */
+	lx_dma_free(address, size);
 }
 
 /*
  * Linux's memory for a device that need not be coherent: the same piece. (The data path takes a
  * few kilobytes of it for every traffic class of a station it meets, and gives them back when
- * the station goes: here they stay taken, like the rings.)
+ * the station goes.)
  */
 void *
 dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *handle, enum dma_data_direction direction, gfp_t gfp)
@@ -831,6 +936,7 @@ dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *handle, enum 
 void
 dma_free_noncoherent(struct device *dev, size_t size, void *memory, dma_addr_t handle, enum dma_data_direction direction)
 {
+	lx_dma_free(memory, size);
 }
 
 /*
@@ -848,7 +954,7 @@ pmap_kextract(vm_offset_t va)
 dma_addr_t
 lkpi_dma_map_phys(struct device *dev, vm_paddr_t address, size_t length, enum dma_data_direction direction, unsigned long attributes)
 {
-	if (address < pool.address || address + length > pool.address + POOL_SIZE) {
+	if (address < pool.address || address + length > pool.address + pool.size) {
 		printf("lx: memory is given to the radio that it cannot reach (%zu bytes)\n", length);
 		return (DMA_MAPPING_ERROR);
 	}
@@ -898,7 +1004,7 @@ linuxkpi_dev_alloc_skb(size_t size, gfp_t gfp)
 	skb->prev = skb->next = skb;
 	skb->shinfo = (struct skb_shared_info *)((uint8_t *)skb + roundup2(sizeof(struct sk_buff), 64));
 	skb->truesize = size + NET_SKB_PAD;
-	skb->head = skb->data = pool.memory + POOL_RINGS + (size_t)slot * POOL_SLOT;
+	skb->head = skb->data = pool.memory + pool.rings + (size_t)slot * POOL_SLOT;
 	skb_reset_tail_pointer(skb);
 	skb->end = skb->head + size + NET_SKB_PAD;
 	skb_reserve(skb, NET_SKB_PAD);
@@ -911,9 +1017,9 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 	if (skb == NULL) {
 		return;
 	}
-	if (in_pool(skb->head, 1) && skb->head >= pool.memory + POOL_RINGS) {
+	if (in_pool(skb->head, 1) && skb->head >= pool.memory + pool.rings) {
 		lx_os_lock();
-		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + POOL_RINGS)) / POOL_SLOT);
+		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + pool.rings)) / POOL_SLOT);
 		lx_os_unlock();
 	}
 	lkpi_kfree(skb->m);
@@ -1218,8 +1324,9 @@ linux_dmi_first_match(const struct dmi_system_id *list)
 void
 lx_memory_say(void)
 {
-	lx_tell("lx: memory: %ld pieces of the kernel's out, %ld KB; of the radio's %u MB: %u KB of rings, %u of %u buffers out\n",
-	    allocations, allocated >> 10, POOL_SIZE >> 20, pool.rings_used >> 10, POOL_SLOTS - pool.free_count, POOL_SLOTS);
+	lx_tell("lx: memory: %ld pieces of the kernel's out, %ld KB; of the radio's %u MB: %u of %u KB of rings (free in %u "
+	    "pieces), %u of %u buffers out\n", allocations, allocated >> 10, pool.size >> 20, pool.rings_used >> 10, pool.rings >> 10,
+	    pool.extents, POOL_SLOTS - pool.free_count, POOL_SLOTS);
 }
 
 int

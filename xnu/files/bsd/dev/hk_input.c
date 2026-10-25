@@ -139,6 +139,9 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 void
 hk_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 {
+	if (type == HK_TOUCH_DOWN || type == HK_BUTTON_DOWN) {
+		hk_cpufreq_boost();             /* (what follows a touch needs the speed before any load shows it) */
+	}
 	touch_post(type, finger, x, y, true);
 }
 

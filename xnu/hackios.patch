@@ -79,10 +79,10 @@ index 4b83160780c3..d6bb1edb1aae 100644
  
  #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..f599fff52068 100644
+index 44274016a4cf..1d7727b57456 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,45 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,46 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -103,6 +103,7 @@ index 44274016a4cf..f599fff52068 100644
 +bsd/dev/hk_apple80211.c	standard
 +bsd/dev/hk_cpufreq.c	standard
 +bsd/dev/hk_thermal.c	standard
++bsd/dev/hk_power.c	standard
 +bsd/dev/hk_display.c	standard
 +bsd/dev/hk_board.c	standard
 +bsd/dev/hk_adreno.c	standard
@@ -128,7 +129,7 @@ index 44274016a4cf..f599fff52068 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +194,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +195,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -184,7 +185,7 @@ index 44274016a4cf..f599fff52068 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +449,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +450,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -192,7 +193,7 @@ index 44274016a4cf..f599fff52068 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +472,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +473,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1652,11 +1653,48 @@ index 1ed75eea2052..d57a19ae50e2 100644
  #  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_library_validation config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_service_port_info ]
  #  MACH_RELEASE =   [ MACH_BASE config_skip_precise_user_kernel_time debugger_for_zone_info ]
  #  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
+diff --git a/iokit/Kernel/IOCPU.cpp b/iokit/Kernel/IOCPU.cpp
+index fd70a820bc90..f6fe1d7227e1 100644
+--- a/iokit/Kernel/IOCPU.cpp
++++ b/iokit/Kernel/IOCPU.cpp
+@@ -210,6 +210,10 @@ OSMetaClassDefineReservedUnused(IOCPU, 7);
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ #if !USE_APPLEARMSMP
++extern "C" void loader_log_line(const char *line);     /* (osfmk/arm64/loader_return.c: a hung kernel's log has it) */
++extern "C" void hk_power_will_sleep(void);
++extern "C" void hk_power_did_wake(void);
++
+ void
+ IOCPUSleepKernel(void)
+ {
+@@ -226,6 +230,7 @@ IOCPUSleepKernel(void)
+ 
+ 	rootDomain->tracePoint( kIOPMTracePointSleepPlatformActions );
+ 	IOPlatformActionsPreSleep();
++	hk_power_will_sleep();          /* (bsd/dev/hk_power.c: what needs every processor's interrupts) */
+ 	rootDomain->tracePoint( kIOPMTracePointSleepCPUs );
+ 
+ 	numCPUs = gIOCPUs->getCount();
+@@ -309,11 +314,13 @@ IOCPUSleepKernel(void)
+ 
+ 	rootDomain->tracePoint( kIOPMTracePointWakePlatformActions );
+ 	IOPlatformActionsPostResume();
++	hk_power_did_wake();
+ 
+ 	sched_restore_available_cores_after_sleep();
+ 
+ 	thread_kern_set_pri(self, old_pri);
+ 	printf("IOCPUSleepKernel exit\n");
++	loader_log_line("IOCPUSleepKernel: every processor back, the platform's wake actions done\n");
+ }
+ 
+ static bool
 diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
-index 4a06407aea5f..69a4bcf1839d 100644
+index 4a06407aea5f..b157ded6a282 100644
 --- a/iokit/Kernel/IOPMrootDomain.cpp
 +++ b/iokit/Kernel/IOPMrootDomain.cpp
-@@ -555,7 +555,16 @@ static uint32_t         gDarkWakeFlags = kDarkWakeFlagPromotionEarly;
+@@ -555,7 +555,21 @@ static uint32_t         gDarkWakeFlags = kDarkWakeFlagPromotionEarly;
  #endif /* !defined(XNU_TARGET_OS_OSX) */
  
  static uint32_t         gNoIdleFlag = 0;
@@ -1669,19 +1707,24 @@ index 4a06407aea5f..69a4bcf1839d 100644
 + * stopped there for good, waiting for a processor to go that never goes. Refused instead, the
 + * system stays awake with its display off, and the side button or a tap wakes the screen.
 + * Boot-arg syssleep=1 gives the old behaviour back.
++ *
++ * The OnePlus 8 sleeps for real (bsd/dev/hk_power.c: the other processors switched off -- they now say so, which
++ * is what IOCPUSleepKernel() waited for --, the boot one in WFI until the power key's interrupt, a scheduled wake
++ * or the charger's cable): allowed there by default (hk_power_sleep_supported()), syssleep=0 refuses it.
 + */
 +static uint32_t         gSleepDisabledFlag = 1;
++extern "C" bool hk_power_sleep_supported(void);         /* bsd/dev/hk_power.c */
  static uint32_t         gSwdPanic = 1;
  static uint32_t         gSwdSleepTimeout = 0;
  static uint32_t         gSwdWakeTimeout = 0;
-@@ -1587,6 +1596,13 @@ IOPMrootDomain::start( IOService * nub )
+@@ -1587,6 +1601,13 @@ IOPMrootDomain::start( IOService * nub )
  #endif /* DEVELOPMENT || DEBUG */
  
  	PE_parse_boot_argn("noidle", &gNoIdleFlag, sizeof(gNoIdleFlag));
 +	{
 +		uint32_t syssleep = 0;
 +
-+		if (PE_parse_boot_argn("syssleep", &syssleep, sizeof(syssleep)) && syssleep) {
++		if ((PE_parse_boot_argn("syssleep", &syssleep, sizeof(syssleep)) && syssleep) || hk_power_sleep_supported()) {
 +			gSleepDisabledFlag = 0;
 +		}
 +	}
@@ -2330,7 +2373,7 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..44d522d5a110 100644
+index e76e7e70ab9c..b5e1aa32548a 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
 @@ -734,6 +734,10 @@ ml_get_machine_mem(void)
@@ -2358,7 +2401,7 @@ index e76e7e70ab9c..44d522d5a110 100644
  	while (1) {
  		;
  	}
-@@ -932,6 +943,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -932,6 +943,142 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -2455,10 +2498,53 @@ index e76e7e70ab9c..44d522d5a110 100644
 +	return true;
 +}
 +
++/*
++ * The platform's system sleep (bsd/dev/hk_power.c, on the boot processor, interrupts masked, every other processor
++ * switched off): mach_absolute_time() does not count it, as an iPhone's does not -- the timers of the kernel and
++ * of every program wait out their time awake -- while the hardware counter, which the calendar's clock reads
++ * (GenericARMPE::getGMTTimeOfDay()), counts on, and the wake's clock_wakeup_calendar() makes up the difference
++ * (mach_continuous_time() included). Freeze: the time to resume at; thaw: the clock goes on from there, the
++ * processors started later take it over in cpu_timebase_init(), and the timer is set for the next deadline again.
++ */
++extern void commpage_update_timebase(void);
++uint64_t ml_sleep_timebase_freeze(void);
++void ml_sleep_timebase_thaw(uint64_t frozen);
++
++uint64_t
++ml_sleep_timebase_freeze(void)
++{
++	return ml_get_timebase();
++}
++
++void
++ml_sleep_timebase_thaw(uint64_t frozen)
++{
++	rtclock_base_abstime = frozen - ml_get_hwclock();
++	getCpuDatap()->cpu_base_timebase = rtclock_base_abstime;
++	commpage_update_timebase();
++	/* (the deadline is the one set before the sleep, and so is rtcPop: without this the timer is not set again) */
++	getCpuDatap()->rtcPop = EndOfAllTime;
++	timer_resync_deadlines();
++}
++
++/* Whether a processor is taking work now (bsd/dev/hk_cpufreq.c's governor: one switched off has no load of its own) */
++bool ml_cpu_online(int cpu_id);
++
++bool
++ml_cpu_online(int cpu_id)
++{
++	if (cpu_id < 0 || cpu_id >= MAX_SCHED_CPUS || processor_array[cpu_id] == PROCESSOR_NULL) {
++		return false;
++	}
++	processor_state_t state = processor_array[cpu_id]->state;
++
++	return state == PROCESSOR_RUNNING || state == PROCESSOR_IDLE || state == PROCESSOR_DISPATCHING;
++}
++
  void
  ml_parse_cpu_topology(void)
  {
-@@ -945,6 +1049,7 @@ ml_parse_cpu_topology(void)
+@@ -945,6 +1092,7 @@ ml_parse_cpu_topology(void)
  	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
@@ -2466,7 +2552,7 @@ index e76e7e70ab9c..44d522d5a110 100644
  
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
-@@ -1005,6 +1110,20 @@ ml_parse_cpu_topology(void)
+@@ -1005,6 +1153,20 @@ ml_parse_cpu_topology(void)
  		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
  
  		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
@@ -2487,7 +2573,7 @@ index e76e7e70ab9c..44d522d5a110 100644
  		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
  		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
  		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
-@@ -1107,6 +1226,7 @@ ml_parse_cpu_topology(void)
+@@ -1107,6 +1269,7 @@ ml_parse_cpu_topology(void)
  	cluster_offsets[0] = 0;
  #endif
  	assert(topology_info.boot_cpu != NULL);
@@ -2495,7 +2581,7 @@ index e76e7e70ab9c..44d522d5a110 100644
  	ml_read_chip_revision(&topology_info.chip_revision);
  
  	/*
-@@ -1427,17 +1547,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1427,17 +1590,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
  	if (!is_boot_cpu) {
  		processor_init(processor, this_cpu_datap->cpu_number, pset);
@@ -2521,7 +2607,7 @@ index e76e7e70ab9c..44d522d5a110 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2355,16 @@ _enable_virtual_timer(void)
+@@ -2237,8 +2398,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);

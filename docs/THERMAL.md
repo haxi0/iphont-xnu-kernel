@@ -2,8 +2,9 @@
 
 ## Thermal service (kernel: `bsd/dev/hk_thermal.c`, userland: `thermald`)
 
-With `cpufreq=1` every core this kernel uses runs at the top of its frequency table, and nothing else would ever
-slow it down. The thermal service is the governor that Android's thermal engine would otherwise be:
+With `cpufreq=1` every core this kernel uses starts at the top of its frequency table; the load governor
+(`docs/POWER.md`) lowers it when idle, but nothing would hold it down under load. The thermal service sets the
+ceiling the governor stays under, as Android's thermal engine would:
 
 | What | How |
 |---|---|

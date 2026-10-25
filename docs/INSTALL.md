@@ -162,7 +162,9 @@ it (PS_HOLD a hard reset, the reason in the PON's soft spare register: `fastboot
 What an installed run keeps: `/private/var` (home screen, settings, app data) is saved into the var store when iOS
 restarts or shuts down (launchd's SIGTERM to `var_store watch`), and every `var_save_every=` seconds (600 in the
 profile) against a reset with the keys, which saves nothing. Shut down switches the phone off (the kernel returns
-reason 3, the loader calls `ResetSystem(EfiResetShutdown)`); restart starts it again through the menu.
+reason 3, the loader calls `ResetSystem(EfiResetShutdown)`); with the cable in, the phone then stays off and
+charges until the power key or the cable comes out (docs/POWER.md, off-mode charging). Restart starts it again
+through the menu.
 
 ## Things to know
 

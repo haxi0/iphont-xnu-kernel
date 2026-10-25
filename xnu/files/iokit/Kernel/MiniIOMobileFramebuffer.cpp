@@ -560,36 +560,73 @@ static const uint8_t k60Hz[] = {                /* timing@0: back to the firmwar
 	2, 0xe6, 0x02, 2, 0xb0, 0x77, 2, 0xe6, 0xb3, 3, 0xf0, 0xa5, 0xa5, 0,
 };
 
+/* TE pulses the panel has sent so far (INTF1's read pointer counter, 16 bits). */
+static inline uint32_t
+teCount(void)
+{
+	return displayReg(gDPU, INTF1_TE_COUNT) >> 16;
+}
+
 /* TEs in 100 ms, from INTF1's read pointer counter (it counts the panel's TE pulses). */
 static unsigned
 teRate(void)
 {
-	uint32_t before = displayReg(gDPU, INTF1_TE_COUNT) >> 16;
+	uint32_t before = teCount();
 
 	IODelay(100000);
-	return (((displayReg(gDPU, INTF1_TE_COUNT) >> 16) - before) & 0xffff) * 10;
+	return ((teCount() - before) & 0xffff) * 10;
 }
 
-static bool
-dsiSend(vm_offset_t dsi, const uint8_t * bytes, unsigned n)
-{
-	size_t frame = (size_t) vinfo.v_rowbytes * vinfo.v_height;
-	volatile uint8_t * buffer = (volatile uint8_t *) (vinfo.v_baseaddr + frame);
-	unsigned length = (4 + n + 3) & ~3u, waited;
+/*
+ * Where the packets go: a page of the display's memory (cont_splash_region, which the display SMMU maps as the
+ * firmware left it) between the first framebuffer -- at the GPU's pitch it ends at 0x9c9f7000 -- and the second.
+ * Past the boot framebuffer's last pixel, as before, would be inside the first framebuffer once its rows are
+ * the GPU's 4352 bytes: a speck of packet bytes at the bottom of the screen.
+ */
+#define DSI_DMA_PHYS            (DOUBLE_PHYS - 0x1000)
 
-	if (round_page(frame) - frame < 64) {
+static vm_offset_t gDSI, gDsiDma;
+
+static bool
+dsiMap(void)
+{
+	if (gDSI == 0) {
+		gDSI = ml_io_map(DSI0_PHYS, 0x1000);
+	}
+	if (gDsiDma == 0) {
+		gDsiDma = ml_io_map(DSI_DMA_PHYS, 0x1000);
+	}
+	return gDSI != 0 && gDsiDma != 0;
+}
+
+/* One DCS packet through DSI0's command DMA: 0x39 a long write, 0x05/0x15 a short one (the command and a parameter). */
+static bool
+dsiPacket(vm_offset_t dsi, uint8_t type, const uint8_t * bytes, unsigned n)
+{
+	volatile uint8_t * buffer = (volatile uint8_t *) gDsiDma;
+	bool shortPacket = type == 0x05 || type == 0x15;
+	unsigned length = shortPacket ? 4 : (4 + n + 3) & ~3u, waited;
+
+	if (n > 255 || (shortPacket && n > 2)) {
 		return false;
 	}
-	buffer[0] = (uint8_t) n;                /* MSM order: word count, then the data type; last packet, long */
-	buffer[1] = 0;
-	buffer[2] = 0x39;
-	buffer[3] = 0xc0;
-	for (unsigned i = 0; i < length - 4; i++) {
-		buffer[4 + i] = i < n ? bytes[i] : 0xff;
+	if (shortPacket) {
+		buffer[0] = n > 0 ? bytes[0] : 0;       /* MSM order: the two data bytes, then the data type; last packet */
+		buffer[1] = n > 1 ? bytes[1] : 0;
+		buffer[2] = type;
+		buffer[3] = 0x80;
+	} else {
+		buffer[0] = (uint8_t) n;                /* MSM order: word count, then the data type; last packet, long */
+		buffer[1] = 0;
+		buffer[2] = type;
+		buffer[3] = 0xc0;
+		for (unsigned i = 0; i < length - 4; i++) {
+			buffer[4 + i] = i < n ? bytes[i] : 0xff;
+		}
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	*(volatile uint32_t *)(dsi + DSI_INTR_CTRL) = displayReg(dsi, DSI_INTR_CTRL);      /* pending status written back: cleared */
-	*(volatile uint32_t *)(dsi + DSI_DMA_BASE) = (uint32_t) (vinfo.v_physaddr + frame);
+	*(volatile uint32_t *)(dsi + DSI_DMA_BASE) = (uint32_t) DSI_DMA_PHYS;
 	*(volatile uint32_t *)(dsi + DSI_DMA_LEN) = length;
 	*(volatile uint32_t *)(dsi + DSI_TRIG_DMA) = 1;
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -607,7 +644,10 @@ dsiSend(vm_offset_t dsi, const uint8_t * bytes, unsigned n)
 static void
 panelRate(unsigned hz)
 {
-	vm_offset_t dsi = ml_io_map(DSI0_PHYS, 0x1000);
+	if (!dsiMap()) {
+		return;
+	}
+	vm_offset_t dsi = gDSI;
 	uint32_t ctrl = displayReg(dsi, DSI_CTRL), trig = displayReg(dsi, DSI_TRIG_CTRL), dma = displayReg(dsi, DSI_CMD_DMA_CTRL);
 	unsigned before = teRate(), sent = 0;
 	uint32_t vsync = displayReg(gDPU, INTF1_TE_VSYNC), count = vsync & 0x7ffff;
@@ -625,13 +665,56 @@ panelRate(unsigned hz)
 		return;
 	}
 	*(volatile uint32_t *)(dsi + DSI_CMD_DMA_CTRL) = dma & ~DSI_CMD_DMA_LOW_POWER;     /* "dsi_hs_mode" */
-	for (const uint8_t * c = hz == 90 ? k90Hz : k60Hz; *c != 0 && dsiSend(dsi, c + 1, *c); c += 1 + *c) {
+	for (const uint8_t * c = hz == 90 ? k90Hz : k60Hz; *c != 0 && dsiPacket(dsi, 0x39, c + 1, *c); c += 1 + *c) {
 		sent++;
 	}
 	*(volatile uint32_t *)(dsi + DSI_CMD_DMA_CTRL) = dma;
 	displayLog("display: %u Hz: %u of 9 DSI commands sent (ctrl %#x trig %#x dma %#x); TE %u Hz before, %u Hz after\n",
 	    hz, sent, ctrl, trig, dma, before, teRate());
 }
+
+extern "C" int get_preemption_level(void);
+
+static void
+panelWait(unsigned ms)
+{
+	if (ml_get_interrupts_enabled() && get_preemption_level() == 0) {
+		IOSleep(ms);
+	} else {
+		IODelay(ms * 1000);
+	}
+}
+
+/* DSI0 in command mode with software-triggered DMA, as the firmware leaves it (panelRate()) */
+static bool
+dsiReady(void)
+{
+	if (!dsiMap()) {
+		return false;
+	}
+	uint32_t ctrl = displayReg(gDSI, DSI_CTRL), trig = displayReg(gDSI, DSI_TRIG_CTRL);
+
+	return (ctrl & 1) && (ctrl & (1u << 2)) && (trig & 7) == 4;
+}
+
+/* A table of packets (type, wait in ms, length, the bytes; 0 ends it), in low power mode as the stock sequences say. */
+static unsigned
+dsiSequence(const uint8_t * c)
+{
+	uint32_t dma = displayReg(gDSI, DSI_CMD_DMA_CTRL);
+	unsigned sent = 0;
+
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma | DSI_CMD_DMA_LOW_POWER;     /* "dsi_lp_mode" */
+	for (; *c != 0 && dsiPacket(gDSI, c[0], c + 3, c[2]); c += 3 + c[2]) {
+		sent++;
+		if (c[1] != 0) {
+			panelWait(c[1]);
+		}
+	}
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma;
+	return sent;
+}
+
 
 /* Autorefresh off, the transfer it may be in the middle of finished (Linux dpu_hw_intf_disable_autorefresh). */
 static bool
@@ -689,6 +772,19 @@ pushStart(unsigned height)
 	return true;
 }
 
+/*
+ * Pushes in a row that did not finish (pushWait() false). One is a refresh missed; PUSH_FAILURES in a row, and the
+ * panel or the MDP has stopped: the boot framebuffer and autorefresh back for the rest of the run (pushStop()).
+ */
+#define PUSH_FAILURES           3
+static uint32_t gPushFailures;
+
+static bool
+pushGiveUp(void)
+{
+	return ++gPushFailures >= PUSH_FAILURES;
+}
+
 /* Wait until no push is in flight: the framebuffer is the MDP's while one is. false: it never finished. */
 static bool
 pushWait(void)
@@ -718,34 +814,141 @@ pushWait(void)
 	}
 	uint64_t done = __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE);
 
+	if (done == 0 && (displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE)) {
+		/* done, and its interrupt did not come: taken as done, and said (it should not happen) */
+		static uint32_t told;
+
+		displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+		done = mach_absolute_time();
+		if (told++ < 4) {
+			displayLog("display: a push was done but its interrupt (%u) did not come\n", MDSS_INTID);
+		}
+	}
 	gPushed = 0;
 	if (done == 0) {
 		return false;
 	}
+	gPushFailures = 0;
 	if (gTouchLat) {
 		hk_tl("tl: k %u kick %llu done %llu\n", gPushId, micros(pushed), micros(done));
 	}
 	return true;
 }
 
-/* The frame in the framebuffer to the panel. Every processor that wrote it has drained its stores (drawRows()). */
+/*
+ * The panel asleep (IOMobileFramebufferRequestPowerChange 0, panelPower()): what the presenter pushes meanwhile is
+ * only remembered -- the pipes pointed at it, the push counted as done at once --, and the latest is sent when the
+ * panel wakes. gPanelLock: a push and the panel's DCS commands never overlap on the DSI link.
+ */
+static bool gPanelOff;
+static IOLock * gPanelLock;
+static IOLock * gClientsLock;           /* (the framebuffer's clients, IOMobileFramebufferUserClient::panelAwake()) */
+
 static void
-pushFrame(uint32_t swap, uint64_t buffer)
+pushFrameLocked(uint32_t swap, uint64_t buffer)
 {
 	__asm__ volatile ("dsb sy" ::: "memory");
 	if (gDouble) {
 		displayWrite(VIG0_SRC0_ADDR, (uint32_t) buffer);
 		displayWrite(VIG1_SRC0_ADDR, (uint32_t) buffer);
 	}
-	__atomic_store_n(&gPushDone, 0, __ATOMIC_RELEASE);
 	loader_screen[1] = gStride[0] != 0 ? gPanelRowBytes : vinfo.v_rowbytes;
 	loader_screen[0] = buffer;
 	gPushId = swap;
+	if (gPanelOff) {
+		gPushed = 0;
+		__atomic_store_n(&gPushDone, mach_absolute_time(), __ATOMIC_RELEASE);
+		return;
+	}
+	__atomic_store_n(&gPushDone, 0, __ATOMIC_RELEASE);
 	gPushed = mach_absolute_time();
 	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
 	displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME);
 	displayWrite(CTL0_START, 1);
 	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* The frame in the framebuffer to the panel. Every processor that wrote it has drained its stores (drawRows()). */
+static void
+pushFrame(uint32_t swap, uint64_t buffer)
+{
+	IOLockLock(gPanelLock);
+	if (!gPanelOff && gPushed != 0) {
+		pushWait();             /* (the frame the panel's wake sent, panelPower(), may still be on its way) */
+	}
+	pushFrameLocked(swap, buffer);
+	IOLockUnlock(gPanelLock);
+}
+
+/* (bsd/dev/hk_power.c: the screen's state, for the memory's bandwidth, the keys and the system's sleep) */
+extern "C" void hk_power_display(bool on);
+
+
+/*
+ * The panel dark and lit again, for IOMobileFramebufferRequestPowerChange (backboardd: 0 when the screen locks or dims
+ * out, 1 when it wakes): display off (0x28) and display on (0x29), DCS short writes, nothing else. The OLED's pixels
+ * are off meanwhile, its TE goes on but nothing is pushed and no VSync is told; the display engine and the memory
+ * idle. Not sleep in (0x10), as Android's off-command has it: after it the panel lost its DSC set-up, and neither
+ * sleep out with display on nor Android's whole on-command (whose picture parameters are not those the firmware set
+ * the display engine up with) brought the picture back -- coloured static over the screen (2026-10-25, on the
+ * phone). Android resets and repowers the panel for that; here the firmware's set-up is what has to stay. Thread
+ * context; the presenter waits meanwhile.
+ */
+static void
+panelPower(bool on)
+{
+	static const uint8_t kOff[] = { 0x05, 20, 1, 0x28, 0 };
+	uint64_t began = mach_absolute_time();
+
+	if (gPanelLock == NULL || !instantnoodle()) {
+		return;
+	}
+	IOLockLock(gPanelLock);
+	if (!gPushing || gPanelOff == !on || !dsiReady()) {
+		IOLockUnlock(gPanelLock);
+		return;
+	}
+	if (!on) {
+		uint32_t dma = displayReg(gDSI, DSI_CMD_DMA_CTRL);
+		unsigned sent = 0;
+
+		pushWait();                     /* (the frame on its way finishes first) */
+		*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma & ~DSI_CMD_DMA_LOW_POWER;   /* "dsi_hs_mode" */
+		for (const uint8_t * c = kOff; *c != 0 && dsiPacket(gDSI, c[0], c + 3, c[2]); c += 3 + c[2]) {
+			sent++;
+			panelWait(c[1]);
+		}
+		*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma;
+		displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) & ~TEAR_RD_PTR);
+		__atomic_store_n(&gTeTime, 0, __ATOMIC_RELEASE);
+		gPanelOff = true;
+		IOLockUnlock(gPanelLock);
+		displayLog("display: the panel dark (%u command, %llu ms)\n", sent, micros(mach_absolute_time() - began) / 1000);
+		hk_power_display(false);
+		return;
+	}
+	hk_power_display(true);         /* (the memory's bandwidth up before the first frame) */
+	static const uint8_t kOn[] = { 0x05, 0, 1, 0x29, 0 };
+	unsigned sent = dsiSequence(kOn);
+
+	displayWrite(INTF1_TEAR_INTR_CLEAR, TEAR_RD_PTR);
+	if (gPushIrq) {
+		displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) | TEAR_RD_PTR);
+	}
+	gPanelOff = false;
+	pushFrameLocked(gPushId, loader_screen[0] != 0 ? loader_screen[0] : vinfo.v_physaddr);    /* the latest frame */
+	IOLockUnlock(gPanelLock);
+	displayLog("display: the panel lit (%u command, %llu ms)\n", sent, micros(mach_absolute_time() - began) / 1000);
+}
+
+/* The panel to sleep and back for the system's sleep (bsd/dev/hk_power.c), when iOS had left it lit: thread context */
+extern "C" void hk_display_power(bool on);
+
+/* Whether the panel is lit (bsd/dev/hk_power.c): asleep only after a power change to 0 */
+extern "C" bool
+hk_display_on(void)
+{
+	return !gPanelOff;
 }
 
 /* Back to the loader (loader_return.c), from any context: the panel refreshing from the boot framebuffer again. */
@@ -754,6 +957,13 @@ hk_display_quiesce(void)
 {
 	if (!gPushing) {
 		return;
+	}
+	if (gPanelOff && dsiReady()) {
+		/* dark: lit for the loader's text, without the lock (a panic may hold it) */
+		static const uint8_t kOn[] = { 0x05, 0, 1, 0x29, 0 };
+
+		dsiSequence(kOn);
+		gPanelOff = false;
 	}
 	for (unsigned i = 0; i < PUSH_TIMEOUT_MS * 10 && gPushed != 0 &&
 	    !(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE) && __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) == 0; i++) {
@@ -1046,6 +1256,8 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
+	gPanelLock = IOLockAlloc();
+	gClientsLock = IOLockAlloc();
 	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
 		IOLog("MiniIOMobileFramebuffer: no thread to put frames on the panel with\n");
 		return false;
@@ -1970,9 +2182,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			dequeueSwap();
 			return;
 		}
-		if (spare == fPanelSent && !pushWait()) {
-			displayLog("display: a pushed frame did not finish in %u ms; the boot framebuffer and autorefresh back\n",
-			    PUSH_TIMEOUT_MS);
+		if (spare == fPanelSent && !pushWait() && pushGiveUp()) {
+			displayLog("display: %u pushed frames in a row did not finish in %u ms; the boot framebuffer and autorefresh "
+			    "back\n", PUSH_FAILURES, PUSH_TIMEOUT_MS);
 			pushStop();
 		}
 		fBack = (unsigned) spare;
@@ -1981,8 +2193,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fBase = fBuffer[fBack];         /* the one not being sent: written now, waited for at the push */
 	} else if (gPushing) {
 		/* paced by the panel: the frame before has to be out of the framebuffer first */
-		if (!pushWait()) {
-			displayLog("display: a pushed frame did not finish in %u ms; autorefresh back on\n", PUSH_TIMEOUT_MS);
+		if (!pushWait() && pushGiveUp()) {
+			displayLog("display: %u pushed frames in a row did not finish in %u ms; autorefresh back on\n", PUSH_FAILURES,
+			    PUSH_TIMEOUT_MS);
 			pushStop();
 		}
 		fStatBeatWait += mach_absolute_time() - began;
@@ -2120,8 +2333,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), surfaces[layer]->drawn, fences[layer]);
 		}
 	}
-	if (gDouble && !pushWait()) {
-		displayLog("display: a pushed frame did not finish in %u ms; the boot framebuffer and autorefresh back\n", PUSH_TIMEOUT_MS);
+	if (gDouble && !pushWait() && pushGiveUp()) {
+		displayLog("display: %u pushed frames in a row did not finish in %u ms; the boot framebuffer and autorefresh back\n",
+		    PUSH_FAILURES, PUSH_TIMEOUT_MS);
 		pushStop();
 	} else if (gPushing) {
 		unsigned sent = panel >= 0 ? (unsigned) panel : fBack;
@@ -2228,13 +2442,16 @@ class IOMobileFramebufferUserClient : public IOUserClient
 	uint64_t                fVSyncCount;
 	uint64_t                fVSyncTime;             /* when the refresh being waited for is due */
 	bool                    fVSyncRunning;
+	bool                    fVSyncParked;           /* stopped because the panel sleeps: started again when it wakes */
 	bool                    fClosed;
 
 	static void vsyncFired(thread_call_param_t self, thread_call_param_t unused);
 	void vsync(void);
 	void armVSync(void);
+	void unparkVSync(void);
 
 public:
+	static void panelAwake(void);
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
@@ -2245,6 +2462,10 @@ public:
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+
+/* The clients (backboardd's, and any other), for their refreshes to start again when the panel wakes */
+#define kFBClientsMost          8
+static IOMobileFramebufferUserClient * gClients[kFBClientsMost];
 
 bool
 IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
@@ -2265,7 +2486,47 @@ IOMobileFramebufferUserClient::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fVSyncCall = thread_call_allocate(&IOMobileFramebufferUserClient::vsyncFired, this);
-	return fLock != NULL && fVSyncCall != NULL;
+	if (fLock == NULL || fVSyncCall == NULL) {
+		return false;
+	}
+	IOLockLock(gClientsLock);
+	for (unsigned i = 0; i < kFBClientsMost; i++) {
+		if (gClients[i] == NULL) {
+			gClients[i] = this;
+			break;
+		}
+	}
+	IOLockUnlock(gClientsLock);
+	return true;
+}
+
+/* The panel is awake again: every client whose refreshes stopped while it slept gets them again. */
+void
+IOMobileFramebufferUserClient::panelAwake(void)
+{
+	if (gClientsLock == NULL) {
+		return;                 /* (no framebuffer started: no clients) */
+	}
+	IOLockLock(gClientsLock);
+	for (unsigned i = 0; i < kFBClientsMost; i++) {
+		if (gClients[i] != NULL) {
+			gClients[i]->unparkVSync();
+		}
+	}
+	IOLockUnlock(gClientsLock);
+}
+
+void
+IOMobileFramebufferUserClient::unparkVSync(void)
+{
+	IOLockLock(fLock);
+	if (fVSyncParked && !fVSyncRunning && !fClosed && fCallbacks[kFBNotifyVSync] != 0) {
+		fVSyncRunning = true;
+		fVSyncTime = mach_absolute_time();
+		armVSync();
+	}
+	fVSyncParked = false;
+	IOLockUnlock(fLock);
 }
 
 IOReturn
@@ -2288,6 +2549,13 @@ IOMobileFramebufferUserClient::clientClose(void)
 void
 IOMobileFramebufferUserClient::free(void)
 {
+	IOLockLock(gClientsLock);
+	for (unsigned i = 0; i < kFBClientsMost; i++) {
+		if (gClients[i] == this) {
+			gClients[i] = NULL;
+		}
+	}
+	IOLockUnlock(gClientsLock);
 	if (fVSyncCall != NULL) {
 		thread_call_cancel_wait(fVSyncCall);
 		thread_call_free(fVSyncCall);
@@ -2386,6 +2654,10 @@ IOMobileFramebufferUserClient::vsync(void)
 	now = fVSyncTime;
 	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
 		fVSyncRunning = false;
+	} else if (gPanelOff) {
+		/* the panel sleeps: it has no refreshes to tell of, as an iPhone's display has none when it is off */
+		fVSyncRunning = false;
+		fVSyncParked = true;
 	} else {
 		fVSyncCount++;
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
@@ -2511,10 +2783,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		return kIOReturnSuccess;
 	}
+	case kFBMethodRequestPowerChange:               /* in: 0 the display off, 1 on */
+		if (args->scalarInputCount >= 1) {
+			panelPower(in[0] != 0);
+			if (in[0] != 0) {
+				panelAwake();
+			}
+		}
+		return kIOReturnSuccess;
+
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
 	case kFBMethodChangeFrameInfo:
 		return kIOReturnSuccess;
 
@@ -2590,6 +2870,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  * IOMobileFramebuffer.framework counts the displays it should wait for by looking for
  * children of /arm-io in the device tree whose device_type is "display-subsystem".
  */
+extern "C" void
+hk_display_power(bool on)
+{
+	panelPower(on);
+	if (on) {
+		IOMobileFramebufferUserClient::panelAwake();
+	}
+}
+
 static void
 publishDisplayNode(void)
 {

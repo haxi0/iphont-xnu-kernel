@@ -1,0 +1,137 @@
+--- a/sys/compat/linuxkpi/common/include/linux/mhi.h
++++ b/sys/compat/linuxkpi/common/include/linux/mhi.h
+@@ -32,9 +32,11 @@
+ 
+ /* Modem Host Interface (MHI) */
+ 
+-/* XXX FIXME */
+-#define	MHI_DB_BRST_DISABLE	0
+-#define	MHI_ER_CTRL		0
++/* doorbell modes and event ring kinds, as the MHI specification numbers them */
++#define	MHI_DB_BRST_DISABLE	0x2
++#define	MHI_DB_BRST_ENABLE	0x3
++#define	MHI_ER_DATA		0
++#define	MHI_ER_CTRL		1
+ 
+ enum mhi_callback {
+ 	MHI_CB_SYS_ERROR,
+@@ -57,7 +59,9 @@
+ 	int	client_managed, data_type, hardware_event, irq, irq_moderation_ms, mode, num_elements, offload_channel, priority;
+ };
+ 
++struct mhi_controller;
+ struct mhi_device {
++	struct mhi_controller		*mhi_cntrl;	/* whose device this is */
+ };
+ 
+ struct mhi_controller_config {
+@@ -90,6 +94,8 @@
+ 	dma_addr_t			iova_start;
+ 	dma_addr_t			iova_stop;
+ 
++	void				*host;		/* the host's own state (wifi/lx/src/lx_mhi.c) */
++
+ 	int				(*runtime_get)(struct mhi_controller *);
+ 	void				(*runtime_put)(struct mhi_controller *);
+ 	void				(*status_cb)(struct mhi_controller *, enum mhi_callback);
+@@ -139,84 +145,22 @@
+ 
+ /* -------------------------------------------------------------------------- */
+ 
+-static __inline int
+-mhi_device_get_sync(struct mhi_device *mhi_dev)
+-{
+-	/* XXX TODO */
+-	return (-1);
+-}
+-
+-static __inline void
+-mhi_device_put(struct mhi_device *mhi_dev)
+-{
+-	/* XXX TODO */
+-}
+-
+-/* -------------------------------------------------------------------------- */
+-
+-static __inline int
+-mhi_prepare_for_power_up(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-	return (0);
+-}
+-
+-static __inline int
+-mhi_sync_power_up(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-	return (0);
+-}
+-
+-static __inline int
+-mhi_async_power_up(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-	return (0);
+-}
+-
+-static __inline void
+-mhi_power_down(struct mhi_controller *mhi_ctrl, bool x)
+-{
+-	/* XXX TODO */
+-}
+-
+-static __inline void
+-mhi_unprepare_after_power_down(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-}
+-
+-/* -------------------------------------------------------------------------- */
+-
+-static __inline int
+-mhi_pm_suspend(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-	return (0);
+-}
++/* (the MHI host underneath: wifi/lx/src/lx_mhi.c of the kernel this is built for) */
++int mhi_device_get_sync(struct mhi_device *);
++void mhi_device_put(struct mhi_device *);
++
++int mhi_prepare_for_power_up(struct mhi_controller *);
++int mhi_sync_power_up(struct mhi_controller *);
++int mhi_async_power_up(struct mhi_controller *);
++void mhi_power_down(struct mhi_controller *, bool);
++void mhi_power_down_keep_dev(struct mhi_controller *, bool);
++void mhi_unprepare_after_power_down(struct mhi_controller *);
++
++int mhi_pm_suspend(struct mhi_controller *);
++int mhi_pm_resume(struct mhi_controller *);
++int mhi_pm_resume_force(struct mhi_controller *);
+ 
+-static __inline int
+-mhi_pm_resume(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-	return (0);
+-}
+-
+-static __inline int
+-mhi_pm_resume_force(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-	return (0);
+-}
+-
+-/* -------------------------------------------------------------------------- */
+-
+-static __inline int
+-mhi_force_rddm_mode(struct mhi_controller *mhi_ctrl)
+-{
+-	/* XXX TODO */
+-	return (0);
+-}
++int mhi_force_rddm_mode(struct mhi_controller *);
++int mhi_download_rddm_image(struct mhi_controller *, bool);
+ 
+ #endif	/* _LINUXKPI_LINUX_MHI_H */

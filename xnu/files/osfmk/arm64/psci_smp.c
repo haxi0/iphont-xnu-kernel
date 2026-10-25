@@ -156,6 +156,8 @@ psci_smp_clean_segment(const char *name)
  * joined the scheduler, and says what became of it if it has not: on a phone the log is all
  * there is to go by.
  */
+static void psci_smp_note(const char *what, int cpu);
+
 kern_return_t
 psci_smp_start_cpu(int cpu)
 {
@@ -187,7 +189,15 @@ psci_smp_start_cpu(int cpu)
 
 	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_ASKED, release);
 	status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+	for (int tries = 0; (status == -4 || status == -5) && tries < 200; tries++) {
+		/* "already on": a core switched off a moment ago (a sleep that ended at once) is still on its way out */
+		delay_for_interval(1, NSEC_PER_MSEC);
+		if (psci_call(PSCI_AFFINITY_INFO, phys_id, 0, 0) == PSCI_AFFINITY_OFF) {
+			status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+		}
+	}
 	if (status != 0) {
+		psci_smp_note(" was not started by the firmware\n", cpu);
 		os_atomic_store(&psci_smp_cpu_stage[cpu], 0, release);
 		printf("psci: cpu %d (MPIDR 0x%x) was not started: the firmware answers %lld (%s)\n",
 		    cpu, phys_id, status, psci_error(status));
@@ -210,6 +220,7 @@ psci_smp_start_cpu(int cpu)
 		now = mach_absolute_time();
 	} while (now < deadline);
 
+	psci_smp_note(" did not join the scheduler in time\n", cpu);
 	if (psci_smp_start_fault.valid != 0) {
 		struct psci_smp_start_fault *f = &psci_smp_start_fault;
 		uint64_t to_virtual = gVirtBase - gPhysBase;
@@ -238,6 +249,11 @@ psci_smp_cpu_off(void)
 	__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_IMASKED);
 	gic_v3_irq_cpu_shutdown();
 	os_atomic_store(&psci_smp_cpu_stage[cpu_number()], PSCI_SMP_CPU_OFF, release);
+	/*
+	 * processor_shutdown() (the system's sleep, IOCPUSleepKernel()) waits in cpu_exit_wait() for this mark before it
+	 * counts the processor as gone; without it the sleep stopped there for good. cpu_machine_init() clears it again.
+	 */
+	getCpuDatap()->cpu_sleep_token = ARM_CPU_ON_SLEEP_PATH;
 	__builtin_arm_dsb(DSB_SY);
 
 	(void) psci_call(PSCI_CPU_OFF, 0, 0, 0);

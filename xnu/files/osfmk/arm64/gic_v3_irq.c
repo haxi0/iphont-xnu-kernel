@@ -136,7 +136,9 @@ static void
 gic_mask(uint32_t intid)
 {
 	if (intid < 32) {
-		gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
+		if (gicr_cpu_base[cpu_number()] != 0) {     /* (0: this processor's GIC is shut down) */
+			gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
+		}
 	} else {
 		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
 	}
@@ -213,6 +215,83 @@ gic_v3_spi_unmask(uint32_t intid)
 	if (gicd_base != 0 && intid >= GIC_INTID_SPI_MIN && intid < GIC_INTID_SPURIOUS_MIN) {
 		gic_write32(gicd_base + GICD_ISENABLER(intid / 32), 1u << (intid % 32));
 	}
+}
+
+/*
+ * The system's sleep (bsd/dev/hk_power.c), on the boot processor with every other one switched off and this
+ * one's interrupts masked: every SPI but the one that is to wake it disabled -- remembered, enabled again after --,
+ * that one routed here. A level-triggered SPI of a device that keeps it raised would otherwise end every WFI at
+ * once, and one routed to a processor that is off would wake nothing.
+ */
+#define GICD_ISPENDR(n)         (0x0200 + 4 * (n))
+#define GIC_SLEEP_WORDS         (GIC_INTID_SPURIOUS_MIN / 32)
+static uint32_t gic_sleep_enabled[GIC_SLEEP_WORDS + 1];
+static uint64_t gic_sleep_route;
+
+void gic_v3_sleep_enter(uint32_t wake_intid);
+void gic_v3_sleep_exit(uint32_t wake_intid);
+bool gic_v3_spi_pending(uint32_t intid);
+
+void
+gic_v3_sleep_enter(uint32_t wake_intid)
+{
+	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+
+	if (gicd_base == 0) {
+		return;
+	}
+	for (uint32_t n = GIC_INTID_SPI_MIN / 32; n <= GIC_SLEEP_WORDS; n++) {
+		gic_sleep_enabled[n] = gic_read32(gicd_base + GICD_ISENABLER(n));
+		gic_write32(gicd_base + GICD_ICENABLER(n), gic_sleep_enabled[n]);
+	}
+	gic_distributor_settle();
+	if (wake_intid >= GIC_INTID_SPI_MIN && wake_intid < GIC_INTID_SPURIOUS_MIN) {
+		gic_sleep_route = *(volatile uint64_t *)(gicd_base + GICD_IROUTER(wake_intid));
+		*(volatile uint64_t *)(gicd_base + GICD_IROUTER(wake_intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
+		gic_distributor_settle();
+		gic_v3_spi_unmask(wake_intid);
+	}
+}
+
+void
+gic_v3_sleep_exit(uint32_t wake_intid)
+{
+	if (gicd_base == 0) {
+		return;
+	}
+	if (wake_intid >= GIC_INTID_SPI_MIN && wake_intid < GIC_INTID_SPURIOUS_MIN) {
+		gic_v3_spi_mask(wake_intid);
+		*(volatile uint64_t *)(gicd_base + GICD_IROUTER(wake_intid)) = gic_sleep_route;
+		gic_distributor_settle();
+	}
+	for (uint32_t n = GIC_INTID_SPI_MIN / 32; n <= GIC_SLEEP_WORDS; n++) {
+		gic_write32(gicd_base + GICD_ISENABLER(n), gic_sleep_enabled[n]);
+	}
+	gic_distributor_settle();
+}
+
+/* How many shared interrupts are enabled now (the platform's sleep test: as many after a sleep as before) */
+uint32_t gic_v3_spi_enabled_count(void);
+
+uint32_t
+gic_v3_spi_enabled_count(void)
+{
+	uint32_t n = 0;
+
+	for (uint32_t word = GIC_INTID_SPI_MIN / 32; gicd_base != 0 && word <= GIC_SLEEP_WORDS; word++) {
+		n += (uint32_t)__builtin_popcount(gic_read32(gicd_base + GICD_ISENABLER(word)));
+	}
+	return n;
+}
+
+/* Raised and not yet taken (with this processor's interrupts masked, nothing takes it) */
+bool
+gic_v3_spi_pending(uint32_t intid)
+{
+	if (gicd_base == 0 || intid < GIC_INTID_SPI_MIN || intid >= GIC_INTID_SPURIOUS_MIN) {
+		return false;
+	}
+	return (gic_read32(gicd_base + GICD_ISPENDR(intid / 32)) & (1u << (intid % 32))) != 0;
 }
 
 /*
@@ -381,13 +460,31 @@ gic_v3_irq_cpu_shutdown(void)
 	if (gicd_base == 0) {
 		return;
 	}
-	gic_v3_irq_quiesce();
+	/*
+	 * This processor's own part only: the interrupt it has taken ended, its redistributor quiet. Not the shared
+	 * interrupts (gic_v3_irq_quiesce()): the return to the loader quiesces those itself, and a processor that is
+	 * switched off for the system's sleep is not the end of the drivers -- with them disabled here, every driver's
+	 * interrupt was off after the wake (the display's push done and TE, the GPU's fences, the touch screen, the
+	 * audio DSP's): pushes waited for their timeout and fell back to autorefresh (tearing), GPU waits and touches
+	 * were polled (2026-10-25).
+	 */
+	if (gic_active_iar[cpu_number()] != 0) {
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu_number()] & ~GIC_IAR_TAKEN);
+		__builtin_arm_isb(ISB_SY);
+		gic_active_iar[cpu_number()] = 0;
+	}
 	gicr = gicr_cpu_base[cpu_number()];
 	if (gicr != 0) {
 		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
 		gic_write32(gicr + GICR_ICPENDR0, 0xffffffffu);
 		gic_write32(gicr + GICR_ICACTIVER0, 0xffffffffu);
 	}
+	/*
+	 * Forgotten, so that gic_v3_irq_cpu_init() sets this processor up in full when it comes back (the system's
+	 * sleep restarts it): without that it came back with its interrupts between processors, its timer and Group 1
+	 * all off -- deaf, and every thread handed to it stranded, the whole system with them.
+	 */
+	gicr_cpu_base[cpu_number()] = 0;
 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 0);
 	__builtin_arm_isb(ISB_SY);
 }

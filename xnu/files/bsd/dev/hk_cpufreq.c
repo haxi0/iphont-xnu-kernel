@@ -20,6 +20,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/hk_input.h>
 #include <sys/hk_board.h>
+#include <sys/param.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -91,6 +92,12 @@ domain_of(uint32_t phys_id)
 static vm_offset_t epss_base[EPSS_DOMAINS];
 static int epss_top[EPSS_DOMAINS] = { -1, -1, -1 };
 static uint32_t epss_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
+/*
+ * The rows in force: epss_cap is the thermal service's ceiling, epss_row what the governor (below) has asked for
+ * under it. Without the governor (cpufreq_gov=0) the group runs at its ceiling, as before there was one.
+ */
+static int epss_cap[EPSS_DOMAINS], epss_row[EPSS_DOMAINS];
+static bool gov_on;
 
 static void
 raise_domain(uint32_t domain, uint32_t cores)
@@ -112,6 +119,7 @@ raise_domain(uint32_t domain, uint32_t cores)
 	}
 	epss_base[domain] = base;
 	epss_top[domain] = (int)top;
+	epss_cap[domain] = epss_row[domain] = (int)top;
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
 	delay_for_interval(20, NSEC_PER_MSEC);
@@ -140,6 +148,20 @@ hk_cpufreq_khz(uint32_t domain, int row)
 	return epss_khz[domain][row];
 }
 
+
+static void
+epss_set(uint32_t domain, int row)
+{
+	if (row > epss_cap[domain]) {
+		row = epss_cap[domain];
+	}
+	if (row < 0) {
+		row = 0;
+	}
+	epss_row[domain] = row;
+	*(volatile uint32_t *)(epss_base[domain] + EPSS_PERF_STATE) = (uint32_t)row;
+}
+
 void
 hk_cpufreq_cap(uint32_t domain, int row)
 {
@@ -152,7 +174,9 @@ hk_cpufreq_cap(uint32_t domain, int row)
 	if (row > epss_top[domain]) {
 		row = epss_top[domain];
 	}
-	*(volatile uint32_t *)(epss_base[domain] + EPSS_PERF_STATE) = (uint32_t)row;
+	epss_cap[domain] = row;
+	/* (lower at once; higher only when the governor wants it, or at once without one) */
+	epss_set(domain, gov_on && epss_row[domain] < row ? epss_row[domain] : row);
 }
 
 /*
@@ -599,6 +623,236 @@ hk_ddr_quiesce(void)
 	tell("ddr: memory bandwidth vote %u for the loader: %s\n", rest, done ? "done" : "FAILED");
 }
 
+/*
+ * The governor (boot-arg cpufreq_gov, 1 by default with cpufreq=1; 0: every group at its top row for the whole run,
+ * as before). The top rows for all of the run kept every core at its highest voltage even in WFI, the screen off
+ * included. Now each group's row follows the busiest of its cores (ml_cpu_idle_time()), as Linux's schedutil
+ * sets it: the next speed is 1.25 times the present one times the busy share -- twice it from 90% busy --, the
+ * lowest row that is at least that; up at once, down GOV_DOWN_ROWS rows a tick at most. A touch or a key
+ * (hk_cpufreq_boost(), from hk_touch_post()) puts every group at its top for GOV_BOOST_MS, as the scroll that
+ * follows needs it before any load could show it. Never above the thermal service's ceiling (hk_cpufreq_cap()).
+ * The top rows until GOV_START_SECONDS after the start: the boot is as fast as it was.
+ *
+ * The memory's bandwidth (ddr=2, the default) follows too: the most there is (ddr_vote=) while the screen is
+ * lit and something is busy -- a core over half busy or over half its rows, a touch, the GPU above its lowest
+ * speed -- and for GOV_DDR_IDLE_MS after; ddr_idle= (default 1024, the firmware's own middle range) when lit and
+ * idle, ddr_dark= (default 1024) with the screen off. Both from this one thread: the RPMh slots are not shared.
+ */
+#define GOV_TICK_MS             20
+#define GOV_TICK_DARK_MS        250
+#define GOV_START_SECONDS       45      /* the lock screen comes at 26 s, the slower cores at 28 s */
+#define GOV_BOOST_MS            150
+#define GOV_DOWN_ROWS           2
+#define GOV_DDR_IDLE_MS         1000
+#define DDR_IDLE                1024
+
+extern bool ml_cpu_online(int cpu_id);
+extern int hz;                          /* (bsd/kern/kern_clock.c: the ticks a second tsleep() counts in) */
+extern uint32_t hk_gpu_speed_level(void);      /* iokit/Kernel/HKGPU.cpp: 0 or 1 is idle */
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
+    thread_t *new_thread);              /* (osfmk/kern/thread.h, private to osfmk's headers) */
+extern void thread_set_thread_name(thread_t thread, const char *name);
+
+static uint64_t gov_boost_until;
+static bool gov_dark;
+static uint32_t gov_ddr_high = 0x3fff, gov_ddr_idle = DDR_IDLE, gov_ddr_dark = DDR_IDLE, gov_ddr_now;
+static uint64_t gov_ticks, gov_row_sum[EPSS_DOMAINS], gov_ddr_changes;
+static int gov_event;
+
+/* A touch or a key: every group to its top at once (any context: one register write a group) */
+void
+hk_cpufreq_boost(void)
+{
+	uint64_t until;
+
+	if (!gov_on) {
+		return;
+	}
+	clock_interval_to_deadline(GOV_BOOST_MS, NSEC_PER_MSEC, &until);
+	os_atomic_store(&gov_boost_until, until, relaxed);
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		if (epss_top[d] >= 0 && epss_row[d] < epss_cap[d]) {
+			epss_set(d, epss_cap[d]);
+		}
+	}
+}
+
+/* The screen off or on (bsd/dev/hk_power.c): the memory's vote changes on the governor's thread, at once */
+void
+hk_cpufreq_display(bool on)
+{
+	os_atomic_store(&gov_dark, !on, relaxed);
+	if (on) {
+		hk_cpufreq_boost();
+	}
+	wakeup(&gov_event);
+}
+
+/*
+ * The vote, from the governor's thread or from the system's sleep (hk_cpufreq_sleep()): never both at once in the
+ * one RPMh slot set -- the governor may have been stopped in the middle of a write when the system went to sleep.
+ * 0: no request of ours at all (the memory at its floor).
+ */
+static uint32_t ddr_busy;
+
+static bool
+gov_ddr(uint32_t vote)
+{
+	bool done;
+
+	if (!ddr_voted || vote == gov_ddr_now) {
+		return true;
+	}
+	if (!os_atomic_cmpxchg(&ddr_busy, 0, 1, acquire)) {
+		return false;
+	}
+	done = vote != 0 ? ddr_vote(vote) :
+	    ddr_rpmh_write((uint32_t[]){ ddr_mc0, ddr_sh0 }, (uint32_t[]){ BCM_COMMIT, BCM_COMMIT }, 2);
+	if (done) {
+		gov_ddr_now = vote;
+		gov_ddr_changes++;
+	}
+	os_atomic_store(&ddr_busy, 0, release);
+	return done;
+}
+
+/*
+ * The system's sleep (bsd/dev/hk_power.c), from its thread before the processor's interrupts are masked, and after
+ * they are back: every group at its lowest row and the memory's vote at ddr_sleep= (default 0, no request: the
+ * memory at its floor) for the sleep; on the way out the memory's vote as for a busy screen and every group at its
+ * top for a moment, the governor taking over from its next tick. Without the governor (cpufreq_gov=0) the rows
+ * go back to the thermal service's ceiling.
+ */
+static uint32_t gov_ddr_sleep;
+
+void
+hk_cpufreq_sleep(bool asleep)
+{
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		if (epss_top[d] >= 0) {
+			epss_set(d, asleep ? 0 : epss_cap[d]);
+		}
+	}
+	if (!asleep) {
+		hk_cpufreq_boost();
+	}
+	if (!gov_ddr(asleep ? gov_ddr_sleep : gov_ddr_high)) {
+		tell("cpufreq: the memory's vote is being written by the governor: left as it is for the %s\n",
+		    asleep ? "sleep" : "wake");
+	}
+}
+
+static void
+gov_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	uint64_t idle_before[MAX_CPUS] = { 0 }, then, busy_at;
+
+	delay_for_interval(GOV_START_SECONDS * 1000, NSEC_PER_MSEC);
+	then = busy_at = mach_absolute_time();
+	for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+		ml_cpu_idle_time((int)i, &idle_before[i]);
+	}
+	os_atomic_store(&gov_on, true, release);
+	tell("cpufreq: the governor takes over: rows follow the load (ddr %u busy, %u idle, %u screen off)\n",
+	    gov_ddr_high, gov_ddr_idle, gov_ddr_dark);
+	for (;;) {
+		uint32_t busy[EPSS_DOMAINS] = { 0 };
+		bool dark = os_atomic_load(&gov_dark, relaxed), boosted, active = false;
+		uint64_t now, span;
+
+		tsleep(&gov_event, PZERO, "cpufreq", MAX(1, (dark ? GOV_TICK_DARK_MS : GOV_TICK_MS) * hz / 1000));
+		now = mach_absolute_time();
+		span = now - then;
+		then = now;
+		if (span == 0) {
+			continue;
+		}
+		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+			uint64_t idle = 0, spent;
+			uint32_t d = domain_of(topology->cpus[i].phys_id);
+
+			if (!ml_cpu_idle_time((int)i, &idle)) {
+				continue;
+			}
+			spent = idle - idle_before[i];
+			idle_before[i] = idle;
+			if (!ml_cpu_online((int)i) || d >= EPSS_DOMAINS) {
+				continue;               /* (switched off, or not started yet: no load of its own) */
+			}
+			busy[d] = MAX(busy[d], (uint32_t)(span > spent ? (span - spent) * 100 / span : 0));
+		}
+		boosted = now < os_atomic_load(&gov_boost_until, relaxed);
+		for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+			uint64_t want;
+			int target = 0;
+
+			if (epss_top[d] < 0) {
+				continue;
+			}
+			want = (uint64_t)epss_khz[d][epss_row[d]] * busy[d] * (busy[d] >= 90 ? 200 : 125) / 10000;
+			while (target < epss_top[d] && epss_khz[d][target] < want) {
+				target++;
+			}
+			if (boosted) {
+				target = epss_top[d];
+			}
+			if (target < epss_row[d] - GOV_DOWN_ROWS) {
+				target = epss_row[d] - GOV_DOWN_ROWS;
+			}
+			if (target != epss_row[d]) {
+				epss_set(d, target);
+			}
+			active |= busy[d] >= 50 || epss_row[d] > epss_top[d] / 2;
+			gov_row_sum[d] += (uint64_t)epss_row[d];
+		}
+		active |= boosted || hk_gpu_speed_level() > 1;
+		if (active) {
+			busy_at = now;
+		}
+		if (dark) {
+			gov_ddr(gov_ddr_dark);
+		} else {
+			uint64_t ms;
+
+			absolutetime_to_nanoseconds(now - busy_at, &ms);
+			gov_ddr(ms / NSEC_PER_MSEC < GOV_DDR_IDLE_MS ? gov_ddr_high : gov_ddr_idle);
+		}
+		if (++gov_ticks % (60000 / GOV_TICK_MS) == 0) {
+			tell("cpufreq: over the last %llu ticks the groups ran at rows %llu/%d %llu/%d %llu/%d on average; memory vote %u "
+			    "(%llu changes)\n", (uint64_t)(60000 / GOV_TICK_MS), gov_row_sum[0] / (60000 / GOV_TICK_MS), epss_top[0],
+			    gov_row_sum[1] / (60000 / GOV_TICK_MS), epss_top[1], gov_row_sum[2] / (60000 / GOV_TICK_MS), epss_top[2],
+			    gov_ddr_now, gov_ddr_changes);
+			bzero(gov_row_sum, sizeof(gov_row_sum));
+		}
+	}
+}
+
+static void
+gov_start(void)
+{
+	uint32_t on = 1;
+	thread_t thread;
+
+	PE_parse_boot_argn("cpufreq_gov", &on, sizeof(on));
+	PE_parse_boot_argn("ddr_vote", &gov_ddr_high, sizeof(gov_ddr_high));
+	PE_parse_boot_argn("ddr_idle", &gov_ddr_idle, sizeof(gov_ddr_idle));
+	PE_parse_boot_argn("ddr_dark", &gov_ddr_dark, sizeof(gov_ddr_dark));
+	PE_parse_boot_argn("ddr_sleep", &gov_ddr_sleep, sizeof(gov_ddr_sleep));
+	gov_ddr_sleep = MIN(gov_ddr_sleep, 0x3fff);
+	gov_ddr_now = ddr_voted ? gov_ddr_high : 0;     /* (what ddr_raise() voted, from the same ddr_vote=) */
+	gov_ddr_high = MIN(gov_ddr_high, 0x3fff);
+	gov_ddr_idle = MIN(gov_ddr_idle, gov_ddr_high);
+	gov_ddr_dark = MIN(gov_ddr_dark, gov_ddr_high);
+	if (!on) {
+		return;
+	}
+	if (kernel_thread_start_priority(gov_thread, NULL, 93, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "cpufreq governor");
+		thread_deallocate(thread);
+	}
+}
+
 void
 hk_cpufreq_init(void)
 {
@@ -630,6 +884,7 @@ hk_cpufreq_init(void)
 		}
 	}
 	printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
+	gov_start();
 	if (PE_parse_boot_argn("membench", &enabled, sizeof(enabled)) && enabled == 1) {
 		memory_bench();
 	} else if (enabled == 2) {

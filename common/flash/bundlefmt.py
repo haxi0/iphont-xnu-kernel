@@ -27,6 +27,7 @@ Boot state (HKSTATE1):
   16  u32 tries                how many times in a row it started that one without it coming up
   20  u32 flags                bit 0: hold -- the user asked for the previous version (flashctl rollback)
                                bit 1: the last choice in the menu was Android (the countdown's default)
+                               bit 2: switched off with the cable in (the next start, by the cable: off-mode charging)
   24  u64 good                 the last generation that came up (userland: var_store bootok)
   32  u64 boots                every start of HackiOS the loader made
   40  u64 bad                  a generation given up on (MAX_TRIES starts, never up): the countdown skips it
@@ -42,6 +43,7 @@ HEADER_MAGIC, STATE_MAGIC = b'HKBOOT02', b'HKSTATE1'
 FLAG_SIGNED = 1
 STATE_HOLD = 1
 STATE_LAST_ANDROID = 2
+STATE_OFF_CHARGING = 4
 
 
 def fnv(data, h=0xcbf29ce484222325):

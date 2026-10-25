@@ -20,6 +20,8 @@ extern "C" {
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 
+#include <IOKit/pwr_mgt/RootDomain.h>
+#include <IOKit/pwr_mgt/IOPM.h>
 #include "MiniDrivers.h"
 
 extern "C" {
@@ -156,11 +158,33 @@ GenericARMCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
 	return psci_smp_start_cpu((int)getCPUNumber());
 }
 
+/* bsd/dev/hk_power.c: the system's sleep on the boot processor; NULL where the platform does not sleep */
+extern "C" const char * hk_power_sleep(void);
+extern "C" void hk_power_set_wake(uint64_t seconds_from_now);
+extern void IOCPUSleepKernel(void);     /* (iokit/Kernel/IOCPU.cpp) */
+extern "C" uint32_t gic_v3_spi_enabled_count(void);
+extern "C" kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern "C" void gic_v3_spi_detach(uint32_t intid);
+extern "C" void loader_log_line(const char *line);
+
 void
 GenericARMCPU::haltCPU(void)
 {
 	if (getCPUNumber() != (UInt32)master_cpu) {
 		processor_exit(machProcessor);
+		return;
+	}
+	/*
+	 * The boot processor, last, in IOCPUSleepKernel(): the system sleeps here, every other processor switched off,
+	 * and comes back out of hk_power_sleep() when something wakes it -- which IOPMrootDomain is told.
+	 */
+	if (!ml_is_quiescing()) {
+		return;                 /* (only IOCPUSleepKernel() halts the boot processor for a sleep) */
+	}
+	const char * reason = hk_power_sleep();
+
+	if (reason != NULL) {
+		getPMRootDomain()->claimSystemWakeEvent(this, kIOPMWakeEventSource, reason);
 	}
 }
 
@@ -190,6 +214,7 @@ public:
 	virtual bool getMachineName(char * name, int maxLength) APPLE_KEXT_OVERRIDE;
 	virtual long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
 	virtual void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+	IOReturn pmSetting(const OSSymbol * type, OSObject * value, uintptr_t refcon);
 };
 
 #define super IODTPlatformExpert
@@ -298,6 +323,49 @@ GenericARMPE::start(IOService * provider)
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */
 	registerService();
 
+	/*
+	 * sleep_test=S (with syssleep=1 and sleep_max=): the platform's sleep sleep_test_count times (default 3), S
+	 * seconds apart, here, before the system goes on -- straight through IOCPUSleepKernel(), the processors off and
+	 * back, the clock frozen and thawed -- without IOPMrootDomain or a userland: for QEMU, whose root has none.
+	 */
+	uint32_t sleep_test = 0, sleep_test_count = 3;
+
+	if (PE_parse_boot_argn("sleep_test", &sleep_test, sizeof(sleep_test)) && sleep_test != 0) {
+		PE_parse_boot_argn("sleep_test_count", &sleep_test_count, sizeof(sleep_test_count));
+		/* a shared interrupt of a driver, as the display's or the GPU's is: it has to be on again after every sleep */
+		bool attached = gic_v3_spi_attach(200, true, [](void *, uint32_t) {}, NULL) == KERN_SUCCESS;
+
+		for (uint32_t i = 0; i < sleep_test_count; i++) {
+			char line[96];
+
+			IOSleep(sleep_test * 1000);
+			uint32_t spis = gic_v3_spi_enabled_count();
+
+			snprintf(line, sizeof(line), "sleep_test: sleep %u of %u, %u processors running, %u shared interrupts on\n", i + 1,
+			    sleep_test_count, processor_avail_count, spis);
+			loader_log_line(line);
+			IOCPUSleepKernel();
+			snprintf(line, sizeof(line), "sleep_test: back from sleep %u, %u processors running, %u shared interrupts on%s\n",
+			    i + 1, processor_avail_count, gic_v3_spi_enabled_count(),
+			    gic_v3_spi_enabled_count() == spis ? "" : ": NOT AS BEFORE");
+			loader_log_line(line);
+		}
+		if (attached) {
+			gic_v3_spi_detach(200);
+		}
+	}
+
+	/* the wake iOS schedules (IOPMSchedulePowerEvent: powerd sets "wake", seconds from now) for the system's sleep */
+	const OSSymbol * settings[] = { OSSymbol::withCString(kIOPMSettingAutoWakeSecondsKey), NULL };
+	OSObject * handle = NULL;
+
+	if (getPMRootDomain() != NULL && settings[0] != NULL &&
+	    getPMRootDomain()->registerPMSettingController(settings, OSMemberFunctionCast(IOPMSettingControllerCallback, this,
+	    &GenericARMPE::pmSetting), this, 0, &handle) != kIOReturnSuccess) {
+		IOLog("GenericARMPE: no PM setting \"wake\": scheduled wakes are not kept\n");
+	}
+	OSSafeReleaseNULL(settings[0]);
+
 	/* Stand-ins for the closed graphics drivers that the iOS window server talks to. */
 	MiniIOSurfaceStart(this);
 	MiniIOMobileFramebufferStart(this);
@@ -312,9 +380,25 @@ GenericARMPE::start(IOService * provider)
  * host scripts) or, failing that, the property boot-epoch of /chosen (the loader, from the
  * firmware's clock) -- and the kernel's own timer counts from there. Without either the
  * calendar starts in 1970, as before.
+ *
+ * The timer is the hardware counter, not mach_absolute_time(): that one stops while the system
+ * sleeps (ml_sleep_timebase_freeze(), bsd/dev/hk_power.c), and this clock is what the wake
+ * measures the sleep by (clock_wakeup_calendar()), as an iPhone's real-time clock.
  */
 static long gBootEpoch;         /* the calendar time at which the system timer read zero */
 static bool gBootEpochKnown;
+
+extern "C" uint64_t ml_get_hwclock(void);
+
+/* seconds of the hardware counter, which counts through the system's sleep */
+static clock_sec_t
+counterSeconds(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(ml_get_hwclock(), &ns);
+	return (clock_sec_t) (ns / NSEC_PER_SEC);
+}
 
 static void
 findBootEpoch(void)
@@ -335,36 +419,36 @@ findBootEpoch(void)
 		OSSafeReleaseNULL(chosen);
 	}
 	if (epoch != 0) {
-		clock_sec_t secs;
-		clock_usec_t usecs;
-
-		clock_get_system_microtime(&secs, &usecs);
-		gBootEpoch = (long) epoch - (long) secs;
+		gBootEpoch = (long) epoch - (long) counterSeconds();
 	}
+}
+
+/* IOPMrootDomain: "wake", seconds from now (0: none) */
+IOReturn
+GenericARMPE::pmSetting(const OSSymbol * type, OSObject * value, uintptr_t refcon __unused)
+{
+	OSNumber * number = OSDynamicCast(OSNumber, value);
+
+	if (type != NULL && type->isEqualTo(kIOPMSettingAutoWakeSecondsKey) && number != NULL) {
+		hk_power_set_wake(number->unsigned64BitValue());
+	}
+	return kIOReturnSuccess;
 }
 
 long
 GenericARMPE::getGMTTimeOfDay(void)
 {
-	clock_sec_t secs;
-	clock_usec_t usecs;
-
 	findBootEpoch();
 	if (gBootEpoch == 0) {
 		return 0;
 	}
-	clock_get_system_microtime(&secs, &usecs);
-	return gBootEpoch + (long) secs;
+	return gBootEpoch + (long) counterSeconds();
 }
 
 void
 GenericARMPE::setGMTTimeOfDay(long secs)
 {
-	clock_sec_t uptime;
-	clock_usec_t usecs;
-
-	clock_get_system_microtime(&uptime, &usecs);
-	gBootEpoch = secs - (long) uptime;
+	gBootEpoch = secs - (long) counterSeconds();
 	gBootEpochKnown = true;
 }
 

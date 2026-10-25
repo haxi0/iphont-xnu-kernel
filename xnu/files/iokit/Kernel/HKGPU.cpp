@@ -261,6 +261,24 @@ static uint32_t gSpeedCalm;             /* (gGPULock) periods in a row under GPU
 static uint64_t gSpeedSlowest;          /* (gGPULock) the longest a change took, since the last five-second line */
 static bool gGPUReported;
 
+/* The level asked for last (bsd/dev/hk_cpufreq.c: the memory's bandwidth stays up while the GPU is above its lowest) */
+extern "C" uint32_t
+hk_gpu_speed_level(void)
+{
+	return gSpeedLevel;
+}
+
+extern "C" bool hk_display_on(void);   /* (MiniIOMobileFramebuffer.cpp) */
+
+/* The screen lit again (bsd/dev/hk_power.c): the speed looked at now, not up to a second later */
+extern "C" void
+hk_gpu_speed_kick(void)
+{
+	if (gSpeedCall != NULL) {
+		thread_call_enter(gSpeedCall);
+	}
+}
+
 static void
 gpuSpeed(thread_call_param_t, thread_call_param_t)
 {
@@ -310,7 +328,8 @@ gpuSpeed(thread_call_param_t, thread_call_param_t)
 	}
 	IOLockUnlock(gGPULock);
 	if (again) {
-		clock_interval_to_deadline(GPU_SPEED_MS, kMillisecondScale, &deadline);
+		/* (with the screen off and the GPU at its lowest, a look a second: nothing is drawn) */
+		clock_interval_to_deadline(!hk_display_on() && gSpeedLevel <= 1 ? 1000 : GPU_SPEED_MS, kMillisecondScale, &deadline);
 		thread_call_enter_delayed(gSpeedCall, deadline);
 	}
 }

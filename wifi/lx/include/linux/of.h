@@ -51,6 +51,10 @@ struct device_node *of_get_child_by_name(const struct device_node *np, const cha
 struct device_node *of_find_node_by_phandle(phandle handle);
 struct device_node *of_parse_phandle(const struct device_node *np, const char *name, int index);
 const struct of_device_id *of_match_node(const struct of_device_id *matches, const struct device_node *np);
+struct resource;
+/* (asked only for a radio whose memory is a fixed region of the tree: none here, see src/lx_pci.c) */
+struct device_node *of_find_node_by_type(struct device_node *from, const char *type);
+int of_address_to_resource(struct device_node *np, int index, struct resource *r);
 
 static inline int
 of_property_read_u32(const struct device_node *np, const char *name, u32 *out)

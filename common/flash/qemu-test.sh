@@ -152,6 +152,16 @@ s = f.parse_state(sys.stdin.buffer.read()); sys.exit(0 if s and s['flags'] & f.S
 		disk; slot $W/gen1.img 0; slot $W/gen2.img 1; state 2 0 2 0 2
 		run $L "" "ab: slots exchanged|ab: not exactly|ab: no unit|flash: booting slot"
 		expect remembered "menu: Android \(countdown\)" "ab: slots exchanged" "!booting slot" ;;
+	off-charging)
+		# switched off with the cable in last time; this start is not the cable's (no PMIC here): the flag is
+		# cleared, the countdown boots as ever
+		disk; slot $W/gen1.img 0; slot $W/gen2.img 1; state 2 0 2 0 4
+		run $L "" "flash: booting slot"
+		expect off-charging "switched off on the charger last time" "booting slot 1, generation 2" "!off-mode charging \("
+		dd if=$W/disk.img bs=512 skip=$((DARWIN_START + 2091520 * 8)) count=1 status=none | python3 -c "
+import sys; sys.path.insert(0, 'common/flash'); import bundlefmt as f
+s = f.parse_state(sys.stdin.buffer.read()); sys.exit(0 if s and not s['flags'] & f.STATE_OFF_CHARGING else 1)" ||
+			{ echo "   the flag was not cleared"; FAIL=$((FAIL+1)); FAILED="$FAILED off-charging-flag"; } ;;
 	not-ours)
 		disk; slot $W/gen1.img 0
 		# Android's slot _b active, ours _a inactive
@@ -234,7 +244,7 @@ s = f.parse_state(sys.stdin.buffer.read()); print('none' if s is None else 'tryi
 	esac
 }
 
-ALL="boot previous guard fallback android remembered not-ours tampered signed forged file file-nomark no-android"
+ALL="boot previous guard fallback android remembered off-charging not-ours tampered signed forged file file-nomark no-android"
 [ $# -gt 0 ] || set -- $ALL
 for s in "$@"; do scenario "$s"; done
 echo "qemu-test: $PASS passed, $FAIL failed${FAILED:+:$FAILED}"
