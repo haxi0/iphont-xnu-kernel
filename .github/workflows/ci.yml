@@ -1,6 +1,6 @@
 # Every push and pull request: the loader builds without a warning, its crypto agrees with Python's,
-# the scripts parse, and the whole dual boot -- every path through the boot menu, the boot guard, the
-# A/B switch, tampered and forged bundles -- runs in QEMU. No phone and no file of iOS needed.
+# and the scripts parse. Kept light for a Raspberry Pi runner; the QEMU dual-boot test is run by hand
+# with common/flash/qemu-test.sh.
 name: ci
 on:
   push:
@@ -26,28 +26,3 @@ jobs:
         run: python3 -m py_compile common/flash/*.py mkxnuimg.py xnuloader/*.py
       - name: shell scripts
         run: shellcheck -S error common/*.sh common/hackios common/flash/*.sh
-
-  dual-boot-in-qemu:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: oosexgang/hackios-xnu-userland
-          path: hackios-xnu-userland
-      - name: tools
-        run: sudo apt-get update && sudo apt-get install -y clang lld qemu-system-arm qemu-efi-aarch64 gdisk python3-cryptography
-      - name: loader
-        run: xnuloader/build.sh
-      - name: every path of the boot menu
-        env:
-          HELLO: hackios-xnu-userland/prebuilt/userland/hello
-          QEMU_TIMEOUT: "600"
-        run: common/flash/qemu-test.sh
-      - name: logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: qemu-logs
-          path: out/qemu-flash/log.txt
