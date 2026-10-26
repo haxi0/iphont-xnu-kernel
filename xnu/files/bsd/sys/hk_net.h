@@ -53,6 +53,8 @@ bool hk_net_attach(const struct hk_net_link *link);
 void hk_net_input(const uint8_t *frame, size_t length);
 /* Frames can pass now / can no longer pass. */
 void hk_net_link_state(bool up);
+/* The interface's address from now on (a radio's private address for a network; the IOKit controller's stays the hardware's) */
+void hk_net_address(const uint8_t address[6]);
 
 void hk_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
 /* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: hk_apple80211.c */

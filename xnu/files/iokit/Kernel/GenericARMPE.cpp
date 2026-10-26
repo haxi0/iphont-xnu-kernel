@@ -28,6 +28,9 @@ extern "C" {
 kern_return_t processor_start(processor_t processor);
 kern_return_t processor_exit(processor_t processor);
 extern uint32_t processor_avail_count;
+extern char sched_string[];     /* (osfmk/kern/sched_prim.c: the scheduler in use) */
+void hk_perfctl_init(void);
+void hk_sched_check_start(void);
 
 /* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
 void psci_smp_init(void);
@@ -111,7 +114,8 @@ GenericARMCPU::start(IOService * provider)
 
 	setCPUState(kIOCPUStateUninitalized);
 	registerService();
-	IOLog("GenericARMCPU: cpu %u (phys id 0x%x) registered\n", (unsigned)getCPUNumber(), physID);
+	IOLog("GenericARMCPU: cpu %u (phys id 0x%x) registered, cluster %u (%s)\n", (unsigned)getCPUNumber(), physID,
+	    topology->cluster_id, topology->cluster_type == CLUSTER_TYPE_E ? "E" : topology->cluster_type == CLUSTER_TYPE_P ? "P" : "SMP");
 	return true;
 }
 
@@ -281,21 +285,48 @@ GenericARMPE::start(IOService * provider)
 			psci_smp_init();
 		}
 		/*
+		 * Every processor is registered, so every processor set (cluster) exists: what AppleARMCPU tells the
+		 * scheduler at this point on an iPhone. The Edge scheduler sets its migration graph between the
+		 * clusters here (sched_edge_cpu_init_completed()); without it no thread would ever leave the boot cluster.
+		 */
+		ml_cpu_init_completed();
+		{
+			const ml_topology_info_t * t = ml_get_topology_info();
+			char line[200];
+			int at = snprintf(line, sizeof(line), "GenericARMPE: scheduler %s on %u cluster(s) of %u processors:", sched_string,
+			    t->num_clusters, count);
+
+			for (unsigned int c = 0; c < t->num_clusters && at < (int)sizeof(line); c++) {
+				at += snprintf(line + at, sizeof(line) - at, " %u %s cpus 0x%llx;", t->clusters[c].cluster_id,
+				    t->clusters[c].cluster_type == CLUSTER_TYPE_E ? "E" : t->clusters[c].cluster_type == CLUSTER_TYPE_P ? "P" : "SMP",
+				    t->clusters[c].cpu_mask);
+			}
+			IOLog("%s\n", line);
+			strlcat(line, "\n", sizeof(line));
+			loader_log_line(line);  /* (the kernel's own log of a run keeps only its end) */
+		}
+		/*
 		 * The slower cores (an L2 access penalty, the loader's "small-core") are started 28 seconds
 		 * later (boot-arg small_cores_after=S; 0: at once). With all seven from the start the lock
 		 * screen came 1.5 s later than with the four big ones alone (26.5-27.0 s after the kernel
 		 * began instead of 25.3-25.5: start-up's other work shares memory and cache with
 		 * SpringBoard's), while that work as a whole was done earlier (34 s instead of 38). With
-		 * the slower cores joining once the lock screen is there: 25.3 s and 36 s.
+		 * the slower cores joining once the lock screen is there: 25.3 s and 36 s. With the Edge scheduler the
+		 * slower cores are those of the E clusters: until they start, the scheduler counts their clusters out
+		 * (no processor available) and puts what prefers them on the P clusters.
 		 */
 		uint32_t later = 28;
 		static thread_call_t later_call;
+		static auto slower = [](unsigned int number) {
+			const ml_topology_cpu_t * c = &ml_get_topology_info()->cpus[number];
+			return c->l2_access_penalty != 0 || c->cluster_type == CLUSTER_TYPE_E;
+		};
 
 		PE_parse_boot_argn("small_cores_after", &later, sizeof(later));
 		cpus[master_cpu]->run();
 		for (unsigned int number = 0; number < MAX_CPUS; number++) {
 			if (cpus[number] != NULL && number != (unsigned int)master_cpu) {
-				if (later != 0 && ml_get_topology_info()->cpus[number].l2_access_penalty != 0) {
+				if (later != 0 && slower(number)) {
 					continue;
 				}
 				cpus[number]->run();
@@ -306,7 +337,7 @@ GenericARMPE::start(IOService * provider)
 
 			later_call = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
 				for (unsigned int number = 0; number < MAX_CPUS; number++) {
-					if (cpus[number] != NULL && ml_get_topology_info()->cpus[number].l2_access_penalty != 0) {
+					if (cpus[number] != NULL && slower(number)) {
 						cpus[number]->run();
 					}
 				}
@@ -318,6 +349,9 @@ GenericARMPE::start(IOService * provider)
 		if (count > 1) {
 			IOLog("GenericARMPE: %u of %u processors are running\n", processor_avail_count, count);
 		}
+		/* the Edge scheduler's performance controller (bsd/dev/hk_perfctl.c), once the clusters exist */
+		hk_perfctl_init();
+		hk_sched_check_start();         /* (boot-arg sched_check=1: bsd/dev/hk_sched_check.c) */
 	}
 
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */
@@ -370,6 +404,7 @@ GenericARMPE::start(IOService * provider)
 	MiniIOSurfaceStart(this);
 	MiniIOMobileFramebufferStart(this);
 	MiniAppleKeyStoreStart();
+	MiniAppleARMBacklightStart();
 	MiniIONetworkStackStart();
 	return true;
 }

@@ -21,6 +21,7 @@ to the next one or 2.5 s later -- is a segment; for each:
 The thresholds are as the coordinator asked for them; 18.0 rather than 16.7 because a frame of a steady
 60 comes 16.6 to 16.8 ms after the one before.
 """
+import bisect
 import sys
 
 OVER_ONE, OVER_TWO, SEGMENT_US = 18000, 34500, 2500000
@@ -42,11 +43,10 @@ def lines_of(paths):
     return out
 
 
-def main():
-    if len(sys.argv) < 2:
-        sys.exit(__doc__)
+def parse(paths):
+    """(gestures, timeline, waits, loads) of the logs: every frame on the panel with the drawing it came from."""
     gestures, frames, swaps, shows, waits, loads = [], [], {}, {}, [], []
-    for line in lines_of(sys.argv[1:]):
+    for line in lines_of(paths):
         w = line.split()
         try:
             if w[1] == 'p' and len(w) >= 8 and int(w[2]) in (1, 4):
@@ -66,18 +66,26 @@ def main():
     gestures.sort()
     frames.sort(key=lambda f: f[1])
     # every frame on the panel, with the drawing it came from
+    ends = [f[1] for f in frames]
     timeline = []
     for sid in sorted(shows):
         if sid not in swaps:
             continue
         swap = swaps[sid]
-        drawn = [f for f in frames if f[1] <= swap]
-        if not drawn:
+        at = bisect.bisect_right(ends, swap)        # (the last drawing that ended by the swap)
+        if at == 0:
             continue
-        began, ended, draws = drawn[-1]
+        began, ended, draws = frames[at - 1]
         ready, shown, done = shows[sid]
         timeline.append(dict(began=began, ended=ended, swap=swap, ready=ready, shown=shown, done=done))
     timeline.sort(key=lambda f: f['done'])
+    return gestures, timeline, waits, loads
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    gestures, timeline, waits, loads = parse(sys.argv[1:])
     all_counts = [0, 0, 0]
     kinds, previous = {}, ''          # the same gesture done more than once: its frames together
     print(f'frames.py: {len(gestures)} gestures, {len(timeline)} frames on the panel, {len(waits)} waits for the GPU '

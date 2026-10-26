@@ -79,10 +79,10 @@ index 4b83160780c3..d6bb1edb1aae 100644
  
  #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..1d7727b57456 100644
+index 44274016a4cf..be89ffb15144 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,46 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,49 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -95,6 +95,7 @@ index 44274016a4cf..1d7727b57456 100644
 +bsd/dev/instantnoodle_battery.c	standard
 +bsd/dev/instantnoodle_speaker.c	standard
 +bsd/dev/instantnoodle_slider.c	standard
++bsd/dev/instantnoodle_wifi.c	standard
 +bsd/dev/hk_battery.c	standard
 +bsd/dev/hk_ufs.c	standard
 +bsd/dev/hk_ufshc.c	standard
@@ -102,6 +103,8 @@ index 44274016a4cf..1d7727b57456 100644
 +bsd/dev/hk_virtio_net.c	standard
 +bsd/dev/hk_apple80211.c	standard
 +bsd/dev/hk_cpufreq.c	standard
++bsd/dev/hk_perfctl.c	standard
++bsd/dev/hk_sched_check.c	standard
 +bsd/dev/hk_thermal.c	standard
 +bsd/dev/hk_power.c	standard
 +bsd/dev/hk_display.c	standard
@@ -129,7 +132,7 @@ index 44274016a4cf..1d7727b57456 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +195,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +198,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -185,7 +188,7 @@ index 44274016a4cf..1d7727b57456 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +450,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +453,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -193,7 +196,7 @@ index 44274016a4cf..1d7727b57456 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +473,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +476,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -201,6 +204,12 @@ index 44274016a4cf..1d7727b57456 100644
  bsd/kern/kern_event.c			standard
  bsd/kern/kern_control.c			optional networking
  bsd/kern/kern_exec.c			standard
+@@ -594,3 +688,5 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
++
++bsd/dev/iphont.c standard
 diff --git a/bsd/dev/arm/km.c b/bsd/dev/arm/km.c
 index fd7a94b20794..354c22752747 100644
 --- a/bsd/dev/arm/km.c
@@ -468,7 +477,7 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..e9713782628b 100644
+index 4df41ba1f61b..7ba14e6d1a68 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -147,6 +147,13 @@
@@ -507,11 +516,13 @@ index 4df41ba1f61b..e9713782628b 100644
  #if CONFIG_PROC_UUID_POLICY
  	/* Initial proc_uuid_policy subsystem */
  	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
-@@ -976,6 +989,14 @@ bsd_init(void)
+@@ -976,6 +989,16 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		hk_input_init();           /* /dev/hk-touch */
++		extern void iphont_init(void);
++		iphont_init();
 +		hk_audio_init();           /* /dev/hk-audio */
 +		hk_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
 +		hk_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
@@ -876,6 +887,19 @@ index 1d71c66629fb..3e1737c21b86 100644
  	if (0 == error) {
  		/*
  		 * Update the new process's signature-dependent process state.
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 1161432246f9..fd880f59236f 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1468,6 +1468,8 @@ int
+ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, boolean_t perf_notify,
+     int jetsam_flags, struct os_reason *exit_reason)
+ {
++	extern void iphont_event(unsigned, unsigned, unsigned, uint64_t, uint64_t);
++	iphont_event(1, 1, 100, proc_pid(p), (uint64_t)rv);
+ 	thread_t self = current_thread();
+ 	struct task *task = proc_task(p);
+ 	struct uthread *ut;
 diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
 index 1750d3a52d3c..9947cb2421da 100644
 --- a/bsd/kern/kern_memorystatus.c
@@ -1194,6 +1218,18 @@ index 6ae9b6bc3fde..58556c324b67 100644
  	struct vnode_attr attr, va, *vap = &va;
  	int len, nlen, rem, xfer, error, attrerr, gotfh, gotattr;
  	int siz, dircount, maxcount, fullsiz, eofflag, dirlen, nentries, isdotdot;
+diff --git a/bsd/sys/Makefile b/bsd/sys/Makefile
+index 3d349c164e65..1ca4d55e1026 100644
+--- a/bsd/sys/Makefile
++++ b/bsd/sys/Makefile
+@@ -172,6 +172,7 @@ KERNELFILES = \
+ # Installs header file for Apple internal use for kernel extensions -
+ #	  $(DSTROOT)/System/Library/Frameworks/Kernel.framework/PrivateHeaders
+ PRIVATE_KERNELFILES = \
++	iphont.h \
+ 	acct.h \
+ 	codesign.h \
+ 	cprotect.h \
 diff --git a/bsd/sys/disk.h b/bsd/sys/disk.h
 index 82efb4fcc000..47a4cd98e59f 100644
 --- a/bsd/sys/disk.h
@@ -1619,7 +1655,7 @@ index 07147cb3188b..c952e4318cf8 100644
  options		FDESC		# fdesc_fs support		# <fdesc>
  options		DEVFS		# devfs support			# <devfs>
 diff --git a/config/MASTER.arm64.bcm2837 b/config/MASTER.arm64.bcm2837
-index 1ed75eea2052..d57a19ae50e2 100644
+index 1ed75eea2052..90c0c1c694b6 100644
 --- a/config/MASTER.arm64.bcm2837
 +++ b/config/MASTER.arm64.bcm2837
 @@ -16,15 +16,15 @@
@@ -1642,9 +1678,12 @@ index 1ed75eea2052..d57a19ae50e2 100644
  #  FILESYS_RELEASE= [ FILESYS_BASE ]
  #  FILESYS_DEV =    [ FILESYS_BASE config_union_mounts fdesc ]
  #  FILESYS_DEBUG =  [ FILESYS_BASE config_union_mounts fdesc ]
-@@ -50,8 +50,8 @@
+@@ -48,10 +48,10 @@
+ #  LIBKERN_RELEASE =[ LIBKERN_BASE ]
+ #  LIBKERN_DEV =    [ LIBKERN_BASE iotracking ]
  #  LIBKERN_DEBUG =  [ LIBKERN_BASE iotracking ]
- #  PERF_DBG_BASE =  [ mach_kdp config_serial_kdp kperf kpc ]
+-#  PERF_DBG_BASE =  [ mach_kdp config_serial_kdp kperf kpc ]
++#  PERF_DBG_BASE =  [ mach_kdp config_serial_kdp kperf kpc config_pervasive_energy ]
  #  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
 -#  PERF_DBG_DEV =   [ PERF_DBG_BASE config_dtrace zleaks kdp_interactive_debugging alternate_debugger sched_hygiene_debug config_iotrace]
 -#  PERF_DBG_DEBUG = [ PERF_DBG_BASE config_dtrace zleaks kdp_interactive_debugging alternate_debugger sched_hygiene_debug config_iotrace]
@@ -1761,10 +1800,22 @@ index 7a32a23e4bb1..35dc7b503846 100644
  	if (entry) {
  		OSData * data1;
 diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
-index d2442944e5f0..e90ba6738516 100644
+index d2442944e5f0..470188d6ea84 100644
 --- a/iokit/Kernel/IOService.cpp
 +++ b/iokit/Kernel/IOService.cpp
-@@ -5179,7 +5179,10 @@ IOService::setRootMedia(IOService * root)
+@@ -1010,9 +1010,11 @@ IOService::detach( IOService * provider )
+  * Register instance - publish it for matching
+  */
+ 
++extern "C" void iphont_event(unsigned, unsigned, unsigned, uint64_t, uint64_t);
+ void
+ IOService::registerService( IOOptionBits options )
+ {
++	iphont_event(3, 1, 1, getRegistryEntryID(), options);
+ 	OSDataAllocation<char> pathBuf;
+ 	const char *        path;
+ 	char *              skip;
+@@ -5179,7 +5181,10 @@ IOService::setRootMedia(IOService * root)
  	bool unhide;
  
  	ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
@@ -1912,10 +1963,10 @@ index 5219fb0d9ed6..29978e9cff43 100644
  		}
  	}
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..dcb3847ce1c4 100644
+index 5fb0a52062e0..30d80f8217ea 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,14 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,15 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1926,10 +1977,17 @@ index 5fb0a52062e0..dcb3847ce1c4 100644
 +iokit/Kernel/HKWLAN.cpp			optional iokitcpp
 +iokit/Kernel/HKBattery.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
++iokit/Kernel/MiniAppleARMBacklight.cpp		optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp
+@@ -148,3 +157,5 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
+ 
+ # Skywalk
+ iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp skywalk
++
++iokit/Kernel/IPhont.cpp optional iokitcpp
 diff --git a/libkern/conf/files b/libkern/conf/files
 index ece14c7d41d3..4a903f73a9ef 100644
 --- a/libkern/conf/files
@@ -2231,6 +2289,45 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+diff --git a/osfmk/arm/machine_routines.h b/osfmk/arm/machine_routines.h
+index d04ecfa99982..d2bea7dd56ee 100644
+--- a/osfmk/arm/machine_routines.h
++++ b/osfmk/arm/machine_routines.h
+@@ -1283,6 +1283,34 @@ extern void sched_perfcontrol_thread_group_preferred_clusters_set(void *machine_
+ extern void sched_perfcontrol_edge_matrix_get(sched_clutch_edge *edge_matrix, bool *edge_request_bitmap, uint64_t flags, uint64_t matrix_order);
+ extern void sched_perfcontrol_edge_matrix_set(sched_clutch_edge *edge_matrix, bool *edge_changes_bitmap, uint64_t flags, uint64_t matrix_order);
+ 
++/*
++ * HackiOS: what the Edge scheduler knows of a cluster and has done between clusters, for the performance
++ * controller (bsd/dev/hk_perfctl.c) and its statistics. Apple's CLPC learns these through kdebug; ours reads them.
++ * By scheduling bucket: FIXPRI, FG, IN, DF, UT, BG (TH_BUCKET_*).
++ */
++#define SCHED_PERFCONTROL_MAX_CLUSTERS  4
++#define SCHED_PERFCONTROL_BUCKETS       6
++struct sched_edge_cluster_info {
++	uint32_t        available_cpus;                         /* online and recommended */
++	uint32_t        runnable;                               /* threads in its runqueues, bound ones included */
++	uint32_t        running_foreign;                        /* processors running a thread of the other core type */
++	uint32_t        load[SCHED_PERFCONTROL_BUCKETS];        /* the migration metric: expected latency, us (UINT32_MAX: unavailable) */
++	uint32_t        exec_us[SCHED_PERFCONTROL_BUCKETS];     /* average time a thread runs before it blocks or is preempted, us */
++};
++struct sched_edge_counters {
++	uint64_t        placed[SCHED_PERFCONTROL_MAX_CLUSTERS];                                /* threads made runnable, by preferred cluster */
++	uint64_t        placed_away[SCHED_PERFCONTROL_MAX_CLUSTERS][SCHED_PERFCONTROL_MAX_CLUSTERS];   /* ... put elsewhere: [preferred][chosen] */
++	uint64_t        steal[SCHED_PERFCONTROL_MAX_CLUSTERS][SCHED_PERFCONTROL_MAX_CLUSTERS];         /* runnable thread stolen [from][to] */
++	uint64_t        foreign_pull[SCHED_PERFCONTROL_MAX_CLUSTERS][SCHED_PERFCONTROL_MAX_CLUSTERS];  /* thread pulled home from a foreign cluster [from][to] */
++	uint64_t        rebalance_ipi[SCHED_PERFCONTROL_MAX_CLUSTERS];                         /* running foreign threads asked to leave, by the idle cluster */
++	uint64_t        amp_rebalance[SCHED_PERFCONTROL_MAX_CLUSTERS];                         /* quantum expired off home: round-robined back ("stir the pot") */
++	uint64_t        tg_migrated;                                                           /* threads moved at once by a preferred-cluster change */
++};
++extern bool sched_edge_cluster_info_get(uint32_t cluster_id, struct sched_edge_cluster_info *info);
++extern void sched_edge_counters_get(struct sched_edge_counters *counters);
++/* the cluster a thread promoted into the UI range by a turnstile prefers while its group's prefers E (UINT32_MAX: none) */
++extern void sched_edge_set_promotion_cluster(uint32_t cluster_id);
++
+ /*
+  * Update the deadline after which sched_perfcontrol_deadline_passed will be called.
+  * Returns TRUE if it successfully canceled a previously set callback,
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2341,6 +2438,46 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm/rtclock.c b/osfmk/arm/rtclock.c
+index 5989b4833493..dfa047196acc 100644
+--- a/osfmk/arm/rtclock.c
++++ b/osfmk/arm/rtclock.c
+@@ -37,6 +37,7 @@
+  *   real-time clock.
+  */
+ 
++#define HK_KPROF_SAMPLES 65536
+ #include <mach/mach_types.h>
+ 
+ #include <kern/clock.h>
+@@ -316,6 +317,11 @@ clock_timebase_info(mach_timebase_info_t info)
+ 	*info = rtclock_timebase_const;
+ }
+ 
++/* A sample of where the processors are in the kernel (kern.hackios.kprof): filled by the clock interrupts, read by a sysctl. */
++volatile uint32_t hk_kprof_on;
++uint32_t hk_kprof_next;
++uint64_t hk_kprof_pcs[HK_KPROF_SAMPLES];
++
+ /*
+  * Real-time clock device interrupt.
+  */
+@@ -365,6 +371,15 @@ rtclock_intr(__unused unsigned int is_user_context)
+ 		    user_mode ? pc : VM_KERNEL_UNSLIDE(pc), user_mode);
+ 	}
+ 
++	/* kern.hackios.kprof (bsd/dev/hk_cpufreq.c): where the processor was when the clock interrupted it */
++	if (__improbable(hk_kprof_on != 0)) {
++		uint32_t at = os_atomic_inc_orig(&hk_kprof_next, relaxed);
++
++		if (at < HK_KPROF_SAMPLES) {
++			hk_kprof_pcs[at] = user_mode ? 0 : (uint64_t) VM_KERNEL_UNSLIDE(pc);   /* (0: it was in a program) */
++		}
++	}
++
+ 	/* call the generic etimer */
+ 	timer_intr(user_mode, pc);
+ }
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2373,7 +2510,7 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..b5e1aa32548a 100644
+index e76e7e70ab9c..ce40444e5d1a 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
 @@ -734,6 +734,10 @@ ml_get_machine_mem(void)
@@ -2401,7 +2538,7 @@ index e76e7e70ab9c..b5e1aa32548a 100644
  	while (1) {
  		;
  	}
-@@ -932,6 +943,142 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -932,6 +943,260 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -2541,10 +2678,128 @@ index e76e7e70ab9c..b5e1aa32548a 100644
 +	return state == PROCESSOR_RUNNING || state == PROCESSOR_IDLE || state == PROCESSOR_DISPATCHING;
 +}
 +
++/*
++ * The clusters of an asymmetric board, for the Edge scheduler (boot-arg sched=edge, the default where the
++ * cores differ; sched=clutch: one processor set of all cores, the slower ones paired as above, as before).
++ *
++ * XNU's cluster is an Apple SoC's group of cores behind one ACC: one clock and voltage, one L2, one type
++ * (E or P). The Snapdragons' equivalent is the frequency domain (EPSS): the scheduler's processor set, the
++ * performance controller's unit of speed (bsd/dev/hk_perfctl.c) and of load are all it. Which core is in which
++ * domain is the board's description, as Linux's device tree has it (qcom,freq-domain): board_cpu_domains=
++ * (bsd/dev/hk_board.c), 4 bits a core by its number, lowest first; the default is both phones' (SM7325,
++ * SM8250: cores 0-3 domain 0, 4-6 domain 1, 7 domain 2, so 0x21110000). The type comes from the loader:
++ * "small-core" (the Cortex-A55s) is E, the others P. A board without small cores (QEMU) is one cluster
++ * unless board_cpu_domains= is given; board_small_cores= (a mask by core number) names small cores where
++ * the loader does not -- both are for testing the scheduler on QEMU, a phone needs neither.
++ */
++#define ML_DEFAULT_CPU_DOMAINS  0x21110000u
++extern uint32_t hk_board_number(const char *name, uint32_t dflt);
++
++static bool ml_amp_topology;            /* this run's clusters are frequency domains, typed E/P, run by the Edge scheduler */
++static uint32_t ml_cpu_domains;         /* board_cpu_domains */
++static uint32_t ml_small_core_mask;     /* board_small_cores, or the loader's "small-core" nodes */
++
++/* A core's number on its board: phones count in MPIDR Aff1 (Aff0 zero), QEMU in Aff0 (Aff1 zero) */
++static uint32_t
++ml_board_core(uint32_t phys_id)
++{
++	return ((phys_id >> MPIDR_AFF1_SHIFT) & 0xff) + (phys_id & 0xff);
++}
++
++static uint32_t
++ml_board_core_domain(uint32_t phys_id)
++{
++	uint32_t core = ml_board_core(phys_id);
++
++	return core < 8 ? (ml_cpu_domains >> (4 * core)) & 0xf : 0;
++}
++
++uint32_t ml_cpu_frequency_domain(int cpu_id);
++bool ml_cpu_topology_is_amp(void);
++
++/* The frequency domain of a processor (bsd/dev/hk_cpufreq.c's EPSS group), by the kernel's number for it */
++uint32_t
++ml_cpu_frequency_domain(int cpu_id)
++{
++	if (cpu_id < 0 || (unsigned)cpu_id >= topology_info.num_cpus) {
++		return 0;
++	}
++	return ml_board_core_domain(topology_info.cpus[cpu_id].phys_id);
++}
++
++bool
++ml_cpu_topology_is_amp(void)
++{
++	return ml_amp_topology;
++}
++
++bool ml_cpu_is_small_core(int cpu_id);
++
++/* A core the loader (or board_small_cores=) calls small: an E core, whichever scheduler runs */
++bool
++ml_cpu_is_small_core(int cpu_id)
++{
++	if (cpu_id < 0 || (unsigned)cpu_id >= topology_info.num_cpus) {
++		return false;
++	}
++	uint32_t core = ml_board_core(topology_info.cpus[cpu_id].phys_id);
++	return core < 32 && ((ml_small_core_mask >> core) & 1);
++}
++
++/*
++ * Before the processors are counted: which scheduler, and so which topology. Edge only where the cores
++ * of the device tree fall in more than one domain (with cpus=N fewer may be used: one is enough for Edge).
++ */
++static void
++ml_choose_scheduler(DTEntry cpus)
++{
++	OpaqueDTEntryIterator iter;
++	DTEntry child;
++	char sched[16] = "";
++	uint32_t domains_seen = 0, max_domain = 0;
++
++	ml_small_core_mask = hk_board_number("small_cores", 0);
++	PE_parse_boot_arg_str("sched", sched, sizeof(sched));
++	if (SecureDTInitEntryIterator(cpus, &iter) != kSuccess) {
++		return;
++	}
++	while (kSuccess == SecureDTIterateEntries(&iter, &child)) {
++		uint32_t phys = (uint32_t)ml_readprop(child, "reg", 0);
++
++		if (ml_readprop(child, "small-core", 0) != 0 && ml_board_core(phys) < 32) {
++			ml_small_core_mask |= 1u << ml_board_core(phys);
++		}
++	}
++	/* the board's domains: given, or the phones' where the loader says the cores differ */
++	ml_cpu_domains = hk_board_number("cpu_domains", ml_small_core_mask != 0 ? ML_DEFAULT_CPU_DOMAINS : 0);
++	if (SecureDTInitEntryIterator(cpus, &iter) != kSuccess) {
++		return;
++	}
++	while (kSuccess == SecureDTIterateEntries(&iter, &child)) {
++		uint32_t d = ml_board_core_domain((uint32_t)ml_readprop(child, "reg", 0));
++
++		domains_seen |= 1u << d;
++		max_domain = MAX(max_domain, d);
++	}
++#if CONFIG_SCHED_EDGE && HK_SCHED_SELECTABLE
++	ml_amp_topology = __builtin_popcount(domains_seen) > 1 && max_domain <= MAX_CPU_CLUSTER_PHY_ID &&
++	    strncmp(sched, "clutch", sizeof(sched)) != 0;
++	if (strncmp(sched, "edge", sizeof(sched)) == 0 && !ml_amp_topology) {
++		/* asked for, on cores all in one domain: Edge on one cluster (a test of the scheduler, QEMU) */
++		sched_select_dispatch(true);
++		return;
++	}
++	sched_select_dispatch(ml_amp_topology);
++#else
++	(void)domains_seen;
++	(void)max_domain;
++#endif
++}
++
  void
  ml_parse_cpu_topology(void)
  {
-@@ -945,6 +1092,7 @@ ml_parse_cpu_topology(void)
+@@ -945,6 +1210,7 @@ ml_parse_cpu_topology(void)
  	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
@@ -2552,7 +2807,16 @@ index e76e7e70ab9c..b5e1aa32548a 100644
  
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
-@@ -1005,6 +1153,20 @@ ml_parse_cpu_topology(void)
+@@ -955,6 +1221,8 @@ ml_parse_cpu_topology(void)
+ 	err = SecureDTLookupEntry(NULL, "/cpus", &entry);
+ 	assert(err == kSuccess);
+ 
++	ml_choose_scheduler(entry);
++
+ 	err = SecureDTInitEntryIterator(entry, &iter);
+ 	assert(err == kSuccess);
+ 
+@@ -1005,6 +1273,21 @@ ml_parse_cpu_topology(void)
  		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
  
  		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
@@ -2567,13 +2831,35 @@ index e76e7e70ab9c..b5e1aa32548a 100644
 +		 * runs a real-time thread, and so on); 2 (the default): as cores of their own (see
 +		 * sched_slow_secondaries in osfmk/kern/sched.h).
 +		 */
-+		if (cpu->l2_access_penalty == 0 && ml_readprop(child, "small-core", 0) != 0 && small_cores_apart) {
++		bool small_core = (ml_small_core_mask >> ml_board_core(cpu->phys_id)) & 1;
++		if (cpu->l2_access_penalty == 0 && small_core && small_cores_apart && !ml_amp_topology) {
 +			cpu->l2_access_penalty = 1;
 +		}
  		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
  		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
  		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
-@@ -1107,6 +1269,7 @@ ml_parse_cpu_topology(void)
+@@ -1016,6 +1299,10 @@ ml_parse_cpu_topology(void)
+ 		cpu->cluster_type = CLUSTER_TYPE_SMP;
+ 
+ 		int cluster_type = (int)ml_readprop(child, "cluster-type", 0);
++		if (ml_amp_topology && cluster_type == 0) {
++			/* (the generic boards: the loader's word for the kind of core, above) */
++			cluster_type = small_core ? 'E' : 'P';
++		}
+ 		if (cluster_type == 'E') {
+ 			cpu->cluster_type = CLUSTER_TYPE_E;
+ 		} else if (cluster_type == 'P') {
+@@ -1033,6 +1320,9 @@ ml_parse_cpu_topology(void)
+ 		uint32_t phys_cluster_id = MPIDR_CLUSTER_ID(cpu->phys_id);
+ #else
+ 		uint32_t phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P);
++		if (ml_amp_topology) {
++			phys_cluster_id = ml_board_core_domain(cpu->phys_id);
++		}
+ #endif
+ 		assert(phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID);
+ 		cpu->cluster_id = ((cluster_phys_to_logical[phys_cluster_id] == -1) ?
+@@ -1107,6 +1397,7 @@ ml_parse_cpu_topology(void)
  	cluster_offsets[0] = 0;
  #endif
  	assert(topology_info.boot_cpu != NULL);
@@ -2581,7 +2867,7 @@ index e76e7e70ab9c..b5e1aa32548a 100644
  	ml_read_chip_revision(&topology_info.chip_revision);
  
  	/*
-@@ -1427,17 +1590,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1427,17 +1718,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
  	if (!is_boot_cpu) {
  		processor_init(processor, this_cpu_datap->cpu_number, pset);
@@ -2607,7 +2893,7 @@ index e76e7e70ab9c..b5e1aa32548a 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2398,16 @@ _enable_virtual_timer(void)
+@@ -2237,8 +2526,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
@@ -2624,6 +2910,22 @@ index e76e7e70ab9c..b5e1aa32548a 100644
  }
  
  void
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 133b07fd6155..2e9a067d324c 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -91,6 +91,11 @@
+ #define CONFIG_SCHED_CLUTCH 1
+ #define CONFIG_SCHED_EDGE   1
+ #endif /* XNU_TARGET_OS_OSX */
++/* ... and for the generic boards, beside the Clutch scheduler it is chosen against at boot (pexpert/arm64/BCM2837.h) */
++#if HK_SCHED_SELECTABLE && !XNU_TARGET_OS_OSX
++#define CONFIG_SCHED_CLUTCH 1
++#define CONFIG_SCHED_EDGE   1
++#endif /* HK_SCHED_SELECTABLE */
+ 
+ #else /* __ARM_AMP__ */
+ #define CONFIG_SCHED_CLUTCH 1
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5a1cce..a54e35035cde 100644
 --- a/osfmk/arm64/start.s
@@ -2972,7 +3274,7 @@ index 9d98c50094a0..9e3476124e54 100644
 +osfmk/minicrypto/mc_provider.c	standard
 +osfmk/minicrypto/mc_aes.c	standard
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index c40d57bcc677..1b7a1fcdfcdf 100644
+index c40d57bcc677..260038b8fbde 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -25,8 +25,8 @@ osfmk/arm64/WKdmCompress_4k.s	standard
@@ -2986,7 +3288,7 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -104,3 +104,8 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+@@ -104,3 +104,10 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
  osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
  osfmk/arm/counter.c	standard
@@ -2995,6 +3297,8 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
++
++osfmk/arm64/iphont_threads.c standard
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 index 384118e8d7a9..2573d2ebd4e6 100644
 --- a/osfmk/console/video_console.c
@@ -3039,7 +3343,7 @@ index 0a00656a0fdd..bfad3cbca5bc 100644
  		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
  	} else {
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 809dafaaa2a7..71c6580f44e2 100644
+index 809dafaaa2a7..47397c253e8c 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -636,6 +636,11 @@ check_exc_receiver_dependency(
@@ -3054,12 +3358,16 @@ index 809dafaaa2a7..71c6580f44e2 100644
  kern_return_t
  exception_triage_thread(
  	exception_type_t        exception,
-@@ -650,6 +655,11 @@ exception_triage_thread(
+@@ -650,6 +655,15 @@ exception_triage_thread(
  	struct exception_action *actions;
  	kern_return_t   kr = KERN_FAILURE;
  
 +#if defined(__arm64__)
 +	/* bring-up aid, see osfmk/arm64/user_exception_trace.c */
++	extern void iphont_event(unsigned, unsigned, unsigned, uint64_t, uint64_t);
++	if (exception == EXC_BAD_ACCESS || exception == EXC_BAD_INSTRUCTION || exception == EXC_CRASH ||
++	    exception == EXC_GUARD || exception == EXC_RESOURCE)
++		iphont_event(1, 3, exception, thread_tid(thread), codeCnt ? code[0] : 0);
 +	user_exception_trace(exception, code, codeCnt, thread);
 +#endif
 +
@@ -3138,10 +3446,64 @@ index a5f68ade084b..9741eb1b3ecd 100644
 +
  #endif  /* _KERN_SCHED_H_ */
 diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
-index 3657d83c5b6f..ded2ff427d68 100644
+index 3657d83c5b6f..a7ebf2e11fbb 100644
 --- a/osfmk/kern/sched_clutch.c
 +++ b/osfmk/kern/sched_clutch.c
-@@ -3204,7 +3204,7 @@ extern int sched_allow_rt_smt;
+@@ -1220,8 +1220,37 @@ sched_clutch_bucket_preferred_cluster(sched_clutch_bucket_t clutch_bucket)
+ 	return sched_edge_clutch_bucket_group_preferred_cluster(clutch_bucket->scb_group);
+ }
+ 
++/*
++ * HackiOS: priority inheritance across core types. A thread whose scheduling priority was raised above its base into
++ * the UI range (a turnstile's push: a lock, or a synchronous IPC, that a UI thread waits on) prefers the cluster the
++ * performance controller names (bsd/dev/hk_perfctl.c: the P cluster) while it holds that push, if its group would
++ * otherwise keep it on E -- so the UI thread is not left waiting on a slow core. UINT32_MAX: off (boot-arg
++ * sched_edge_promote=0, or no controller).
++ */
++static uint32_t sched_edge_promotion_cluster = UINT32_MAX;
++static int sched_edge_promote = 1;
++
++void
++sched_edge_set_promotion_cluster(uint32_t cluster_id)
++{
++	os_atomic_store(&sched_edge_promotion_cluster, sched_edge_promote ? cluster_id : UINT32_MAX, relaxed);
++}
++
++static uint32_t sched_edge_thread_preferred_cluster_promoted(thread_t thread, bool promotion_applies);
++
+ uint32_t
+ sched_edge_thread_preferred_cluster(thread_t thread)
++{
++	return sched_edge_thread_preferred_cluster_promoted(thread, true);
++}
++
++/*
++ * (A running thread is not preempted for its push: it goes on where it runs, its core at the speed its load gave it --
++ * moved onto an idle P cluster at its lowest clock it would be no faster. The push decides where it is put when it is
++ * queued or woken: an E cluster's queue is where a lock holder makes a UI thread wait.)
++ */
++static uint32_t
++sched_edge_thread_preferred_cluster_promoted(thread_t thread, bool promotion_applies)
+ {
+ 	if (SCHED_CLUTCH_THREAD_CLUSTER_BOUND(thread)) {
+ 		/* For threads bound to a specific cluster, return the bound cluster id */
+@@ -1234,7 +1263,14 @@ sched_edge_thread_preferred_cluster(thread_t thread)
+ 		sched_bucket = sched_clutch_thread_bucket_map(thread, thread->base_pri);
+ 	}
+ 	sched_clutch_bucket_group_t clutch_bucket_group = &clutch->sc_clutch_groups[sched_bucket];
+-	return sched_edge_clutch_bucket_group_preferred_cluster(clutch_bucket_group);
++	uint32_t preferred = sched_edge_clutch_bucket_group_preferred_cluster(clutch_bucket_group);
++	uint32_t promotion = os_atomic_load(&sched_edge_promotion_cluster, relaxed);
++	if (__improbable(promotion != UINT32_MAX) && promotion_applies && thread->sched_pri > thread->base_pri &&
++	    thread->sched_pri >= BASEPRI_FOREGROUND && thread->sched_pri < BASEPRI_RTQUEUES &&
++	    pset_type_for_id(preferred) == CLUSTER_TYPE_E) {
++		return promotion;
++	}
++	return preferred;
+ }
+ 
+ /*
+@@ -3204,7 +3240,7 @@ extern int sched_allow_rt_smt;
  static bool
  sched_clutch_thread_avoid_processor(processor_t processor, thread_t thread)
  {
@@ -3150,11 +3512,197 @@ index 3657d83c5b6f..ded2ff427d68 100644
  		/*
  		 * This is a secondary SMT processor.  If the primary is running
  		 * a realtime thread, only allow realtime threads on the secondary.
+@@ -3419,6 +3455,27 @@ const struct sched_dispatch_table sched_edge_dispatch = {
+ 
+ static bitmap_t sched_edge_available_pset_bitmask[BITMAP_LEN(MAX_PSETS)];
+ 
++/* HackiOS: counts of the Edge scheduler's decisions between clusters (osfmk/arm/machine_routines.h) */
++_Static_assert(MAX_PSETS <= SCHED_PERFCONTROL_MAX_CLUSTERS, "sched_edge_counters is too small");
++_Static_assert(TH_BUCKET_SCHED_MAX == SCHED_PERFCONTROL_BUCKETS, "sched_edge_cluster_info has a load per bucket");
++static struct sched_edge_counters sched_edge_counts;
++#define EDGE_COUNT(field) os_atomic_inc(&sched_edge_counts.field, relaxed)
++
++/*
++ * HackiOS: background work does not go up from an E cluster to a P cluster, not by migration and not by a P core's
++ * steal -- the policy Apple's comment on sched_edge_qos_max_parallelism() states ("the performance controller would
++ * never recommend execution on the P-cores" for BG). Without it, once the E cluster is saturated and its edge to P
++ * opened, the threads an idle P core steals are the background ones (the E cores run the higher QoS, the BG threads
++ * are what waits). Boot-arg sched_edge_bg_up=1: as Apple's code is.
++ */
++static int sched_edge_bg_up = 0;
++
++static bool
++sched_edge_bg_held_down(sched_bucket_t bucket, processor_set_t from, processor_set_t to)
++{
++	return !sched_edge_bg_up && bucket == TH_BUCKET_SHARE_BG && from->pset_type == CLUSTER_TYPE_E && to->pset_type == CLUSTER_TYPE_P;
++}
++
+ /*
+  * sched_edge_pset_available()
+  *
+@@ -3535,6 +3592,8 @@ sched_edge_init(void)
+ 	sched_timeshare_init();
+ 	sched_clutch_tunables_init();
+ 	sched_edge_max_clusters = ml_get_cluster_count();
++	PE_parse_boot_argn("sched_edge_bg_up", &sched_edge_bg_up, sizeof(sched_edge_bg_up));
++	PE_parse_boot_argn("sched_edge_promote", &sched_edge_promote, sizeof(sched_edge_promote));
+ }
+ 
+ static void
+@@ -3887,6 +3946,7 @@ sched_edge_foreign_runnable_thread_remove(processor_set_t pset, uint64_t ctime)
+ 		 * some form of global state across psets to make that kind of a check cheap.
+ 		 */
+ 		if (thread != THREAD_NULL) {
++			EDGE_COUNT(foreign_pull[target_pset->pset_cluster_id][pset->pset_cluster_id]);
+ 			KDBG(MACHDBG_CODE(DBG_MACH_SCHED_CLUTCH, MACH_SCHED_EDGE_REBAL_RUNNABLE) | DBG_FUNC_NONE, thread_tid(thread), pset->pset_cluster_id, target_pset->pset_cluster_id, 0);
+ 			break;
+ 		}
+@@ -3987,8 +4047,19 @@ sched_edge_steal_thread(processor_set_t pset, uint64_t candidate_pset_bitmap)
+ 		if (sched_edge_steal_possible(pset, steal_from_pset)) {
+ 			uint64_t current_timestamp = mach_absolute_time();
+ 			sched_clutch_root_bucket_t root_bucket = sched_clutch_root_highest_root_bucket(&steal_from_pset->pset_clutch_root, current_timestamp, SCHED_CLUTCH_HIGHEST_ROOT_BUCKET_UNBOUND_ONLY);
++			if (root_bucket != NULL && sched_edge_bg_held_down(root_bucket->scrb_bucket, steal_from_pset, pset)) {
++				/* (not the background work: the most urgent of the rest, if there is any) */
++				bitmap_t others = steal_from_pset->pset_clutch_root.scr_unbound_runnable_bitmap[0] & ~(1ULL << TH_BUCKET_SHARE_BG);
++				int bucket = bitmap_lsb_first(&others, TH_BUCKET_SCHED_MAX);
++				root_bucket = bucket >= 0 ? &steal_from_pset->pset_clutch_root.scr_unbound_buckets[bucket] : NULL;
++			}
++			if (root_bucket == NULL) {
++				pset_unlock(steal_from_pset);
++				continue;
++			}
+ 			thread = sched_clutch_thread_unbound_lookup(&steal_from_pset->pset_clutch_root, root_bucket);
+ 			sched_clutch_thread_remove(&steal_from_pset->pset_clutch_root, thread, current_timestamp, SCHED_CLUTCH_BUCKET_OPTIONS_SAMEPRI_RR);
++			EDGE_COUNT(steal[steal_from_pset->pset_cluster_id][pset->pset_cluster_id]);
+ 			KDBG(MACHDBG_CODE(DBG_MACH_SCHED_CLUTCH, MACH_SCHED_EDGE_STEAL) | DBG_FUNC_NONE, thread_tid(thread), pset->pset_cluster_id, steal_from_pset->pset_cluster_id, 0);
+ 			sched_update_pset_load_average(steal_from_pset, current_timestamp);
+ 		}
+@@ -4087,7 +4158,7 @@ sched_edge_shared_rsrc_migrate_possible(thread_t thread, processor_set_t preferr
+ static bool
+ sched_edge_thread_avoid_processor(processor_t processor, thread_t thread)
+ {
+-	processor_set_t preferred_pset = pset_array[sched_edge_thread_preferred_cluster(thread)];
++	processor_set_t preferred_pset = pset_array[sched_edge_thread_preferred_cluster_promoted(thread, false)];
+ 	if (thread_shared_rsrc_policy_get(thread, CLUSTER_SHARED_RSRC_TYPE_RR)) {
+ 		return sched_edge_shared_rsrc_migrate_possible(thread, preferred_pset, processor->processor_set);
+ 	}
+@@ -4150,6 +4221,7 @@ sched_edge_balance(__unused processor_t cprocessor, processor_set_t cpset)
+ 	for (int cpuid = lsb_first(ast_processor_map); cpuid >= 0; cpuid = lsb_next(ast_processor_map, cpuid)) {
+ 		processor_t ast_processor = processor_array[cpuid];
+ 		sched_ipi_perform(ast_processor, ipi_type[cpuid]);
++		EDGE_COUNT(rebalance_ipi[cpset->pset_cluster_id]);
+ 		KDBG(MACHDBG_CODE(DBG_MACH_SCHED_CLUTCH, MACH_SCHED_EDGE_REBAL_RUNNING) | DBG_FUNC_NONE, 0, cprocessor->cpu_id, cpuid, 0);
+ 	}
+ }
+@@ -4185,6 +4257,9 @@ sched_edge_migration_check(uint32_t cluster_id, processor_set_t preferred_pset,
+ 	if (edge[cluster_id].sce_migration_allowed == false) {
+ 		return false;
+ 	}
++	if (sched_edge_bg_held_down(thread->th_sched_bucket, preferred_pset, dst_pset)) {
++		return false;
++	}
+ 	uint32_t dst_load = shared_rsrc_thread ? (uint32_t)sched_pset_cluster_shared_rsrc_load(dst_pset, shared_rsrc_type) : sched_edge_cluster_load_metric(dst_pset, thread->th_sched_bucket);
+ 	if (dst_load == 0) {
+ 		/* The candidate cluster is idle; select it immediately for execution */
+@@ -4498,6 +4573,7 @@ sched_edge_migrate_candidate(processor_set_t preferred_pset, thread_t thread, pr
+ 			boolean_t non_preferred_pset = (thread->last_processor->processor_set->pset_type != preferred_pset->pset_type);
+ 			if (non_preferred_pset) {
+ 				selected_pset = sched_edge_amp_rebalance_pset(preferred_pset, thread);
++				EDGE_COUNT(amp_rebalance[selected_pset->pset_cluster_id]);
+ 				goto migrate_candidate_available_check;
+ 			}
+ 		}
+@@ -4547,6 +4623,10 @@ sched_edge_choose_processor(processor_set_t pset, processor_t processor, thread_
+ 	 * factor that into the migration decisions.
+ 	 */
+ 	chosen_pset = sched_edge_migrate_candidate(preferred_pset, thread, pset, true);
++	EDGE_COUNT(placed[preferred_pset->pset_cluster_id]);
++	if (chosen_pset && chosen_pset != preferred_pset) {
++		EDGE_COUNT(placed_away[preferred_pset->pset_cluster_id][chosen_pset->pset_cluster_id]);
++	}
+ 	if (chosen_pset) {
+ 		chosen_processor = choose_processor(chosen_pset, processor, thread);
+ 	}
+@@ -4584,6 +4664,7 @@ sched_edge_run_drained_threads(queue_t clutch_threads)
+ 	/* Now setrun all the threads in the local queue */
+ 	qe_foreach_element_safe(thread, clutch_threads, runq_links) {
+ 		remqueue(&thread->runq_links);
++		EDGE_COUNT(tg_migrated);
+ 		thread_lock(thread);
+ 		thread_setrun(thread, SCHED_TAILQ);
+ 		thread_unlock(thread);
+@@ -4727,6 +4808,7 @@ sched_edge_migrate_thread_group_running_threads(
+ 
+ 		if (expected_tg && non_preferred_cluster) {
+ 			ipi_type[cpuid] = sched_ipi_action(src_processor, NULL, SCHED_IPI_EVENT_REBALANCE);
++			EDGE_COUNT(tg_migrated);
+ 			if (ipi_type[cpuid] != SCHED_IPI_NONE) {
+ 				bit_set(ast_processor_map, cpuid);
+ 			} else if (src_processor == current_processor()) {
+@@ -4959,6 +5041,34 @@ sched_edge_ipi_policy(processor_t dst, thread_t thread, boolean_t dst_idle, sche
+ 	return sched_ipi_policy(dst, thread, dst_idle, event);
+ }
+ 
++/*
++ * HackiOS: the cluster's state and the counters, for the performance controller (osfmk/arm/machine_routines.h).
++ * Read without the pset lock: each value is one load, the set of them only roughly of one instant.
++ */
++bool
++sched_edge_cluster_info_get(uint32_t cluster_id, struct sched_edge_cluster_info *info)
++{
++	if (cluster_id >= (uint32_t)sched_edge_max_clusters || pset_array[cluster_id] == NULL) {
++		return false;
++	}
++	processor_set_t pset = pset_array[cluster_id];
++
++	info->available_cpus = (uint32_t)pset_available_cpu_count(pset);
++	info->runnable = (uint32_t)sched_clutch_root_count(&pset->pset_clutch_root);
++	info->running_foreign = (uint32_t)bit_count(pset->cpu_running_foreign & pset->cpu_state_map[PROCESSOR_RUNNING]);
++	for (sched_bucket_t b = TH_BUCKET_FIXPRI; b < TH_BUCKET_SCHED_MAX; b++) {
++		info->load[b] = sched_edge_cluster_load_metric(pset, b);
++		info->exec_us[b] = (uint32_t)pset->pset_execution_time[b].pset_avg_thread_execution_time;
++	}
++	return true;
++}
++
++void
++sched_edge_counters_get(struct sched_edge_counters *counters)
++{
++	*counters = sched_edge_counts;
++}
++
+ /*
+  * sched_edge_qos_max_parallelism()
+  */
 diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
-index 8e29586464de..0a7de6fc4be7 100644
+index 8e29586464de..4528dc7a9b3c 100644
 --- a/osfmk/kern/sched_prim.c
 +++ b/osfmk/kern/sched_prim.c
-@@ -2042,6 +2042,7 @@ sched_vm_group_maintenance(void)
+@@ -423,6 +423,23 @@ bitmap_t        sched_preempt_pri[BITMAP_LEN(NRQS_MAX)];
+  */
+ char sched_string[SCHED_STRING_MAX_LENGTH];
+ 
++#if CONFIG_SCHED_EDGE && HK_SCHED_SELECTABLE
++/* The scheduler in use (osfmk/kern/sched_prim.h): Clutch until the topology is read, which may choose Edge. */
++SECURITY_READ_ONLY_LATE(const struct sched_dispatch_table *) sched_current_dispatch = &sched_clutch_dispatch;
++
++void
++sched_select_dispatch(bool edge)
++{
++	sched_current_dispatch = edge ? &sched_edge_dispatch : &sched_clutch_dispatch;
++}
++
++bool
++sched_edge_active(void)
++{
++	return sched_current_dispatch == &sched_edge_dispatch;
++}
++#endif /* CONFIG_SCHED_EDGE && HK_SCHED_SELECTABLE */
++
+ uint32_t sched_debug_flags = SCHED_DEBUG_FLAG_CHOOSE_PROCESSOR_TRACEPOINTS;
+ 
+ /* Global flag which indicates whether Background Stepper Context is enabled */
+@@ -2042,6 +2059,7 @@ sched_vm_group_maintenance(void)
  #endif
  
  int sched_allow_rt_smt = 1;
@@ -3162,7 +3710,7 @@ index 8e29586464de..0a7de6fc4be7 100644
  int sched_avoid_cpu0 = SCHED_AVOID_CPU0;
  int sched_allow_rt_steal = 1;
  int sched_backup_cpu_timeout_count = 5; /* The maximum number of 10us delays to wait before using a backup cpu */
-@@ -2097,6 +2098,7 @@ void
+@@ -2097,6 +2115,7 @@ void
  sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
  {
  	processor_t ast_processor = NULL;
@@ -3170,7 +3718,7 @@ index 8e29586464de..0a7de6fc4be7 100644
  
  #if (DEVELOPMENT || DEBUG)
  	if (__improbable(sched_smt_balance == 0)) {
-@@ -2105,7 +2107,39 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+@@ -2105,7 +2124,39 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
  #endif
  
  	assert(cprocessor == current_processor());
@@ -3211,7 +3759,7 @@ index 8e29586464de..0a7de6fc4be7 100644
  		goto smt_balance_exit;
  	}
  
-@@ -2120,7 +2154,6 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+@@ -2120,7 +2171,6 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
  
  	processor_t sprocessor;
  
@@ -3219,7 +3767,7 @@ index 8e29586464de..0a7de6fc4be7 100644
  	uint64_t running_secondary_map = (cpset->cpu_state_map[PROCESSOR_RUNNING] &
  	    ~cpset->primary_map);
  	for (int cpuid = lsb_first(running_secondary_map); cpuid >= 0; cpuid = lsb_next(running_secondary_map, cpuid)) {
-@@ -2581,6 +2614,10 @@ restart:
+@@ -2581,6 +2631,10 @@ restart:
  		bool is_yielding         = (*reason & AST_YIELD) == AST_YIELD;
  
  		bool needs_smt_rebalance = !is_yielding && thread->sched_pri < BASEPRI_RTQUEUES && processor->processor_primary != processor;
@@ -3230,7 +3778,7 @@ index 8e29586464de..0a7de6fc4be7 100644
  
  		bool affinity_mismatch   = thread->affinity_set != AFFINITY_SET_NULL && thread->affinity_set->aset_pset != pset;
  
-@@ -2705,7 +2742,7 @@ pick_new_rt_thread:
+@@ -2705,7 +2759,7 @@ pick_new_rt_thread:
  
  				clear_pending_AST_bits(pset, processor, 3);
  
@@ -3239,7 +3787,7 @@ index 8e29586464de..0a7de6fc4be7 100644
  					processor_t sprocessor = processor->processor_secondary;
  					if ((sprocessor->state == PROCESSOR_RUNNING) || (sprocessor->state == PROCESSOR_DISPATCHING)) {
  						ipi_type = sched_ipi_action(sprocessor, NULL, SCHED_IPI_EVENT_SMT_REBAL);
-@@ -2774,7 +2811,8 @@ send_followup_ipi_before_idle:
+@@ -2774,7 +2828,8 @@ send_followup_ipi_before_idle:
  				goto restart;
  			}
  
@@ -3249,6 +3797,31 @@ index 8e29586464de..0a7de6fc4be7 100644
  				/* secondary can only run realtime thread */
  				if (idle_reason == 0) {
  					idle_reason = 4;
+diff --git a/osfmk/kern/sched_prim.h b/osfmk/kern/sched_prim.h
+index c6ab61767a30..c383a40b68d8 100644
+--- a/osfmk/kern/sched_prim.h
++++ b/osfmk/kern/sched_prim.h
+@@ -813,7 +813,19 @@ extern boolean_t preemption_enabled(void);
+ 
+ #if __AMP__
+ 
+-#if CONFIG_SCHED_EDGE
++#if CONFIG_SCHED_EDGE && HK_SCHED_SELECTABLE
++/*
++ * Two schedulers in one kernel, the one in use picked once at boot, before the first processor is set up
++ * (sched_select_dispatch(), from ml_parse_cpu_topology()): Edge on clusters of different cores, Clutch on
++ * one processor set otherwise or with boot-arg sched=clutch.
++ */
++extern const struct sched_dispatch_table sched_edge_dispatch;
++extern const struct sched_dispatch_table sched_clutch_dispatch;
++extern const struct sched_dispatch_table *sched_current_dispatch;
++#define SCHED(f) (sched_current_dispatch->f)
++extern void sched_select_dispatch(bool edge);
++extern bool sched_edge_active(void);
++#elif CONFIG_SCHED_EDGE
+ extern const struct sched_dispatch_table sched_edge_dispatch;
+ #define SCHED(f) (sched_edge_dispatch.f)
+ #else /* CONFIG_SCHED_EDGE */
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
 index bec97fbf7243..203e1f48783f 100644
 --- a/osfmk/kern/startup.c
@@ -3302,6 +3875,64 @@ index 384ef23fe0e1..d5ab6db0edbc 100644
  uint64_t
  thread_last_run_time(thread_t th)
  {
+diff --git a/osfmk/kern/thread_group.c b/osfmk/kern/thread_group.c
+index f04b813d0292..3f5f231ae33e 100644
+--- a/osfmk/kern/thread_group.c
++++ b/osfmk/kern/thread_group.c
+@@ -100,7 +100,12 @@ thread_group_init(void)
+ 	// Get thread group structure extension from EDT or boot-args (which can override EDT)
+ 	if (!PE_parse_boot_argn("kern.thread_group_extra_bytes", &tg_machine_data_size, sizeof(tg_machine_data_size))) {
+ 		if (!PE_get_default("kern.thread_group_extra_bytes", &tg_machine_data_size, sizeof(tg_machine_data_size))) {
++#if CONFIG_SCHED_EDGE && HK_SCHED_SELECTABLE
++			/* the performance controller's state of a group (bsd/dev/hk_perfctl.c, struct pc_tg) lives here */
++			tg_machine_data_size = 256;
++#else
+ 			tg_machine_data_size = 8;
++#endif
+ 		}
+ 	}
+ 
+@@ -542,6 +547,28 @@ thread_group_find_by_id_and_retain(uint64_t id)
+ 	return result;
+ }
+ 
++/*
++ * For the performance controller's periodic look at every group (bsd/dev/hk_perfctl.c): fn is called for each
++ * live group with a reference taken and tg_lock held (fn must not block), and returns whether to keep the
++ * reference; the kept ones are the caller's to drop with thread_group_release() after this returns.
++ */
++void
++thread_group_perfctl_iterate(bool (*fn)(struct thread_group *tg, void *machine_data, void *arg), void *arg)
++{
++	struct thread_group *tg;
++
++	lck_mtx_lock(&tg_lock);
++	qe_foreach_element(tg, &tg_queue, tg_queue_chain) {
++		if (!os_ref_retain_try(&tg->tg_refcount)) {
++			continue;       /* (being freed: its deinit callout comes after it leaves the queue) */
++		}
++		if (!fn(tg, &tg->tg_machine_data, arg)) {
++			os_ref_release_live(&tg->tg_refcount);
++		}
++	}
++	lck_mtx_unlock(&tg_lock);
++}
++
+ /*
+  * Add new reference to specified thread group
+  */
+diff --git a/osfmk/kern/thread_group.h b/osfmk/kern/thread_group.h
+index d2d12f36dbad..f949bce31abc 100644
+--- a/osfmk/kern/thread_group.h
++++ b/osfmk/kern/thread_group.h
+@@ -124,6 +124,7 @@ uint64_t        thread_group_get_id(struct thread_group *tg);
+ uint32_t        thread_group_count(void);
+ const char *    thread_group_get_name(struct thread_group *tg);
+ void *          thread_group_get_machine_data(struct thread_group *tg);
++void            thread_group_perfctl_iterate(bool (*fn)(struct thread_group *tg, void *machine_data, void *arg), void *arg);
+ uint32_t        thread_group_machine_data_size(void);
+ boolean_t       thread_group_uses_immediate_ipi(struct thread_group *tg);
+ cluster_type_t  thread_group_recommendation(struct thread_group *tg);
 diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
 index f2b9ce24bd8d..3aed167fe32e 100644
 --- a/osfmk/kern/work_interval.c
@@ -3379,15 +4010,26 @@ index 65144c74239c..ab6260d52d84 100644
  }
  
 diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
-index d9f0723244e5..53fe4f371d7f 100644
+index d9f0723244e5..06d982fdc2cd 100644
 --- a/pexpert/pexpert/arm64/BCM2837.h
 +++ b/pexpert/pexpert/arm64/BCM2837.h
-@@ -11,6 +11,15 @@
+@@ -11,6 +11,26 @@
  #define BCM2837
  #define BCM2837_BRINGUP
  #define ARM_ARCH_TIMER
 +#define GENERIC_GIC_V3_IRQ                 1 /* interrupts via GICv3 Group 1, see osfmk/arm64/gic_v3_irq.c */
 +#define GENERIC_PSCI_SMP                  1 /* more cores are started through PSCI, see osfmk/arm64/psci_smp.c */
++
++/*
++ * Asymmetric multiprocessing: the phones' cores are of two kinds (Cortex-A55 beside Cortex-A77/A78) in clusters
++ * of different speeds, as an Apple SoC's E and P cores are. With this the kernel has what XNU builds for those --
++ * a processor set per cluster, the Edge scheduler (CONFIG_SCHED_EDGE, osfmk/arm64/proc_reg.h), thread groups
++ * placed by a performance controller (bsd/dev/hk_perfctl.c) -- and picks at boot whether to use it (boot-arg
++ * sched=edge|clutch, osfmk/kern/sched_prim.c): a board whose cores are all alike (QEMU) runs the Clutch
++ * scheduler on one processor set as before, and so does any run with sched=clutch, the regression baseline.
++ */
++#define __ARM_AMP__                       1
++#define HK_SCHED_SELECTABLE               1
 +
 +/*
 + * The cores this kernel really runs on (Cortex-A55/A78, QEMU cortex-a76) are
@@ -3398,7 +4040,7 @@ index d9f0723244e5..53fe4f371d7f 100644
  
  #define __ARM_ARCH__              8
  #define __ARM_VMSA__              8
-@@ -22,6 +31,7 @@
+@@ -22,6 +42,7 @@
  #ifndef ASSEMBLER
  
  #define PI3_UART
@@ -3406,7 +4048,7 @@ index d9f0723244e5..53fe4f371d7f 100644
  
  #define PI3_BREAK                               asm volatile("brk #0");
  
-@@ -60,8 +70,11 @@
+@@ -60,8 +81,11 @@
  #define BCM2837_PUT32(addr, value) do { *((volatile uint32_t *) addr) = value; } while(0)
  #define BCM2837_GET32(addr) *((volatile uint32_t *) addr)
  
@@ -3421,18 +4063,26 @@ index d9f0723244e5..53fe4f371d7f 100644
  
  #endif /* ! _PEXPERT_ARM_BCM2837_H */
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
-index c84b2100bc19..aaad5cd2e8c6 100644
+index c84b2100bc19..d64c08e579f5 100644
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
-@@ -91,7 +91,7 @@
+@@ -91,8 +91,14 @@
  #include <pexpert/arm64/BCM2837.h>
  
  #define MAX_L2_CLINE                   6
 -#define MAX_CPUS                       4
+-#define MAX_CPU_CLUSTERS               1
 +#define MAX_CPUS                       8 /* the Raspberry Pi has four; the boards this runs on now have up to eight */
- #define MAX_CPU_CLUSTERS               1
++/*
++ * A cluster is a group of cores with a clock of their own (on the Snapdragons: an EPSS frequency domain, which
++ * is also where their L2 type and speed are alike): the phones have three (4 + 3 + 1), newer Snapdragons four.
++ * How many a run has is the topology's to say (ml_parse_cpu_topology(): one, as before, unless the scheduler
++ * is the Edge scheduler and the cores differ).
++ */
++#define MAX_CPU_CLUSTERS               4
  
  #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
 diff --git a/security/mac_vfs_subr.c b/security/mac_vfs_subr.c
 index 97028c06bb92..0daad830d0c0 100644
 --- a/security/mac_vfs_subr.c

@@ -268,6 +268,19 @@ hk_net_link_state(bool up)
 	net_link_event(net_ifp, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
 }
 
+void
+hk_net_address(const uint8_t address[6])
+{
+	uint8_t now[ETHER_ADDR_LEN];
+
+	if (net_ifp == NULL || (ifnet_lladdr_copy_bytes(net_ifp, now, sizeof(now)) == 0 && memcmp(now, address, sizeof(now)) == 0)) {
+		return;
+	}
+	/* (configd hears of it: the link layer posts KEV_DL_LINK_ADDRESS_CHANGED) */
+	ifnet_set_lladdr(net_ifp, address, ETHER_ADDR_LEN);
+	printf("net: en0's address is %s now\n", address[0] & 2 ? "a private one, for the network" : "the radio's own");
+}
+
 /* The interface's own thread: for a link that wants to be asked, and for the minute's line in the log. */
 static void
 net_thread(__unused void *parameter, __unused wait_result_t result)

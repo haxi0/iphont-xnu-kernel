@@ -24,6 +24,7 @@
 #include <vm/pmap.h>
 
 #include <linux/bottom_half.h>
+#include <linux/cpu.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmi.h>
@@ -39,6 +40,7 @@
 #include <linux/timer.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <crypto/hash.h>
 
 #include <lx_os.h>
 #include "lx.h"
@@ -46,6 +48,20 @@
 #define SLICE_NS	(5 * 1000000ull)	/* how long a sleep lasts before it looks again */
 
 /* ---- saying things ------------------------------------------------------------------------- */
+
+/* (dev_err() and its kin, for a device: it is the radio) */
+int
+device_printf(device_t dev, const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	lx_tell("ath11k: %s%s", line, line[0] != 0 && line[strlen(line) - 1] == '\n' ? "" : "\n");
+	return (0);
+}
 
 int
 printf(const char *format, ...)
@@ -160,6 +176,56 @@ struct thread *
 lx_curthread(void)
 {
 	return (&lx_thread()->td);
+}
+
+/* The calling thread's record given back: it leaves the layer for good (its function is about to return). */
+static void
+lx_thread_release(void)
+{
+	void *self = lx_os_thread_self();
+
+	for (unsigned i = 0; i < nitems(lx_threads); i++) {
+		if (lx_threads[i].self == self) {
+			memset(&lx_threads[i].td, 0, sizeof(lx_threads[i]) - offsetof(struct lx_thread, td));
+			__atomic_store_n(&lx_threads[i].self, NULL, __ATOMIC_RELEASE);
+		}
+	}
+}
+
+/*
+ * A thread of the layer's: function(argument), and its record given back when that returns -- threads
+ * that come and go (the MHI host's, at each power-up) would otherwise fill the table above.
+ */
+struct lx_spawned {
+	void (*function)(void *);
+	void *argument;
+};
+
+static void
+spawned_runs(void *start)
+{
+	struct lx_spawned s = *(struct lx_spawned *)start;
+
+	lx_os_free(start, sizeof(s));
+	s.function(s.argument);
+	lx_thread_release();
+}
+
+int
+lx_spawn(const char *name, void (*function)(void *), void *argument)
+{
+	struct lx_spawned *start = lx_os_alloc(sizeof(*start));
+	int error;
+
+	if (start == NULL) {
+		return (ENOMEM);
+	}
+	start->function = function;
+	start->argument = argument;
+	if ((error = lx_os_thread(name, spawned_runs, start)) != 0) {
+		lx_os_free(start, sizeof(*start));
+	}
+	return (error);
 }
 
 struct pcpu *
@@ -364,6 +430,32 @@ lx_pause_ms(unsigned ms)
 	lx_os_lock();
 	lx_os_sleep(&nothing, ms * 1000000ull);
 	lx_os_unlock();
+}
+
+/*
+ * FreeBSD's DELAY() (Linux's udelay() and mdelay() come to it): a short wait is spun, a long one
+ * slept -- nothing of the driver runs where it may not sleep.
+ */
+void
+DELAY(int us)
+{
+	unsigned long long until = lx_os_nanoseconds() + (unsigned long long)(us > 0 ? us : 0) * 1000ull;
+
+	if (us >= 2000) {
+		lx_pause_ms((unsigned)(us + 999) / 1000);
+		return;
+	}
+	while (lx_os_nanoseconds() < until) {
+	}
+}
+
+/* cpumask_of(): which processor takes what is the kernel's to say; every one is the same here */
+cpumask_t *
+lkpi_get_static_single_cpu_mask(int cpu)
+{
+	static cpumask_t one;
+
+	return (&one);
 }
 
 void
@@ -589,6 +681,7 @@ struct lx_workqueue {
 	unsigned first, count;
 	struct work_struct *running;
 	void *thread;
+	bool dying, gone;			/* destroy_workqueue(): its thread is to end, and has */
 	char name[24];
 };
 
@@ -603,8 +696,14 @@ worker(void *argument)
 		lx_os_lock();
 		queue->running = NULL;
 		lx_os_wakeup(&queue->running);
-		while (queue->count == 0) {
+		while (queue->count == 0 && !queue->dying) {
 			lx_os_sleep(queue, SLICE_NS);
+		}
+		if (queue->count == 0) {
+			queue->gone = true;
+			lx_os_wakeup(&queue->gone);
+			lx_os_unlock();
+			return;			/* (lx_spawn() gives its record back) */
 		}
 		work = queue->waiting[queue->first];
 		queue->first = (queue->first + 1) % nitems(queue->waiting);
@@ -625,17 +724,30 @@ linux_create_workqueue_common(const char *name, int cpus)
 		return (NULL);
 	}
 	strlcpy(queue->name, name, sizeof(queue->name));
-	if (lx_os_thread(queue->name, worker, queue) != 0) {
+	if (lx_spawn(queue->name, worker, queue) != 0) {
 		lx_os_free(queue, sizeof(*queue));
 		return (NULL);
 	}
 	return (&queue->shown);
 }
 
+/* What is queued is done, then its thread ends; the queue is given back when it has (the driver's removal) */
 void
 linux_destroy_workqueue(struct workqueue_struct *wq)
 {
-	/* (its thread stays, asleep: queues are made once here and never given up while the kernel runs) */
+	struct lx_workqueue *queue = __containerof(wq, struct lx_workqueue, shown);
+
+	if (lx_os_thread_self() == queue->thread) {
+		return;				/* (from its own work: it would wait for itself; left as it is) */
+	}
+	lx_os_lock();
+	queue->dying = true;
+	lx_os_wakeup(queue);
+	while (!queue->gone) {
+		lx_os_sleep(&queue->gone, SLICE_NS);
+	}
+	lx_os_unlock();
+	lx_os_free(queue, sizeof(*queue));
 }
 
 bool
@@ -909,10 +1021,22 @@ lx_dma_free(void *memory, size_t size)
 	lx_os_unlock();
 }
 
+/*
+ * Aligned as Linux promises (Documentation/core-api/dma-api.rst: "to the smallest PAGE_SIZE order
+ * which is greater than or equal to the requested size"); the QCA6390's firmware counts on it for
+ * the memory it is given (Android's: 0xa1000000 for 6 MB, 0xa1800000 for M3's image). The
+ * WCN6750's (AHB) pool is small, and that driver has done without.
+ */
 void *
 linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag)
 {
-	return (lx_dma_alloc(size, 0, dma_handle));
+	size_t align = 0;
+
+	if (lx_os_bus() == LX_BUS_PCI) {
+		for (align = 4096; align < size; align <<= 1) {
+		}
+	}
+	return (lx_dma_alloc(size, align, dma_handle));
 }
 
 /* (dma_free_coherent() ends here) */
@@ -1053,6 +1177,12 @@ void
 linuxkpi_release_firmware(const struct linuxkpi_firmware *fw)
 {
 	lkpi_kfree(fw);
+}
+
+int
+linuxkpi_request_firmware(const struct linuxkpi_firmware **out, const char *name, struct device *dev)
+{
+	return (linuxkpi_firmware_request_nowarn(out, name, dev));
 }
 
 /* ---- what the files built so far name and do not get to --------------------------------------------- */
@@ -1339,4 +1469,62 @@ lx_base_init(void)
 	}
 	begun = true;
 	return (lx_os_thread("wifi-ticks", ticker, NULL));
+}
+
+/* ---- crypto/hash.h: Michael, for ath11k's check of TKIP frames -------------------------------------- */
+
+struct crypto_shash *
+crypto_alloc_shash(const char *name, int type, int mask)
+{
+	struct crypto_shash *tfm;
+
+	if (strcmp(name, "michael_mic") != 0) {
+		return (ERR_PTR(-ENOENT));
+	}
+	tfm = kzalloc(sizeof(*tfm), GFP_KERNEL);
+	return (tfm != NULL ? tfm : ERR_PTR(-ENOMEM));
+}
+
+void
+crypto_free_shash(struct crypto_shash *tfm)
+{
+	if (!IS_ERR_OR_NULL(tfm)) {
+		explicit_bzero(tfm, sizeof(*tfm));
+		kfree(tfm);
+	}
+}
+
+int
+crypto_shash_setkey(struct crypto_shash *tfm, const uint8_t *key, size_t length)
+{
+	if (length != 8) {
+		return (-EINVAL);
+	}
+	memcpy(tfm->key, key, 8);
+	tfm->keyed = true;
+	return (0);
+}
+
+int
+crypto_shash_init(struct shash_desc *desc)
+{
+	if (desc->tfm == NULL || !desc->tfm->keyed) {
+		return (-ENOKEY);
+	}
+	lx_wpa_michael_begin(&desc->state, desc->tfm->key);
+	return (0);
+}
+
+int
+crypto_shash_update(struct shash_desc *desc, const uint8_t *data, size_t length)
+{
+	lx_wpa_michael_more(&desc->state, data, (unsigned)length);
+	return (0);
+}
+
+int
+crypto_shash_final(struct shash_desc *desc, uint8_t *out)
+{
+	lx_wpa_michael_end(&desc->state, out);
+	return (0);
 }

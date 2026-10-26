@@ -56,6 +56,8 @@ extern "C" void hk_tl(const char * format, ...) __printflike(1, 2);
 extern "C" {
 /* bsd/dev/hk_adreno.c ("the GPU kept on"; declared in bsd/sys/hk_input.h, which is not seen from here) */
 bool hk_gpu_ready(void);
+bool hk_gpu_suspend(void);
+bool hk_gpu_resume(void);
 bool hk_gpu_parameter(uint32_t which, uint64_t * value);
 uint64_t hk_gpu_address(uint64_t size);
 void hk_gpu_address_free(uint64_t address, uint64_t size);
@@ -270,11 +272,82 @@ hk_gpu_speed_level(void)
 
 extern "C" bool hk_display_on(void);   /* (MiniIOMobileFramebuffer.cpp) */
 
+static volatile bool gSleepPending;     /* the system is going to sleep, or sleeps: the speed's thread call neither runs nor is set */
+static bool gGPUAsleep;                 /* (gGPULock, held from the one call to the other) the GPU block is given back */
+
+/*
+ * The system's sleep (bsd/dev/hk_power.c, before the other processors go and after they are back): the GPU block given back
+ * -- the 3D core and the CX half off -- and started again (hk_gpu_suspend(), hk_gpu_resume()). gGPULock is held in between,
+ * so nothing submits, maps, waits or looks at the speed meanwhile; the programs and what they have are untouched.
+ * A sleep the GPU cannot go through (a submission that is not done) leaves it on.
+ */
+extern "C" void
+hk_gpu_sleep_begin(void)
+{
+	if (gGPULock == NULL || !hk_gpu_ready() || gGPUAsleep) {
+		return;
+	}
+	gSleepPending = true;
+	if (gSpeedCall != NULL) {
+		thread_call_cancel_wait(gSpeedCall);
+	}
+	IOLockLock(gGPULock);
+	if (!hk_gpu_suspend()) {
+		IOLockUnlock(gGPULock);
+		gSleepPending = false;
+		if (gSpeedCall != NULL) {
+			thread_call_enter(gSpeedCall);
+		}
+		return;
+	}
+	gGPUAsleep = true;
+}
+
+extern "C" void
+hk_gpu_sleep_end(void)
+{
+	if (!gGPUAsleep) {
+		return;
+	}
+	hk_gpu_resume();
+	gSpeedLevel = hk_gpu_level_count() - 1;         /* (where the steps leave the core) */
+	gSpeedCalm = 0;
+	gGPUAsleep = false;
+	IOLockUnlock(gGPULock);
+	gSleepPending = false;
+	if (gSpeedCall != NULL) {
+		thread_call_enter(gSpeedCall);
+	}
+}
+
 /* The screen lit again (bsd/dev/hk_power.c): the speed looked at now, not up to a second later */
 extern "C" void
 hk_gpu_speed_kick(void)
 {
-	if (gSpeedCall != NULL) {
+	if (gSpeedCall != NULL && !gSleepPending) {
+		thread_call_enter(gSpeedCall);
+	}
+}
+
+/*
+ * A touch or a key (bsd/dev/hk_input.c, with the processors' boost): the GPU at its top level for gpu_boost= ms (default
+ * 300; 0 off), as the scroll that follows needs its speed before the load shows it -- a frame that costs 3 ms at 525 MHz
+ * costs 5 at 305, and the load of 27% that it makes never asks for more. Heat still holds it down.
+ */
+static uint64_t gSpeedBoostUntil;       /* mach time; read without the lock */
+static uint32_t gSpeedBoostMs = 300;
+
+extern "C" void
+hk_gpu_speed_boost(void)
+{
+	uint64_t until;
+
+	if (gSpeedCall == NULL || gSpeedBoostMs == 0 || gSleepPending) {
+		return;
+	}
+	clock_interval_to_deadline(gSpeedBoostMs, kMillisecondScale, &until);
+	__atomic_store_n(&gSpeedBoostUntil, until, __ATOMIC_RELAXED);
+	if (gSpeedLevel < hk_gpu_level_count() - 1) {
 		thread_call_enter(gSpeedCall);
 	}
 }
@@ -285,6 +358,9 @@ gpuSpeed(thread_call_param_t, thread_call_param_t)
 	uint64_t deadline;
 	bool again = true;
 
+	if (gSleepPending) {
+		return;                 /* (hk_gpu_sleep_end() starts it again) */
+	}
 	IOLockLock(gGPULock);
 	if (!hk_gpu_ready()) {
 		again = false;
@@ -306,6 +382,10 @@ gpuSpeed(thread_call_param_t, thread_call_param_t)
 			want = top;
 		} else if (gSpeedCalm >= GPU_SPEED_CALM && want > 1) {
 			want--;
+			gSpeedCalm = 0;
+		}
+		if (mach_absolute_time() < __atomic_load_n(&gSpeedBoostUntil, __ATOMIC_RELAXED)) {
+			want = top;
 			gSpeedCalm = 0;
 		}
 		if (gSpeedHot) {
@@ -494,6 +574,7 @@ HKGPUStart(void)
 		IOLog("HKGPU: the service did not start\n");
 	}
 	gpu->release();
+	PE_parse_boot_argn("gpu_boost", &gSpeedBoostMs, sizeof(gSpeedBoostMs));
 	if (gpu_dcvs && (gSpeedCall = thread_call_allocate(gpuSpeed, NULL)) != NULL) {
 		gSpeedLevel = hk_gpu_level_count() - 1;    /* (where step 17 left it) */
 		gpuSpeed(NULL, NULL);

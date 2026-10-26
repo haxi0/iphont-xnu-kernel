@@ -12,6 +12,7 @@
  * Only valid while the kernel does not drive hardware that UEFI also uses.
  */
 #include <mach/mach_types.h>
+#include <sys/iphont.h>
 #include <machine/atomic.h>
 #include <kern/cpu_number.h>
 #include <kern/debug.h>
@@ -76,6 +77,12 @@ static uint32_t loader_log_ring_at;      /* where the next character goes in the
 static bool     loader_log_wrapped;
 static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
 static char     loader_log_scratch[LOADER_LOG_RING];
+/*
+ * Every character ever put in the log, the dropped ones included: an offset that only grows, so that a
+ * host that follows the log from the loader (oem iphont-log, the toolkit's live log) asks for "from N on"
+ * and is told what it missed, instead of fetching the whole log every time.
+ */
+uint64_t        loader_log_total;
 
 /*
  * Characters come from every processor, and from interrupt handlers on top of whatever was
@@ -153,6 +160,9 @@ loader_log_put_locked(char c)
 			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
 		}
 	}
+	/* after the character: a reader on the loader's core that sees the count sees the character */
+	__asm__ volatile ("dmb ish" ::: "memory");
+	loader_log_total++;
 }
 
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
@@ -203,6 +213,9 @@ struct loader_live {
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
 	uint64_t magic3;                /* "XNULIVE3": what follows is there */
 	const uint64_t *screen;         /* loader_screen */
+	uint64_t magic4;                /* "XNULIVE4": what follows is there */
+	const uint64_t *log_total;      /* loader_log_total */
+	const void *agent;              /* the toolkit's mailbox (bsd/dev/iphont.c, struct iphont_box) */
 };
 
 /*
@@ -224,6 +237,7 @@ struct loader_live loader_live = {
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
 	.magic3 = 0x334556494c554e58ULL, .screen = loader_screen,
+	.magic4 = 0x344556494c554e58ULL, .log_total = &loader_log_total, .agent = &iphont_box,
 };
 
 /*
@@ -457,6 +471,9 @@ loader_return_test(void *as_panic)
 	loader_return();
 }
 
+static thread_call_t loader_return_call;
+static uint64_t loader_return_wall_deadline;      /* mach_continuous_time() at which the timed return is due */
+
 static void
 loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
@@ -494,10 +511,30 @@ loader_return_timer_init(void)
 		return;
 	}
 	thread_call_t call = thread_call_allocate(loader_return_timer, NULL);
-	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
-	thread_call_enter_delayed(call, deadline);
+	loader_return_call = call;
+	nanoseconds_to_absolutetime((uint64_t)seconds * NSEC_PER_SEC, &deadline);
+	loader_return_wall_deadline = mach_continuous_time() + deadline;
+	thread_call_enter_delayed(call, mach_absolute_time() + deadline);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
+
+/*
+ * The timed return is wall time, sleeping included: mach_absolute_time() stands still while the system sleeps
+ * (bsd/dev/hk_power.c), so the thread call above would end the run later by every second slept, and the host
+ * (xl run), which waits XL_SECS plus a margin of wall time, called a run that was only asleep a hang. After a
+ * sleep the call is set again for what is left of the wall time, or run at once when that is over.
+ */
+void
+loader_return_wake(void)
+{
+	uint64_t now = mach_continuous_time();
+
+	if (loader_return_call == NULL) {
+		return;
+	}
+	thread_call_cancel(loader_return_call);
+	thread_call_enter_delayed(loader_return_call, mach_absolute_time() + (now < loader_return_wall_deadline ? loader_return_wall_deadline - now : 0));
+}
 
 /*
  * A loader that watches from another core also listens to the host, and passes on a request to
@@ -534,6 +571,7 @@ loader_stop_poll_init(void)
 	loader_stop_poll(NULL, NULL);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_stop_poll_init);
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, iphont_trace_init);
 
 /*
  * boot-arg hv_wdt_pet=1: the loader has armed the Qualcomm hypervisor's

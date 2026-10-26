@@ -126,6 +126,12 @@ instantnoodle_gpio_output(struct instantnoodle_pin p, bool high, unsigned pull, 
 	configure(p, pull, ma, true);
 }
 
+void
+instantnoodle_gpio_function(struct instantnoodle_pin p, unsigned function, unsigned pull, unsigned ma)
+{
+	wr(pin_base(p), pull | (function & 0xf) << 2 | (ma / 2 - 1) << 6);
+}
+
 bool
 instantnoodle_gpio_level(struct instantnoodle_pin p)
 {

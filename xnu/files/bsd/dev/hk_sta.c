@@ -41,6 +41,7 @@ static bool sta_thread_made;
 static bool sta_calls;                          /* the thread is in a call of the station side's */
 static unsigned sta_reads;                      /* ... and so many others are in its state() */
 static bool sta_on;                             /* the radio's power, as last asked for */
+static bool sta_held;                           /* the system sleeps: no call is begun (hk_sta_suspend()) */
 
 /* what has been asked for and not begun */
 static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
@@ -77,7 +78,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 		int error = 0;
 
 		lck_mtx_lock(&sta_lock);
-		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
+		while (sta_ops == NULL || sta_held || !(asked_power || asked_leave || asked_join || asked_scan)) {
 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
 		}
 		ops = sta_ops;
@@ -203,6 +204,60 @@ void
 hk_sta_lost(int error)
 {
 	hk_apple80211_event(HK_STA_LINK, error != 0 ? error : ECONNRESET);
+}
+
+/* ---- the system's sleep --------------------------------------------------------------------------------- */
+
+bool
+hk_sta_suspend(void)
+{
+	const struct hk_sta_ops *ops;
+	struct hk_sta_state *state;
+	bool on, joined = false;
+
+	lck_mtx_lock(&sta_lock);
+	if (sta_ops == NULL) {
+		lck_mtx_unlock(&sta_lock);
+		return false;
+	}
+	sta_held = true;
+	while (sta_calls) {
+		lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
+	}
+	ops = sta_ops;
+	on = sta_on;
+	sta_calls = true;                       /* (the station side is ours until resume: hk_sta_attach(NULL) waits) */
+	lck_mtx_unlock(&sta_lock);
+	if (on && ops != NULL) {
+		if ((state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO)) != NULL) {
+			ops->state(state);
+			joined = state->phase == HK_STA_JOINED;
+			kfree_data(state, sizeof(*state));
+		}
+		ops->power(false);
+		if (joined) {
+			hk_apple80211_event(HK_STA_LINK, ENETDOWN);
+		}
+	}
+	lck_mtx_lock(&sta_lock);
+	sta_calls = false;
+	lck_mtx_unlock(&sta_lock);
+	thread_wakeup((event_t)&sta_calls);
+	return on;
+}
+
+void
+hk_sta_resume(bool was_on)
+{
+	lck_mtx_lock(&sta_lock);
+	sta_held = false;
+	if (was_on && sta_ops != NULL && sta_on && !asked_power) {
+		/* (the power-on joins the standing network again, as after Settings' switch) */
+		asked_power = true;
+		asked_power_on = true;
+	}
+	lck_mtx_unlock(&sta_lock);
+	thread_wakeup((event_t)&sta_ops);
 }
 
 /* ---- who wants a network ------------------------------------------------------------------------------- */

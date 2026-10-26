@@ -101,6 +101,8 @@ struct mhi_host {
 	struct mhi_host_config config;
 
 	bool allocated, powered, mission, failed;
+	bool mission_told;		/* the device's own event says its mission has begun (the register says it earlier) */
+	unsigned rung_again;		/* doorbells rung again for a command not completed */
 	volatile uint32_t ee, state;	/* as the device last said */
 	uint32_t bhi, bhie, channel_doorbells, event_doorbells;
 	unsigned wakes;			/* votes for the device to stay out of M1/M2 */

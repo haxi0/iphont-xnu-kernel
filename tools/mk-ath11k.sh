@@ -1,7 +1,8 @@
 #!/bin/bash
-# Build the driver of the phone's Wi-Fi radio for our kernel: ath11k, Qualcomm's driver for the
-# WCN6750 (and its kin) as it is in Linux, unmodified, on a layer that gives it the kernel
-# interfaces it expects. Three things meet here, and only the third is in the repository:
+# Build the driver of the phones' Wi-Fi radios for our kernel: ath11k, Qualcomm's driver for the
+# WCN6750 (redwood, inside the SoC) and the QCA6390 (the OnePlus 8, on PCIe: its own pci.c, pcic.c
+# and mhi.c, on an MHI host of ours) as it is in Linux, unmodified, on a layer that gives it the
+# kernel interfaces it expects. Three things meet here, and only the third is in the repository:
 #
 #   Linux's ath11k        drivers/net/wireless/ath/ath11k of a pinned release of Linux
 #                         (BSD-3-Clause-Clear; the one header of ath/ it includes is ISC);
@@ -177,8 +178,9 @@ for s in $(cat out/undefined.txt); do
 done
 [ -z "$missing" ] || exit 1
 $CC -c out/stubs.s -o out/stubs.o
-# four names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of hk_lx.h)
-printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
+# six names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop(), lx_transmit(), lx_suspend() and
+# lx_resume() of hk_lx.h)
+printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n_lx_suspend\n_lx_resume\n' > out/exported.txt
 $LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath11k.o 2> out/ld.err ||
 	{ cat out/ld.err; exit 1; }
 rm -f out/all.o

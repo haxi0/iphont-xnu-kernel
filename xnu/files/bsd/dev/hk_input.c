@@ -136,13 +136,27 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	wakeup(&touch_queue);
 }
 
+extern void hk_gpu_speed_boost(void);      /* iokit/Kernel/HKGPU.cpp */
+
 void
 hk_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 {
 	if (type == HK_TOUCH_DOWN || type == HK_BUTTON_DOWN) {
-		hk_cpufreq_boost();             /* (what follows a touch needs the speed before any load shows it) */
+		hk_cpufreq_boost();
+		hk_gpu_speed_boost();           /* (what follows a touch needs the speed before any load shows it) */
 	}
 	touch_post(type, finger, x, y, true);
+}
+
+/* Remote input uses the normal queue but must never count toward the physical recovery chord. */
+void
+hk_touch_inject(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	if (type == HK_TOUCH_DOWN || type == HK_BUTTON_DOWN) {
+		hk_cpufreq_boost();
+		hk_gpu_speed_boost();
+	}
+	touch_post(type, finger, x, y, false);
 }
 
 static int

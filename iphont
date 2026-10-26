@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+# iphont: the phone, for coding agents (JSON on stdout). See docs/TOOLKIT.md, or `./iphont --help`.
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'tools'))
+from iphont.cli import main
+sys.exit(main())

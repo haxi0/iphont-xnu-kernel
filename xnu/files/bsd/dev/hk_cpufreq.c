@@ -12,7 +12,14 @@
  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c ("epss" variant).
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
+#include <kern/task.h>
+#include <mach/task_info.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
 #include <kern/thread.h>
+#include <kern/processor.h>
+#include <kern/sched_prim.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -29,6 +36,9 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void hk_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+extern processor_t cpu_to_processor(int cpu);
+extern processor_t thread_bind(processor_t processor);
+extern bool ml_cpu_online(int cpu_id);
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -62,6 +72,7 @@ tell(const char *format, ...)
 #define EPSS_FREQ_TABLE         0x100           /* a word per row: [31:30] clock source, [7:0] multiple of 19.2 MHz */
 #define EPSS_TABLE_ROWS         40
 #define EPSS_PERF_STATE         0x320           /* the row that is wanted */
+#define EPSS_VOLT_TABLE         0x200           /* a word per row: [11:0] the row's voltage, mV (read as Linux reads it) */
 #define XO_KHZ                  19200
 #define ALTERNATE_KHZ           300000          /* source 0: a fixed 300 MHz */
 
@@ -79,19 +90,24 @@ loop_speed(void)
 	return nanos ? (uint32_t)(2000000ULL * 1000 / nanos) : 0;
 }
 
-/* The group of the core with that number in its MPIDR (the device tree's "reg": the number is the second field). */
-static uint32_t
-domain_of(uint32_t phys_id)
-{
-	uint32_t core = (phys_id >> 8) & 0xff;
+/*
+ * The group of a processor, by the kernel's number for it: the board's description of its frequency domains
+ * (osfmk/arm64/machine_routines.c, board_cpu_domains=; on both phones cores 0-3, 4-6 and 7), which is also
+ * how the Edge scheduler's clusters are made.
+ */
+extern uint32_t ml_cpu_frequency_domain(int cpu_id);
 
-	return core < 4 ? 0 : core < 7 ? 1 : 2;
+static uint32_t
+domain_of(unsigned int cpu)
+{
+	return ml_cpu_frequency_domain((int)cpu);
 }
 
 /* each group's registers and the highest row of its table, once raised: for the thermal service's caps */
 static vm_offset_t epss_base[EPSS_DOMAINS];
 static int epss_top[EPSS_DOMAINS] = { -1, -1, -1 };
 static uint32_t epss_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
+static uint32_t epss_mv[EPSS_DOMAINS][EPSS_TABLE_ROWS];         /* for the performance controller's energy model */
 /*
  * The rows in force: epss_cap is the thermal service's ceiling, epss_row what the governor (below) has asked for
  * under it. Without the governor (cpufreq_gov=0) the group runs at its ceiling, as before there was one.
@@ -116,6 +132,7 @@ raise_domain(uint32_t domain, uint32_t cores)
 		top = row;
 		top_khz = khz;
 		epss_khz[domain][row] = khz;
+		epss_mv[domain][row] = *(volatile uint32_t *)(base + EPSS_VOLT_TABLE + 4 * row) & 0xfff;
 	}
 	epss_base[domain] = base;
 	epss_top[domain] = (int)top;
@@ -123,8 +140,8 @@ raise_domain(uint32_t domain, uint32_t cores)
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
 	delay_for_interval(20, NSEC_PER_MSEC);
-	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
-	    top_khz / 1000);
+	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz (%u mV; lowest row %u MHz, %u mV)\n",
+	    domain, cores, was, top, top_khz / 1000, epss_mv[domain][top], epss_khz[domain][0] / 1000, epss_mv[domain][0]);
 }
 
 /*
@@ -232,9 +249,22 @@ memory_bench(void)
 #define BENCH_THREADS   8
 static struct {
 	volatile uint32_t ready, go, done;
+	uint32_t threads;               /* how many are to be ready before they start */
 	uint64_t ns[BENCH_THREADS][3];
 	uint32_t core[BENCH_THREADS];
 } bench;
+
+/*
+ * One more thread is ready; the last one starts them all. (Not the caller: with a busy thread of kernel priority on every
+ * core, a user thread waiting to say "go" may never get a core again.)
+ */
+static void
+bench_ready(void)
+{
+	if (os_atomic_inc(&bench.ready, relaxed) == bench.threads) {
+		os_atomic_store(&bench.go, 1, release);
+	}
+}
 
 static void
 bench_thread(void *arg, wait_result_t wr __unused)
@@ -244,15 +274,21 @@ bench_thread(void *arg, wait_result_t wr __unused)
 	vm_offset_t a = 0, b = 0;
 	volatile uint64_t sum = 0;
 
+	/* one thread on each core, whatever the scheduler would do with seven busy threads (they spin until all are ready) */
+	if (ml_cpu_online((int)index)) {
+		thread_bind(cpu_to_processor((int)index));
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+
 	if (kmem_alloc(kernel_map, &a, size, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS ||
 	    kmem_alloc(kernel_map, &b, size, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
-		os_atomic_inc(&bench.ready, relaxed);
 		os_atomic_inc(&bench.done, relaxed);
+		bench_ready();
 		return;
 	}
 	memset((void *)a, 1, size);
 	memset((void *)b, 2, size);
-	os_atomic_inc(&bench.ready, relaxed);
+	bench_ready();
 	while (!os_atomic_load(&bench.go, acquire)) {
 	}
 	bench.core[index] = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
@@ -280,41 +316,341 @@ bench_thread(void *arg, wait_result_t wr __unused)
 }
 
 static void
-bench_all(void *arg __unused, wait_result_t wr __unused)
+bench_run(uint64_t total[3])
 {
 	const uint32_t threads = MIN(ml_get_topology_info()->num_cpus, BENCH_THREADS);
 	const uint64_t mb = 4 * 16;                     /* per thread and test */
-	uint64_t total[3] = { 0, 0, 0 };
 
-	delay_for_interval(2000, NSEC_PER_MSEC);
+	bzero(&bench, sizeof(bench));
+	bench.threads = threads;
+	total[0] = total[1] = total[2] = 0;
 	for (uintptr_t i = 0; i < threads; i++) {
 		thread_t thread;
 
 		if (kernel_thread_start(bench_thread, (void *)i, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		} else {
-			os_atomic_inc(&bench.ready, relaxed);
 			os_atomic_inc(&bench.done, relaxed);
+			bench_ready();
 		}
 	}
-	while (os_atomic_load(&bench.ready, relaxed) < threads) {
-		delay_for_interval(1, NSEC_PER_MSEC);
-	}
-	os_atomic_store(&bench.go, 1, release);
 	while (os_atomic_load(&bench.done, acquire) < threads) {
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
 	for (uint32_t i = 0; i < threads; i++) {
-		tell("membench: all at once: core %u: writing %llu MB/s, reading %llu MB/s, copying %llu MB/s\n", bench.core[i],
-		    bench.ns[i][0] ? mb * 1000000000ull / bench.ns[i][0] : 0, bench.ns[i][1] ? mb * 1000000000ull / bench.ns[i][1] : 0,
-		    bench.ns[i][2] ? mb * 1000000000ull / bench.ns[i][2] : 0);
 		for (int k = 0; k < 3; k++) {
 			total[k] += bench.ns[i][k] ? mb * 1000000000ull / bench.ns[i][k] : 0;
 		}
 	}
-	tell("membench: all %u at once, together: writing %llu MB/s, reading %llu MB/s, copying %llu MB/s\n", threads, total[0],
-	    total[1], total[2]);
 }
+
+static void
+bench_all(void *arg __unused, wait_result_t wr __unused)
+{
+	uint64_t total[3];
+
+	delay_for_interval(2000, NSEC_PER_MSEC);
+	bench_run(total);
+	tell("membench: all %u at once, together: writing %llu MB/s, reading %llu MB/s, copying %llu MB/s\n",
+	    MIN(ml_get_topology_info()->num_cpus, BENCH_THREADS), total[0], total[1], total[2]);
+}
+
+/*
+ * kern.hackios.membench: what all the cores together get from memory right now, writing, in MB a second (a read of it
+ * runs the test, about a second, on every core of ours at once). Tests read it before a sleep and after the wake: the
+ * memory's vote and the cores that were started again show in it. (tools/t: "mem")
+ */
+static int
+sysctl_membench(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	static lck_mtx_t *lock;
+	static uint64_t last[3];
+	uint64_t total[3] = { 0, 0, 0 };
+
+	if (lock == NULL) {
+		lock = lck_mtx_alloc_init(lck_grp_alloc_init("hk_membench", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
+	}
+	lck_mtx_lock(lock);
+	bench_run(total);
+	memcpy(last, total, sizeof(last));
+	lck_mtx_unlock(lock);
+	tell("membench: now, all together: writing %llu MB/s, reading %llu MB/s, copying %llu MB/s\n", total[0], total[1], total[2]);
+	return SYSCTL_OUT(req, &total[0], sizeof(total[0]));
+}
+
+SYSCTL_DECL(_kern_hackios);
+SYSCTL_PROC(_kern_hackios, OID_AUTO, membench, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_membench, "Q",
+    "memory write bandwidth of all cores together, MB/s (runs the test)");
+
+/*
+ * kern.hackios.cpuspeed: how fast a core of each group really runs now -- a loop measured on it (loop_speed(), thousands of
+ * iterations a millisecond) -- with the row the governor has asked for and the row EPSS says it has. A read of it binds the
+ * reading thread to a core of each group in turn; "d0 row 16/16 speed 1234 ..." for groups 0 to 2 (a group none of our cores is
+ * in, or whose core is not online, says "-"). Tests read it before a sleep and after the wake (tools/t).
+ */
+extern processor_t cpu_to_processor(int cpu);
+extern processor_t thread_bind(processor_t processor);
+extern bool ml_cpu_online(int cpu_id);
+
+static int
+sysctl_cpuspeed(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char text[240] = "";
+	size_t used = 0;
+	const ml_topology_info_t *topology = ml_get_topology_info();
+
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		int cpu = -1;
+
+		for (unsigned i = 0; i < topology->num_cpus && cpu < 0; i++) {
+			if (epss_top[d] >= 0 && domain_of(i) == d && ml_cpu_online((int) i)) {
+				cpu = (int) i;
+			}
+		}
+		if (cpu < 0) {
+			used += (size_t) snprintf(text + used, sizeof(text) - used, "d%u - ", d);
+			continue;
+		}
+		processor_t was = thread_bind(cpu_to_processor(cpu));
+		uint32_t speed;
+
+		thread_block(THREAD_CONTINUE_NULL);
+		speed = loop_speed();
+		thread_bind(was);
+		thread_block(THREAD_CONTINUE_NULL);
+		used += (size_t) snprintf(text + used, sizeof(text) - used, "d%u asked %d hw %u of %d speed %u ", d, epss_row[d],
+		    *(volatile uint32_t *)(epss_base[d] + EPSS_PERF_STATE), epss_top[d], speed);
+	}
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+
+SYSCTL_PROC(_kern_hackios, OID_AUTO, cpuspeed, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_cpuspeed, "A",
+    "each group's row asked for, EPSS's row, and a loop measured on one of its cores");
+
+/*
+ * kern.hackios.top: the processes that used the most processor time since the last read (user plus system, all cores added:
+ * "name[pid] ms" for the first eight), what a profile of a gesture needs and ps(1) does not show here. The first read only sets
+ * the starting point.
+ */
+#define TOP_PROCS       512
+static struct top_entry {
+	int pid;
+	uint64_t ns, system_ns;
+	char name[20];
+} top_now[TOP_PROCS], top_before[TOP_PROCS];
+static unsigned top_count, top_before_count;
+
+extern task_t proc_task(proc_t);
+extern void proc_iterate(unsigned int flags, int (*callout)(proc_t, void *), void *arg, int (*filterfn)(proc_t, void *),
+    void *filterarg);
+
+static int
+top_visit(proc_t p, __unused void *arg)
+{
+	task_t task = proc_task(p);
+	struct task_absolutetime_info info;
+	mach_msg_type_number_t count = TASK_ABSOLUTETIME_INFO_COUNT;
+	uint64_t ns;
+
+	if (task == TASK_NULL || top_count == TOP_PROCS ||
+	    task_info(task, TASK_ABSOLUTETIME_INFO, (task_info_t) &info, &count) != KERN_SUCCESS) {
+		return 0;
+	}
+	absolutetime_to_nanoseconds(info.total_user + info.total_system, &ns);
+	top_now[top_count].pid = proc_pid(p);
+	top_now[top_count].ns = ns;
+	absolutetime_to_nanoseconds(info.total_system, &top_now[top_count].system_ns);
+	proc_name(proc_pid(p), top_now[top_count].name, sizeof(top_now[0].name));
+	top_count++;
+	return 0;
+}
+
+static int
+sysctl_top(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	static lck_mtx_t *lock;
+	char text[480] = "";
+	size_t used = 0;
+	struct { int index; uint64_t ms, system_ms; } best[8];
+	unsigned found = 0;
+
+	if (lock == NULL) {
+		lock = lck_mtx_alloc_init(lck_grp_alloc_init("hk_top", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
+	}
+	lck_mtx_lock(lock);
+	top_count = 0;
+	proc_iterate(1 /* PROC_ALLPROCLIST */, top_visit, NULL, NULL, NULL);
+	for (unsigned i = 0; i < top_count; i++) {
+		uint64_t was = 0, was_system = 0, ms;
+
+		for (unsigned k = 0; k < top_before_count; k++) {
+			if (top_before[k].pid == top_now[i].pid) {
+				was = top_before[k].ns;
+				was_system = top_before[k].system_ns;
+				break;
+			}
+		}
+		if (top_before_count == 0) {
+			break;
+		}
+		ms = (top_now[i].ns - MIN(was, top_now[i].ns)) / NSEC_PER_MSEC;
+		unsigned at = found;
+
+		while (at > 0 && best[at - 1].ms < ms) {
+			at--;
+		}
+		if (at < 8) {
+			for (unsigned m = MIN(found, 7); m > at; m--) {
+				best[m] = best[m - 1];
+			}
+			best[at].index = (int) i;
+			best[at].ms = ms;
+			best[at].system_ms = (top_now[i].system_ns - MIN(was_system, top_now[i].system_ns)) / NSEC_PER_MSEC;
+			found = MIN(found + 1, 8);
+		}
+	}
+	for (unsigned i = 0; i < found; i++) {
+		used += (size_t) snprintf(text + used, sizeof(text) - used, "%s[%d] %llu(sys %llu) ", top_now[best[i].index].name,
+		    top_now[best[i].index].pid, best[i].ms, best[i].system_ms);
+	}
+	memcpy(top_before, top_now, sizeof(top_now[0]) * top_count);
+	top_before_count = top_count;
+	lck_mtx_unlock(lock);
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+
+SYSCTL_PROC(_kern_hackios, OID_AUTO, top, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_top, "A",
+    "processor time by process since the last read, in ms: the first eight");
+
+/*
+ * kern.hackios.kprof: where the processors were in the kernel when the clock interrupted them (osfmk/arm/rtclock.c fills the
+ * samples, up to 65536). Write 1: clear and start; write 0: stop. Read: the places the samples fell in, 32 bytes each, as
+ * "address:count" (the kernel's own unslid address: `nm -n mach.development.bcm2837.unstripped` names it; tools/kprof.py), the 40 most
+ * often hit, and how many samples were in a program (0) and in all. A read stops the sampling.
+ */
+#define HK_KPROF_SAMPLES 65536
+extern volatile uint32_t hk_kprof_on;
+extern uint32_t hk_kprof_next;
+extern uint64_t hk_kprof_pcs[HK_KPROF_SAMPLES];
+
+static int
+sysctl_kprof_ctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = 0, error = SYSCTL_IN(req, &value, sizeof(value));
+
+	if (error == 0 && req->newptr) {
+		if (value) {
+			hk_kprof_next = 0;
+		}
+		hk_kprof_on = value != 0;
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern_hackios, OID_AUTO, kprof_ctl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_kprof_ctl, "I",
+    "1: start sampling where the processors are in the kernel; 0: stop");
+
+static int
+sysctl_kprof(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	static struct { uint64_t bucket; uint32_t count; } places[2048];
+	char *text = kalloc_data(2048, Z_WAITOK | Z_ZERO);
+	unsigned used = 0, total = MIN(hk_kprof_next, (uint32_t) HK_KPROF_SAMPLES), program = 0;
+	size_t length = 0;
+	int error;
+
+	hk_kprof_on = 0;
+	if (text == NULL) {
+		return ENOMEM;
+	}
+	bzero(places, sizeof(places));
+	for (unsigned i = 0; i < total; i++) {
+		uint64_t bucket = hk_kprof_pcs[i] >> 5;
+		unsigned k = (unsigned)((bucket * 0x9e3779b97f4a7c15ull) >> 53) % 2048, tries = 0;
+
+		if (hk_kprof_pcs[i] == 0) {
+			program++;
+			continue;
+		}
+		while (places[k].count != 0 && places[k].bucket != bucket && tries++ < 2048) {
+			k = (k + 1) % 2048;
+		}
+		if (tries < 2048) {
+			places[k].bucket = bucket;
+			places[k].count++;
+			used += places[k].count == 1;
+		}
+	}
+	length += (size_t) snprintf(text, 2048, "%u in programs of %u:", program, total);
+	for (unsigned n = 0; n < 40; n++) {
+		unsigned best = 0;
+
+		for (unsigned k = 1; k < 2048; k++) {
+			best = places[k].count > places[best].count ? k : best;
+		}
+		if (places[best].count == 0 || length + 24 > 2048) {
+			break;
+		}
+		length += (size_t) snprintf(text + length, 2048 - length, " %llx:%u", places[best].bucket << 5, places[best].count);
+		places[best].count = 0;
+	}
+	error = SYSCTL_OUT(req, text, length + 1);
+	kfree_data(text, 2048);
+	(void) used;
+	return error;
+}
+
+SYSCTL_PROC(_kern_hackios, OID_AUTO, kprof, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_kprof, "A",
+    "the places in the kernel the clock interrupts found a processor at, 32 bytes each (see kprof_ctl)");
+
+/*
+ * kern.hackios.memlat: how long a dependent load takes from a working set that fits the core's L2 (256 KB), the shared L3
+ * (3 MB) and only memory (96 MB), in tenths of a nanosecond, measured on the core the reader happens to be on: a chain of
+ * loads each of which gives the address of the next, a cache line apart, in an order a prefetcher cannot follow. The cores'
+ * speed, the L3's and the memory's all show in it, and a vote that was lost across a sleep shows as a longer time.
+ */
+static uint32_t
+chase(vm_size_t size)
+{
+	vm_offset_t memory = 0;
+	uint64_t *table, began, nanos;
+	uint64_t lines = size / 64, at = 0, loads = 3000000;
+	uint32_t result = 0;
+
+	if (kmem_alloc(kernel_map, &memory, size, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
+		return 0;
+	}
+	table = (uint64_t *) memory;
+	/* a cycle through all the lines in a fixed pseudo-random order: line i leads to (a * i + c) mod lines, a odd and prime to lines */
+	for (uint64_t i = 0; i < lines; i++) {
+		table[i * 8] = ((i * 2654435761ull + 40503) % lines);
+	}
+	/* (that is not always one cycle: whichever it is, it is long enough for the loads below to leave the caches) */
+	for (uint64_t i = 0; i < lines; i++) {
+		(void) table[at * 8];
+		at = table[at * 8];
+	}
+	began = mach_absolute_time();
+	for (uint64_t i = 0; i < loads; i++) {
+		at = table[at * 8];
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &nanos);
+	result = (uint32_t)(nanos * 10 / loads + (at == ~0ull));
+	kmem_free(kernel_map, memory, size);
+	return result;
+}
+
+static int
+sysctl_memlat(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char text[96];
+
+	snprintf(text, sizeof(text), "l2 %u l3 %u dram %u", chase(256u << 10), chase(3u << 20), chase(96u << 20));
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+
+SYSCTL_PROC(_kern_hackios, OID_AUTO, memlat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_memlat, "A",
+    "dependent-load latency from 256 KB, 3 MB and 96 MB, in tenths of a nanosecond (runs the test)");
 
 /*
  * Boot-arg cpuload=MS: every MS milliseconds, how busy each of our cores was meanwhile, in
@@ -640,7 +976,7 @@ hk_ddr_quiesce(void)
  */
 #define GOV_TICK_MS             20
 #define GOV_TICK_DARK_MS        250
-#define GOV_START_SECONDS       45      /* the lock screen comes at 26 s, the slower cores at 28 s */
+#define GOV_START_SECONDS       45      /* the lock screen comes at 26 s, the slower cores at 28 s (boot-arg gov_start=N) */
 #define GOV_BOOST_MS            150
 #define GOV_DOWN_ROWS           2
 #define GOV_DDR_IDLE_MS         1000
@@ -655,6 +991,13 @@ extern void thread_set_thread_name(thread_t thread, const char *name);
 
 static uint64_t gov_boost_until;
 static bool gov_dark;
+/*
+ * From the performance controller (bsd/dev/hk_perfctl.c), which knows what runs where: the lowest speed each group
+ * is to have for the work it was given (kHz, 0: none), and which groups a touch is to raise (by default all: the
+ * controller narrows it to the clusters the interactive work is on).
+ */
+static uint32_t gov_floor_khz[EPSS_DOMAINS];
+static uint32_t gov_boost_domains = (1u << EPSS_DOMAINS) - 1;
 static uint32_t gov_ddr_high = 0x3fff, gov_ddr_idle = DDR_IDLE, gov_ddr_dark = DDR_IDLE, gov_ddr_now;
 static uint64_t gov_ticks, gov_row_sum[EPSS_DOMAINS], gov_ddr_changes;
 static int gov_event;
@@ -665,16 +1008,93 @@ hk_cpufreq_boost(void)
 {
 	uint64_t until;
 
+	hk_perfctl_touch();
 	if (!gov_on) {
 		return;
 	}
 	clock_interval_to_deadline(GOV_BOOST_MS, NSEC_PER_MSEC, &until);
 	os_atomic_store(&gov_boost_until, until, relaxed);
 	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		if (!(os_atomic_load(&gov_boost_domains, relaxed) & (1u << d))) {
+			continue;
+		}
 		if (epss_top[d] >= 0 && epss_row[d] < epss_cap[d]) {
 			epss_set(d, epss_cap[d]);
 		}
 	}
+}
+
+/* The lowest row of a group at or above khz (the top if none is) */
+static int
+row_for_khz(uint32_t d, uint32_t khz)
+{
+	int row = 0;
+
+	while (row < epss_top[d] && epss_khz[d][row] < khz) {
+		row++;
+	}
+	return row;
+}
+
+/*
+ * The performance controller's floor for a group (see gov_floor_khz). With now, a floor above the group's row
+ * raises it at once (one register write), as a touch does: a frame that is late cannot wait for the next tick.
+ */
+void
+hk_cpufreq_floor(uint32_t domain, uint32_t khz, bool now)
+{
+	if (domain >= EPSS_DOMAINS || epss_top[domain] < 0) {
+		return;
+	}
+	os_atomic_store(&gov_floor_khz[domain], khz, relaxed);
+	if (now && os_atomic_load(&gov_on, acquire)) {
+		int row = row_for_khz(domain, khz);
+
+		if (row > epss_row[domain]) {
+			epss_set(domain, row);
+		}
+	}
+}
+
+void
+hk_cpufreq_boost_domains(uint32_t mask)
+{
+	os_atomic_store(&gov_boost_domains, mask, relaxed);
+}
+
+/* What a group runs at now and at most (kHz; 0: not ours, or cpufreq=0) */
+uint32_t
+hk_cpufreq_cur_khz(uint32_t domain)
+{
+	if (domain >= EPSS_DOMAINS || epss_top[domain] < 0) {
+		return 0;
+	}
+	return epss_khz[domain][epss_row[domain]];
+}
+
+/* The row a group was asked for and a row's voltage (mV, 0 if not known) */
+int
+hk_cpufreq_row(uint32_t domain)
+{
+	return domain < EPSS_DOMAINS && epss_top[domain] >= 0 ? epss_row[domain] : -1;
+}
+
+uint32_t
+hk_cpufreq_mv(uint32_t domain, int row)
+{
+	if (domain >= EPSS_DOMAINS || row < 0 || row > epss_top[domain]) {
+		return 0;
+	}
+	return epss_mv[domain][row];
+}
+
+uint32_t
+hk_cpufreq_max_khz(uint32_t domain)
+{
+	if (domain >= EPSS_DOMAINS || epss_top[domain] < 0) {
+		return 0;
+	}
+	return epss_khz[domain][epss_top[domain]];
 }
 
 /* The screen off or on (bsd/dev/hk_power.c): the memory's vote changes on the governor's thread, at once */
@@ -682,6 +1102,7 @@ void
 hk_cpufreq_display(bool on)
 {
 	os_atomic_store(&gov_dark, !on, relaxed);
+	hk_perfctl_display(on);
 	if (on) {
 		hk_cpufreq_boost();
 	}
@@ -748,7 +1169,12 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint64_t idle_before[MAX_CPUS] = { 0 }, then, busy_at;
 
-	delay_for_interval(GOV_START_SECONDS * 1000, NSEC_PER_MSEC);
+	{
+		uint32_t start = GOV_START_SECONDS;
+
+		PE_parse_boot_argn("gov_start", &start, sizeof(start));     /* tests: the steady state is what they measure, sooner */
+		delay_for_interval(start * 1000, NSEC_PER_MSEC);
+	}
 	then = busy_at = mach_absolute_time();
 	for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
 		ml_cpu_idle_time((int)i, &idle_before[i]);
@@ -770,7 +1196,7 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
 			uint64_t idle = 0, spent;
-			uint32_t d = domain_of(topology->cpus[i].phys_id);
+			uint32_t d = domain_of(i);
 
 			if (!ml_cpu_idle_time((int)i, &idle)) {
 				continue;
@@ -794,9 +1220,11 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 			while (target < epss_top[d] && epss_khz[d][target] < want) {
 				target++;
 			}
-			if (boosted) {
+			if (boosted && (os_atomic_load(&gov_boost_domains, relaxed) & (1u << d))) {
 				target = epss_top[d];
 			}
+			/* (the controller sets floors with the screen off only for work with deadlines: audio, say) */
+			target = MAX(target, row_for_khz(d, os_atomic_load(&gov_floor_khz[d], relaxed)));
 			if (target < epss_row[d] - GOV_DOWN_ROWS) {
 				target = epss_row[d] - GOV_DOWN_ROWS;
 			}
@@ -873,7 +1301,9 @@ hk_cpufreq_init(void)
 		return;
 	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
-		cores[domain_of(topology->cpus[i].phys_id)]++;
+		if (domain_of(i) < EPSS_DOMAINS) {
+			cores[domain_of(i)]++;
+		}
 	}
 	/* (whichever core this thread happens to be on, and stays on or not: it only goes to the log) */
 	here = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;

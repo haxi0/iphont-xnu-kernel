@@ -674,6 +674,7 @@ clock_source(const char *name, uint32_t rcgr, uint32_t source)
 }
 
 static bool measure_clocks(void);
+static bool resuming;                   /* hk_gpu_resume() is running the steps again */
 
 /*
  * The clocks the device tree gives the GMU and the SMMU, at the rates both the vendor's driver
@@ -717,7 +718,7 @@ step_clocks(void)
 	    !clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false)) {
 		return false;
 	}
-	return measure_clocks();
+	return resuming || measure_clocks();     /* (four clocks, 27 ms each: shown once at the start, not at every wake) */
 }
 
 /*
@@ -895,6 +896,8 @@ measure_clocks(void)
  * What every later step stands on: CX powered, the GMU's clock running by its control register,
  * and the register bus's clock running by measurement (see above).
  */
+static bool cx_measured;                /* cx_ready() has measured the register bus's clock since CX last came on */
+
 static bool
 cx_ready(void)
 {
@@ -909,6 +912,9 @@ cx_ready(void)
 		    cx_is_on() ? "on" : "off", gmu_clock);
 		return false;
 	}
+	if (cx_measured) {
+		return true;            /* (measured since CX came on: 28 ms a time, and nothing between the steps takes the clock away) */
+	}
 	ahb_hz = measure_quietly(GPUCC_DEBUG_AHB);
 	if (ahb_hz == MEASURE_FAILED) {
 		printf("adreno: %u: the frequency counter did not finish (step 5 shows whether it works)\n", step);
@@ -919,6 +925,7 @@ cx_ready(void)
 		printf("adreno: %u: without that clock a register of the GPU block would not answer: not touching it\n", step);
 		return false;
 	}
+	cx_measured = true;
 	return true;
 }
 
@@ -1405,6 +1412,12 @@ struct gpu_block {
 static bool
 block_new(struct gpu_space *space, struct gpu_block *block, uint64_t address, uint32_t size, uint64_t attributes)
 {
+	if (block->memory != 0) {
+		/* the steps run again (the GPU given back and started again, gpu_cycle): the memory of the first time is let go, the
+		   address is mapped to the new at once, below -- the block is stopped, nothing reads through the old mapping */
+		kmem_free(kernel_map, block->memory, round_page(block->size));
+		block->memory = 0;
+	}
 	block->address = address;
 	block->size = (size + 4095) & ~4095u;
 	if (kmem_alloc(kernel_map, &block->memory, round_page(block->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
@@ -1813,6 +1826,7 @@ step_gmu_space(void)
 	if (gmu_firmware == NULL) {
 		return false;
 	}
+	gmu_block_count = 0;            /* (a second start finds the blocks of the first, which block_new() lets go) */
 	for (uint64_t at = 0; at + sizeof(struct gmu_firmware_block) <= gmu_firmware_size;) {
 		struct gmu_firmware_block block;
 
@@ -2457,6 +2471,17 @@ step_core_power(void)
 	return !space_faulted(&gmu_space);
 }
 
+#include "hk_a650_hwcg.h"
+
+static bool
+hwcg_wanted(void)
+{
+	uint32_t on = 1;
+
+	PE_parse_boot_argn("gpu_hwcg", &on, sizeof(on));
+	return on != 0;
+}
+
 /* ---- step 18: the 3D core's memory and its microcode -------------------------------------------------------- */
 
 /*
@@ -2887,6 +2912,23 @@ step_core_start(void)
 	}
 	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 3);
 	put(&gpu, "rbbm_perfctr_gpu_busy_masked", RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+	/*
+	 * Hardware clock gating (Linux a6xx_set_hwcg): each block's clock stops by itself when it has nothing to do. Without it
+	 * the whole core's clock tree toggles for as long as the core is powered, drawing or not. The SP's clock is stopped
+	 * through the GMU while the table is written. gpu_hwcg=0: as before.
+	 */
+	if (hwcg_wanted()) {
+		const uint32_t clock_cntl_on = 0x8aa8aa82;
+		uint32_t sp = get(&gmu, "gx_sptprac_clock_control", GMU_WORD(0x80));
+
+		put(&gmu, "gx_sptprac_clock_control", GMU_WORD(0x80), sp & ~1u);
+		for (unsigned i = 0; i < sizeof(a650_hwcg) / sizeof(a650_hwcg[0]); i++) {
+			wr(gpu.base + GPU_WORD(a650_hwcg[i].reg), a650_hwcg[i].value);
+		}
+		put(&gmu, "gx_sptprac_clock_control", GMU_WORD(0x80), sp | 1u);
+		put(&gpu, "rbbm_clock_cntl", RBBM_CLOCK_CNTL, clock_cntl_on);
+		printf("adreno: %u: hardware clock gating on (%zu registers)\n", step, sizeof(a650_hwcg) / sizeof(a650_hwcg[0]));
+	}
 	put64(&gpu, "uche_write_range_max", UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
 	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x0001fffffffff000ull);
 	put64(&gpu, "uche_write_thru_base", UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
@@ -3214,6 +3256,7 @@ gpu_block_stop(void)
 	uint32_t slumber[3] = { 0, 0, 0 };
 	bool power_off = false;
 
+	cx_measured = false;
 	step = 0;
 	newest_step = ~0u;
 	if (core_runs && core_is_on) {
@@ -3540,6 +3583,16 @@ bool
 hk_gpu_ready(void)
 {
 	return gpu_kept;
+}
+
+/* The GPU block's power switches, for the log (bsd/dev/hk_power.c at sleep): bit 0 CX on, bit 1 GX (the 3D core) on; -1 no GPU */
+int
+hk_gpu_power_bits(void)
+{
+	if (!gpu_kept) {
+		return -1;
+	}
+	return (cx_is_on() ? 1 : 0) | ((rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) ? 2 : 0);
 }
 
 /* The answers to msm's GET_PARAM (Linux's adreno_get_param for this GPU; the numbers are msm_drm.h's). */
@@ -4236,6 +4289,103 @@ static bool(*const steps[])(void) = {
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
+/*
+ * The system's sleep (bsd/dev/hk_power.c; iokit/Kernel/HKGPU.cpp holds its lock from the one to the other, so no program
+ * submits, maps or waits meanwhile, and nothing here is called that touches the block's registers): the GPU block is given
+ * back as it is at the end of a run (gpu_block_stop(): the GMU told to slumber, the zap shader and the CX half given up),
+ * and started again by the same steps. Everything a program has -- its buffers' memory and tables, its fences -- is memory
+ * of ours and stays; what the hardware held is rebuilt: the SMMU's contexts (the core's tables are the ones the programs'
+ * share the first GB of, so their root entries still point right), the GMU, the ring, the core's state. The fence word,
+ * which the steps start at 0, is put back to the last submission's number, so that every fence that was passed stays so.
+ * The vendor's driver does the same in a6xx_gmu_suspend / a6xx_gmu_resume. gpu_cycle=N tries it N times at the start.
+ */
+static bool gpu_asleep;
+
+bool
+hk_gpu_suspend(void)
+{
+	uint64_t began = mach_absolute_time(), ns;
+	bool was = quiet;
+
+	if (!gpu_kept || gpu_asleep || !core_runs) {
+		return false;
+	}
+	for (int i = 0; i < 500 && !hk_gpu_done(gpu_fence); i++) {
+		sleep_ms(1);
+	}
+	if (!hk_gpu_done(gpu_fence)) {
+		printf("adreno: sleep: the 3D core has not finished submission %u: the GPU stays on for this sleep\n", gpu_fence);
+		return false;
+	}
+	if (gpu_irq) {
+		wr(gpu.base + RBBM_INT_0_MASK, 0);
+		gic_v3_spi_mask(GPU_INTID);
+	}
+	quiet = true;
+	gpu_block_stop();
+	quiet = was;
+	gpu_asleep = true;
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	printf("adreno: sleep: the GPU block is given back (CX %s, GX %s) in %llu ms; submissions up to %u are done\n",
+	    cx_is_on() ? "ON" : "off", (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) ? "ON" : "off", ns / NSEC_PER_MSEC, gpu_fence);
+	return true;
+}
+
+bool
+hk_gpu_resume(void)
+{
+	uint64_t began = mach_absolute_time(), ns;
+	bool ok = false;
+
+	if (!gpu_asleep) {
+		return true;
+	}
+	for (int attempt = 1; attempt <= 2 && !ok; attempt++) {
+		ok = true;
+		quiet = true;
+		ring_at = ring_sent = 0;
+		resuming = true;
+		char times[160] = "";
+		size_t used = 0;
+
+		for (step = 1; step <= last_step && ok; step++) {
+			uint64_t from = mach_absolute_time(), took;
+
+			if (!(skip_steps & 1u << step) && !steps[step - 1]()) {
+				printf("adreno: wake: attempt %u: step %u FAILED\n", attempt, step);
+				ok = false;
+				break;
+			}
+			absolutetime_to_nanoseconds(mach_absolute_time() - from, &took);
+			if (took >= 10 * NSEC_PER_MSEC && used < sizeof(times) - 16) {
+				used += (size_t) snprintf(times + used, sizeof(times) - used, " %u:%llu", step, took / NSEC_PER_MSEC);
+			}
+		}
+		printf("adreno: wake: steps that took 10 ms or more (step:ms):%s\n", times);
+		if (!ok && attempt == 1) {
+			gpu_block_stop();
+		}
+	}
+	quiet = true;
+	resuming = false;
+	if (ok) {
+		ring_space = &core_space;       /* (the core's own tables: a program's are switched to again at its next submission) */
+		bzero((void *)core_scratch.memory, 4096);
+		*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = gpu_fence;
+		to_memory(core_scratch.memory, 4096);
+		gpu_timed = gpu_fence;
+		if (gpu_irq) {
+			gpu_interrupt_on();
+			gic_v3_spi_unmask(GPU_INTID);
+		}
+		gpu_asleep = false;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	printf("adreno: wake: the GPU block is started again %s in %llu ms\n", ok ? "(takes commands)" : "FAILED: THE GPU IS LOST",
+	    ns / NSEC_PER_MSEC);
+	return ok;
+}
+
 /* ---- beside the steps: how warm the GPU is ------------------------------------------------------------------ */
 
 /* (its temperature: the thermal service's, hk_gpu_temperature() below) */
@@ -4306,7 +4456,7 @@ hk_adreno_minute(void)
 {
 	int32_t tenths = hk_gpu_temperature();
 
-	if (!gpu_kept) {
+	if (!gpu_kept || gpu_asleep) {
 		return;
 	}
 	bool was = quiet;
@@ -4506,7 +4656,7 @@ hk_adreno_init(void)
 		"the GMU's address space", "the GMU's firmware", "the GMU's start", "the GMU's message queues", "the 3D core's power",
 		"the 3D core's address space", "the zap shader", "the 3D core's start", "the 3D core's first commands", "a frame"
 	};
-	uint32_t only = 0, done = 0, failed = 0, keep = 0;
+	uint32_t only = 0, done = 0, failed = 0, keep = 0, cycles = 0;
 	bool by_itself = false;
 
 	kona = instantnoodle_board();
@@ -4562,6 +4712,31 @@ hk_adreno_init(void)
 		}
 		printf("adreno: step %u: done\n", step);
 		done = step;
+	}
+	/*
+	 * gpu_cycle=N (a test of the way to the GPU's power collapse in a system sleep): the block is given back as at the end of
+	 * a run (gpu_block_stop(): the GMU told to slumber, the zap shader and the CX half given up) and the steps run again
+	 * in this boot, N times, before anything uses the GPU. What it shows is whether a started-again GPU takes work: step 21
+	 * and 22 are the proof.
+	 */
+	PE_parse_boot_argn("gpu_cycle", &cycles, sizeof(cycles));
+	for (uint32_t cycle = 1; cycle <= cycles && !failed && done >= 21; cycle++) {
+		printf("adreno: cycle %u of %u: the GPU block is given back and started again\n", cycle, cycles);
+		gpu_block_stop();
+		ring_at = ring_sent = 0;
+		done = 0;
+		for (step = 1; step <= last_step; step++) {
+			if (skip_steps & 1u << step) {
+				continue;
+			}
+			if (!steps[step - 1]()) {
+				printf("adreno: cycle %u: step %u: FAILED\n", cycle, step);
+				failed = step;
+				break;
+			}
+			done = step;
+		}
+		printf("adreno: cycle %u: %s (step %u)\n", cycle, failed ? "NOT STARTED AGAIN" : "STARTED AGAIN", done);
 	}
 	PE_parse_boot_argn("adreno_keep", &keep, sizeof(keep));
 	if (keep) {

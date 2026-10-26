@@ -5,10 +5,13 @@
 !/.gitignore
 !/.github/
 !/README.md
+!/AGENTS.md
+!/CLAUDE.md
 !/LICENSE
 !/common/
 !/docs/
 !/xl
+!/iphont
 !/mkxnuimg.py
 !/xnu-build.sh
 !/xnu-env.sh
@@ -49,6 +52,7 @@ __pycache__/
 !/xnuloader/darwinfile.c
 !/xnuloader/identity.h
 !/xnuloader/loader.c
+!/xnuloader/iphont.c
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
 

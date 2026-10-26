@@ -43,6 +43,7 @@ struct hk_touch {
 #ifdef KERNEL
 /* For drivers; not from interrupt context. */
 void hk_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+void hk_touch_inject(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void hk_input_init(void);
 void hk_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void hk_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
@@ -85,6 +86,15 @@ uint32_t hk_cpufreq_khz(uint32_t domain, int row);   /* how fast that row is, 0 
 void hk_cpufreq_cap(uint32_t domain, int row);       /* the group at that row at most (the thermal service) */
 void hk_cpufreq_boost(void);       /* a touch or a key: every group at its top for a moment (the governor) */
 void hk_cpufreq_display(bool on);  /* the screen off or on: the memory's bandwidth follows (bsd/dev/hk_power.c) */
+void hk_cpufreq_floor(uint32_t domain, uint32_t khz, bool now);   /* the performance controller's lowest speed for a group */
+void hk_cpufreq_boost_domains(uint32_t mask);        /* the groups a touch raises (default all) */
+uint32_t hk_cpufreq_cur_khz(uint32_t domain);        /* the speed a group was asked for, 0 if not ours */
+uint32_t hk_cpufreq_max_khz(uint32_t domain);        /* its top speed, 0 if not ours */
+int hk_cpufreq_row(uint32_t domain);                 /* the row it was asked for, -1 if not ours */
+uint32_t hk_cpufreq_mv(uint32_t domain, int row);    /* a row's voltage from EPSS's table, mV */
+void hk_perfctl_init(void);        /* the performance controller of the Edge scheduler (bsd/dev/hk_perfctl.c) */
+void hk_perfctl_display(bool on);  /* ... told when the screen goes off or on */
+void hk_perfctl_touch(void);       /* ... and of a touch or key (from hk_cpufreq_boost(), any context) */
 void hk_thermal_init(void);        /* the thermal service: on with cpufreq=1 unless thermal=0 (bsd/dev/hk_thermal.c) */
 void hk_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void hk_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
@@ -111,6 +121,14 @@ const uint8_t *hk_wifi_driver_file(const char *name, uint64_t *size);     /* a f
 bool hk_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
 bool hk_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
 bool hk_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
+/* on PCI (the OnePlus 8): QRTR carried by the radio's MHI channel instead of GLINK (bsd/dev/hk_wifi.c) */
+void hk_wifi_qrtr_input(const void *data, unsigned long length);           /* a datagram from the radio */
+void hk_wifi_qrtr_carrier(int (*send)(const void *data, unsigned long length));    /* who sends ours; NULL: none */
+/* the system's sleep (bsd/dev/hk_power.c): the radio off before it, on again after it, as it was */
+void hk_wifi_sleep(void);
+void hk_wifi_wake(void);
+int hk_lx_suspend(void);           /* the driver's firmware stopped for the sleep: 0, or an errno (then it is left running) */
+int hk_lx_resume(void);            /* ... and started again: 0, or an errno (then the driver is down) */
 /* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
 bool hk_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
 

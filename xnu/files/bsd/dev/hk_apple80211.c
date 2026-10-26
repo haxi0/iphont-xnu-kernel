@@ -150,7 +150,7 @@ struct apple80211_scan_result {
 	uint8_t elements[1024];
 };
 
-/* ASSOCIATE (20): 592 bytes; of what follows the key (the RSN element wifid built, flags) nothing is used */
+/* ASSOCIATE (20): 592 bytes; of what follows the key only the private address is used */
 struct apple80211_assoc {
 	uint32_t version;
 	uint16_t mode, auth_lower, auth_upper, unused_0;
@@ -160,7 +160,9 @@ struct apple80211_assoc {
 	uint32_t key_version, key_length, key_cipher;   /* cipher 10: a passphrase as typed; 6: the key (from 64 hex digits) */
 	uint16_t key_flags, key_index;
 	uint8_t key[64];
-	uint8_t rest[0x250 - 0x88];
+	uint8_t rest[0x1fc - 0x88];             /* the RSN element wifid built (0xcc), the colocated networks' scope, flags */
+	uint8_t private_address[6];             /* iOS's private Wi-Fi address for the network, or zeros */
+	uint8_t rest2[0x250 - 0x202];
 };
 
 #define CIPHER_PMK              6
@@ -177,7 +179,8 @@ struct apple80211_link_changed {
 	uint8_t unused_3[4];
 };
 
-_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
+_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48 &&
+    offsetof(struct apple80211_assoc, private_address) == 0x1fc,
     "the association request as iOS 16.5 has it");
 _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
     "the link event as iOS 16.5 reads it");
@@ -201,6 +204,7 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "hk-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+static unsigned room_least = ~0u, elements_cut; /* the least room for elements a scan's result was given, and how often it was short */
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -240,6 +244,20 @@ give(const struct apple80211req *request, const void *data, size_t length)
 	       request->req_len);
 }
 
+/* As many of a network's elements, whole, as there is room for: the length written. */
+static unsigned
+elements_for_ios(const uint8_t *in, unsigned length, uint8_t *out, unsigned room)
+{
+	unsigned written = 0;
+
+	for (unsigned at = 0; at + 2 <= length && at + 2 + in[at + 1] <= length && written + 2 + in[at + 1] <= room;
+	    at += 2 + in[at + 1]) {
+		memcpy(out + written, in + at, 2 + in[at + 1]);
+		written += 2 + in[at + 1];
+	}
+	return written;
+}
+
 /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
 static int
 give_network(const struct apple80211req *request, const struct hk_sta_bss *bss)
@@ -265,8 +283,10 @@ give_network(const struct apple80211req *request, const struct hk_sta_bss *bss)
 	result->ssid_length = bss->ssid_length;
 	memcpy(result->ssid, bss->ssid, bss->ssid_length);
 	result->age_ms = bss->age_ms;
-	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
-	memcpy(result->elements, bss->elements, result->elements_length);
+	/* as many whole elements as there is room for: never none of them, or the framework sees no RSN and builds no join */
+	room_least = room < room_least ? room : room_least;
+	result->elements_length = (uint16_t)elements_for_ios(bss->elements, bss->elements_length, result->elements, room);
+	elements_cut += result->elements_length < bss->elements_length && bss->elements_length > room;
 	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
 	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
 	    at += 2 + bss->elements[at + 1]) {
@@ -302,12 +322,19 @@ get(struct apple80211req *request)
 		/*
 		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
 		 * bits alone, from the first (the framework hands in a buffer that begins after the old
-		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
-		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
-		 * for a WPA2 network ("Unable to join").
+		 * header's version word). TKIP and its Michael check, AES, AES-CCM, power management, short
+		 * slot and preamble, WPA2, WME, short guard interval at 20 MHz. Read wrong, the framework sees
+		 * no WPA2 and builds no join for a WPA2 network ("Unable to join"); without TKIP it builds none
+		 * for a "mixed" network, TKIP to everybody (-3903 before the ASSOCIATE: its group cipher is one
+		 * the card cannot do) -- the radio does TKIP, and the station takes such a group key.
+		 * Protected management frames (52: wifid's 80211W_ENABLED), SAE (75: the framework's
+		 * Apple80211IsAuthSelAllowed() for AKM 8; with it WPA3 and the WPA3 side of a transition
+		 * network) -- where the bits are as iOS 26's IO80211 and wifid read them, and Apple's own
+		 * driver sets them (AppleBCMWLANCore::getCARD_CAPABILITIES). Not FT (33): the station does
+		 * not do it, and iOS joins an FT network by its PSK then.
 		 */
 		uint8_t bits[13] = { 0 };
-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+		static const uint8_t has[] = { 1, 2, 3, 6, 9, 10, 12, 14, 17, 19, 52, 75 };
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
@@ -535,8 +562,19 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 		error = EINVAL;
 		goto out;
 	}
+	/*
+	 * iOS's private Wi-Fi address for this network, if it uses one (found by its value: wifid's
+	 * "WFMacRandomisation: Private mac address being used" against the request's bytes). Taken as
+	 * the framework takes it: set, and locally administered unicast.
+	 */
+	if (request->req_len >= sizeof(*asked) && copyin(request->req_data + offsetof(struct apple80211_assoc, private_address),
+	    asked->private_address, sizeof(asked->private_address)) == 0 && (asked->private_address[0] & 3) == 2) {
+		memcpy(what->address, asked->private_address, sizeof(what->address));
+	}
 	what->ssid_length = (uint8_t)asked->ssid_length;
 	memcpy(what->ssid, asked->ssid, asked->ssid_length);
+	/* the key management the framework chose (APPLE80211_AUTHTYPE_*, one bit): the station joins with that one */
+	what->akm = asked->auth_upper == 0x0008 ? 2 : asked->auth_upper == 0x0400 ? 6 : asked->auth_upper == 0x1000 ? 8 : 0;
 	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
 	if (asked->key_length == 0) {
 		what->security = HK_STA_OPEN;
@@ -672,12 +710,31 @@ static struct {
 } kinds[96];
 static unsigned kind_count;
 
-static void
+/*
+ * The requests of the run in order, but for those asked for ever (the network joined, a scan and its
+ * results, the power, the channels, the country): what a join was preceded by, for the summary.
+ */
+static struct {
+	int32_t type, value;
+	uint32_t length;
+	int16_t error;
+	bool set;
+} trail[128];
+static unsigned trail_count;
+
+/* (how many times this kind has been asked, this one with them; 0 if there was no room to count it) */
+static unsigned
 note(const struct apple80211req *request, bool is_set, int error)
 {
-	unsigned i;
+	unsigned i, times = 0;
+	int32_t t = request->req_type;
 
 	lck_mtx_lock(&apple80211_lock);
+	if (t != 103 && t != 11 && t != 10 && t != 383 && t != 51 && t != 19 && t != 254 && t != 27) {
+		trail[trail_count % 128] = (typeof(trail[0])) { .type = t, .value = request->req_val, .length = request->req_len,
+			                                        .error = (int16_t)error, .set = is_set };
+		trail_count++;
+	}
 	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
 	}
 	if (i < sizeof(kinds) / sizeof(kinds[0])) {
@@ -687,8 +744,10 @@ note(const struct apple80211req *request, bool is_set, int error)
 		kinds[i].times++;
 		kinds[i].answered += error == 0;
 		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
+		times = kinds[i].times;
 	}
 	lck_mtx_unlock(&apple80211_lock);
+	return times;
 }
 
 void
@@ -700,6 +759,12 @@ hk_apple80211_summary(void)
 		return;
 	}
 	said = true;
+	printf("apple80211: in this run: a scan's result was given room for %u bytes of elements at the least; %u were cut short\n",
+	    room_least, elements_cut);
+	for (unsigned n = trail_count > 128 ? trail_count - 128 : 0; n < trail_count; n++) {
+		printf("apple80211: trail %u: %s %d (%s), value %d, %u bytes: %d\n", n, trail[n % 128].set ? "set" : "get",
+		    trail[n % 128].type, type_name(trail[n % 128].type), trail[n % 128].value, trail[n % 128].length, trail[n % 128].error);
+	}
 	for (unsigned i = 0; i < kind_count; i++) {
 		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
 		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
@@ -713,10 +778,10 @@ hk_apple80211_summary(void)
 errno_t
 hk_apple80211_ioctl(u_long command, void *data)
 {
-	static unsigned said;
 	struct apple80211req *request = data;
 	char who[32] = "?", what[200] = "";
 	bool is_set = command == SIOCSA80211;
+	unsigned times;
 	int error;
 
 	if (command != SIOCSA80211 && command != SIOCGA80211) {
@@ -724,10 +789,9 @@ hk_apple80211_ioctl(u_long command, void *data)
 	}
 	proc_selfname(who, sizeof(who));
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
-	note(request, is_set, error);
-	/* (a request that is repeated for ever is said a few hundred times) */
-	if (said < 800) {
-		said++;
+	times = note(request, is_set, error);
+	/* (a kind of request that is repeated for ever -- a scan's results, the network joined -- is said 40 times) */
+	if (times <= 40) {
 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
 		    EOPNOTSUPP ? "REFUSED\n" : "");

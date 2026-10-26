@@ -5,7 +5,8 @@
  *
  *   MiniIOSurface.cpp              IOSurface: pixel buffers shared between processes
  *   MiniIOMobileFramebuffer.cpp    IOMobileFramebuffer: the display (the boot framebuffer)
- *   MiniAppleKeyStore.cpp          AppleKeyStore: the keybag of a device without a passcode
+  *   MiniAppleKeyStore.cpp          AppleKeyStore: the keybag of a device without a passcode
+ *   MiniAppleARMBacklight.cpp      AppleARMBacklight: the service brightness requests go to
  *   MiniIONetworkStack.cpp         IONetworkStack: what configd's interface namer waits for
  */
 #ifndef _IOKIT_MINIDRIVERS_H
@@ -16,6 +17,7 @@
 void MiniIOSurfaceStart(IOService * provider);
 void MiniIOMobileFramebufferStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);
+void MiniAppleARMBacklightStart(void);
 void MiniIONetworkStackStart(void);
 
 #endif /* _IOKIT_MINIDRIVERS_H */

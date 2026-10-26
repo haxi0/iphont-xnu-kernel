@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+tools/t [LEVEL | CHECK ...] [options]: the phone's tests, as short as they can be and no shorter.
+
+Levels (each a list of checks, run in ONE boot; the boot is the floor: ~50 s to a settled SpringBoard):
+  host      host-side checks only (no phone): syntax, self-tests, builds that are stale. Seconds.
+  quick     boot pods                       a change to userland or rendering: boots, App Library pods are lit (~75 s)
+  gfx       boot pods frames                + frame pacing of the usual gestures (~110 s)
+  power     boot frames sleep frames        sleep/wake: deep sleep entered and left, frame pacing the same after it (~120 s)
+  display   boot frames sleep1              display, GPU, refresh: pacing, one short sleep, no fallback to autorefresh
+  full      boot pods frames sleep frames sleep_rapid frames powerd idle   extended regression: only when a change is
+                                            architectural, a failure is intermittent, or before a final check (~6 min)
+Checks may be named instead of a level:  tools/t boot sleep
+
+  boot        the system reaches a settled SpringBoard (CPU idle, not by a fixed wait), with no panic
+  pods        the App Library's pods are lighter than their wallpaper (a screenshot, tools/look/check.py)
+  frames      the usual gestures once (~14 s); a second `frames` after a `sleep` is compared with the first
+  sleep       2 sleeps of 3 s from the kernel's own timer: each asserted (the wake came from the timer, the continuous
+              clock ran 3 s, mach time stood still, all but 2 cores off), then the screen woken and unlocked
+  sleep1      one such sleep
+  sleep_rapid 5 sleeps of 2 s in a row
+  powerd      one sleep of 15 s woken through powerd (IOPMSchedulePowerEvent): the iOS wake path itself
+  darkwake    a dark (timer) wake, then the lock button: the screen has to light
+  idle        45 s untouched, then the clocks and the display's state are read
+
+Options:  --no-run  host checks and builds only    --keep  leave userland/rc.jobs.t     --max N  seconds the run may take
+Every phase is timed and written to logs/t-<time>.txt. Needs the phone in the loader (xl state), or in fastboot.
+A boot that does not reach a settled SpringBoard in 100 s without its log growing is stopped and its evidence printed:
+it is not retried (look at the log first). Exit status 0 when every check passed.
+"""
+import concurrent.futures as cf
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(ROOT)
+sys.path.insert(0, os.path.join(ROOT, 'tools', 'wakeperf'))
+
+LEVELS = {
+    'host': [],
+    'quick': ['boot', 'pods'],
+    'gfx': ['boot', 'pods', 'frames'],
+    'power': ['boot', 'frames', 'sleep', 'frames'],
+    'display': ['boot', 'frames', 'sleep1'],
+    'full': ['boot', 'pods', 'frames', 'sleep', 'frames', 'sleep_rapid', 'frames', 'powerd', 'darkwake', 'brightness', 'idle'],
+}
+
+RW = '/hackios/bin/rwtouch'
+PT = '/hackios/bin/power_test'
+ST = '/hackios/bin/sched_test'
+GESTURES = [      # the usual gestures, once: page swipes both ways twice, Search down and closed, Control Center and closed
+    f'{RW} swipe 0.85 0.5 0.15 0.5 300 wait 0.8 swipe 0.15 0.5 0.85 0.5 300 wait 0.8 swipe 0.85 0.5 0.15 0.5 300 wait 0.8 '
+    'swipe 0.15 0.5 0.85 0.5 300 wait 1',
+    f'{RW} swipe 0.5 0.4 0.5 0.7 300 wait 1.2 button home wait 1 swipe 0.92 0.003 0.92 0.5 300 wait 1.5 button home wait 1.5',
+]
+WAKE = [          # the screen after a sleep: a user's wake lights it by itself (`power_test sleep`: the timer as the power key); wait for that, unlock
+    f'{PT} waitdisplay on 8',
+    f'{RW} wait 1 swipe 0.5 0.985 0.5 0.3 200 idle 60 8',
+]
+LOCK = [f'{RW} button lock', f'{PT} waitdisplay off 5']      # as a user leaves it: the screen locked and dark, then the system sleeps
+# (job lines, estimated seconds on the phone)
+CHECKS = {
+    'boot': ([f'{RW} frames 20 90', f'{RW} idle 60 20', f'{RW} mark boot-ok'], 25),
+    'pods': ([f'{RW} swipe 0.85 0.5 0.15 0.5 300 wait 1.2 swipe 0.85 0.5 0.15 0.5 300 wait 2.5 mark shot-library wait 2.5',
+              f'{RW} swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1.5'], 12),
+    'settle': ([f'{RW} uptime 34', f'{RW} idle 50 30'], 8),     # (put in before the first `frames`: the governor takes over at 30 s: gov_start)
+    'frames': ([f'{RW} mark phase'] + GESTURES, 15),
+    # the brightness slider of Control Center, dragged up and down: what iOS asks of the backlight service shows in the kernel log
+    'brightness': ([f'{RW} notify com.hackios.brightness.20 wait 1.5', f'{PT} backlight 20',
+                    f'{RW} notify com.hackios.brightness.90 wait 1.5', f'{PT} backlight 90',
+                    f'{RW} notify com.hackios.brightness.5 wait 1.5', f'{PT} backlight 5'] + LOCK +
+                   [f'{PT} sleep 3 1 dark', f'{RW} button lock', f'{PT} waitdisplay on 6', f'{RW} wait 1.5', f'{PT} backlight woken',
+                    f'{RW} notify com.hackios.brightness.100 wait 1.5', f'{PT} backlight 100'], 22),
+    # Safari (the bottom bar's shadow): started by SpringBoard, its layers written down (MobileSafari has the dump), a picture
+    'safari': (['/hackios/bin/battery_test launch com.apple.mobilesafari', f'{RW} wait 12 mark shot-safari wait 1',
+                f'{RW} notify com.hackios.layers wait 3'], 20),
+    # a notification on the lock screen (and a banner before it): screenshots for looking at materials and shadows
+    'lockshots': ([f'{RW} button lock wait 2 button lock', f'{PT} waitdisplay on 6', f'{RW} wait 2 mark shot-lockscreen wait 2',
+                   '/hackios/bin/sound_test springboard route wait 1 notification com.apple.mobiletimer HackiOS wait 2.5',
+                   f'{RW} mark shot-locknotif notify com.hackios.layers wait 2', f'{RW} button lock wait 2 button lock', f'{RW} wait 3 mark shot-locknotif2 wait 2'], 25),
+    # CPU time by process over 6 Search pull-downs (the gesture that drops to 57 fps): where the cores' 50-75% goes
+    # the widget extensions a wake starts: who uses the processors for the 12 s after it, and where in them (hkprof=2: the programs sample from their start)
+    'wakeprof': ([f'{PT} top start'] + LOCK + [f'{PT} sleep 3 1'] + WAKE + [f'{RW} wait 8', f'{PT} top wake', f'{RW} notify com.hackios.prof wait 3'], 30),
+    # the home screen left alone for 15 s: who uses the processors (the widget extensions burn 40% of a core), and where (hkprof=1)
+    'widgetprof': ([f'{RW} mark phase', f'{PT} top start', f'{RW} notify com.hackios.prof.start', f'{RW} wait 15', f'{PT} top widgets',
+                    f'{RW} notify com.hackios.prof wait 3'], 22),
+    # Search pulled down and closed six times (the gesture that falls to 57 fps): who uses the processors, and the frame times
+    'searchprof': ([f'{RW} mark phase', f'{PT} top start', f'{PT} kprof start', f'{RW} notify com.hackios.prof.start', *[f'{RW} swipe 0.5 0.4 0.5 0.7 300 wait 1.2 button home wait 1.2' for _ in range(6)], f'{PT} kprof search', f'{RW} notify com.hackios.prof wait 2', f'{PT} top search'], 24),
+    # who uses the processors during the usual gestures (kern.hackios.top): twice, to see what a wake changes
+    'cpuprof': ([f'{PT} top start'] + [GESTURES[0].replace(' wait 1', ' wait 0.3') if False else GESTURES[0]] + [f'{PT} top gestures1'] + LOCK +
+                [f'{PT} sleep 15 1 powerd'] + WAKE + [f'{PT} top start2', GESTURES[0], f'{PT} top gestures2'], 45),
+    'sleep': ([f'{PT} mem before'] + LOCK + [f'{PT} sleep 3 2'] + WAKE + [f'{PT} mem after'], 24),
+    'sleep1': (LOCK + [f'{PT} sleep 3 1'] + WAKE, 14),
+    'sleep_rapid': ([f'{PT} sleep 2 5'] + WAKE, 25),
+    'darkwake': (LOCK + [f'{PT} sleep 3 1 dark', f'{RW} mark darkwake', f'{RW} button lock', f'{PT} waitdisplay on 6'] + [f'{RW} wait 1 swipe 0.5 0.985 0.5 0.3 200 idle 60 8'], 20),
+    'powerd': ([f'{PT} cpu before', f'{PT} lat before'] + LOCK + [f'{PT} sleep 15 1 powerd', f'{PT} cpu wake', f'{PT} lat wake'] + WAKE + [f'{RW} wait 4', f'{PT} cpu later', f'{PT} lat later'], 36),
+    'idle': ([f'{RW} wait 45', f'{PT} status'], 47),
+    # the scheduler (docs/SCHEDULER.md): the kernel's own checks on a settled system, then the repeatable workloads
+    # (sched_test), with the kernel's view before and after (kern.hackios.amp); run with T_BOOTARGS=sched=clutch for the baseline
+    'sched': ([f'{ST} amp before', f'{ST} check', f'{ST} spin df 2 3', f'{ST} spin bg 3 3', f'{ST} spin ui 7 3',
+               f'{ST} fair 4 2 14', f'{ST} frames 16.67 4000 5 6 ut', f'{ST} frames 8.33 3000 4 7 df', f'{ST} lat ui 4 3 7 df',
+               f'{ST} lat df 4 3', f'{ST} mix 6', f'{ST} pi 4 2000', f'{ST} amp after'], 55),
+    # frame pacing of a render loop under load, repeated (the 120 Hz case with 7 busy default-QoS threads, and 60 Hz with utility load)
+    'schedframes': ([f'{ST} frames 8.33 3000 4 7 df', f'{ST} frames 8.33 3000 4 7 df', f'{ST} frames 8.33 3000 4 7 df',
+                     f'{ST} frames 16.67 4000 4 6 ut', f'{ST} frames 16.67 4000 4 6 ut', f'{ST} amp frames'], 28),
+    # priority inheritance through a lock, alone: compare T_BOOTARGS=sched_edge_promote=0 and sched=clutch
+    'schedpi': ([f'{ST} pi 4 2000', f'{ST} amp pi1', f'{ST} pi 4 2000', f'{ST} amp pi2', f'{ST} pi 4 2000', f'{ST} pi 4 500'], 18),
+    # the kernel's scheduler state where it is put (between gestures: what the UI did to it)
+    'amp': ([f'{ST} amp mark'], 2),
+}
+BOOTARGS = ('cpus=8 cpufreq=1 bootcpu=7 ufs=2 root_apfs=ufs_darwin gpu=1 touch_lat=1 sb_clock=24 log_launchd=0 gov_start=30')
+BOOT_STUCK_S = 100          # a boot is at a settled SpringBoard in 45-55 s; past this, with a log that no longer grows, it is stuck
+BOOT_SLOW_S = 160           # ... and past this even a log that grows is too slow to be called a boot
+
+times = {}
+verdicts = []
+
+
+def say(text=''):
+    print(text, flush=True)
+
+
+def check(name, ok, detail=''):
+    verdicts.append((name, ok))
+    say(f'  {"PASS" if ok else "FAIL"}  {name}{": " + detail if detail else ""}')
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, shell=isinstance(cmd, str), text=True, capture_output=True, **kw)
+
+
+def timed(name):
+    class T:
+        def __enter__(self):
+            self.t = time.time()
+
+        def __exit__(self, *a):
+            times[name] = time.time() - self.t
+    return T()
+
+
+# ---- host-side checks ---------------------------------------------------------------------------------------------
+def host_checks():
+    out = []
+    r = sh('bash -n xl && bash -n tools/wakeperf/run.sh && bash -n tools/look/run.sh')
+    out.append(('shell syntax (xl, run scripts)', r.returncode == 0, r.stderr.strip()))
+    r = sh('python3 -I -m py_compile tools/t tools/frames.py tools/wakeperf/report.py tools/look/diff.py tools/look/check.py')
+    out.append(('python syntax', r.returncode == 0, r.stderr.strip()[-200:]))
+    r = sh('python3 tools/wakeperf/report.py --self-test')
+    out.append(('report.py self-test', r.returncode == 0, r.stdout.strip() or r.stderr.strip()[-200:]))
+    r = sh('python3 -I tools/sched-test/amp.py --self-test && bash -n tools/sched-test/qemu.sh')
+    out.append(('sched-test amp.py self-test', r.returncode == 0, r.stdout.strip() or r.stderr.strip()[-200:]))
+    r = sh("nix-shell -p python3Packages.numpy python3Packages.pillow --run 'python3 tools/look/check.py --self-test'")
+    out.append(('look/check.py self-test', r.returncode == 0, r.stdout.strip() or r.stderr.strip()[-200:]))
+    return out
+
+
+# ---- builds, cached by what they are made of ------------------------------------------------------------------------
+def kernel_stale():
+    binary = 'xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837'
+    if not os.path.exists(binary):
+        return True
+    dirs = ' '.join(f'xnu-src/xnu-8796.121.2/{d}' for d in ('bsd', 'osfmk', 'iokit', 'libkern', 'pexpert', 'config', 'EXTERNAL_HEADERS'))
+    r = sh(f'find {dirs} -type f -newer {binary} \\( -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.s" -o -name "*.S" -o -name "*.m" \\) -print -quit')
+    return bool(r.stdout.strip())
+
+
+def build_kernel():
+    if not kernel_stale():
+        return 'kernel up to date'
+    r = sh("nix-shell --run 'SKIP=\"loader images boot\" common/build.sh instantnoodle'")
+    if kernel_stale():      # the build ends in an error that is expected (xnu/README.md), so judge by the binary: still older than the sources = failed
+        errors = [l for l in open('out/kernel-build.log', errors='replace') if ' error: ' in l]
+        return 'KERNEL BUILD FAILED: ' + (errors[0].strip()[-300:] if errors else r.stderr[-300:])
+    return 'kernel built'
+
+
+def userland_hash(jobs):
+    h = hashlib.sha256()
+    h.update(jobs.encode())
+    for base, _, files in sorted(os.walk('userland/src')):
+        for f in sorted(files):
+            with open(os.path.join(base, f), 'rb') as fh:
+                h.update(f.encode() + fh.read())
+    for f in ('userland/build.sh', 'userland/mkjobs.py', 'userland/init.c' if os.path.exists('userland/init.c') else 'userland/build.sh'):
+        with open(f, 'rb') as fh:
+            h.update(fh.read())
+    return h.hexdigest()[:16]
+
+
+# userland/build.sh's default INJECT, and MobileSafari given the layer dump (src/inject_sb.c: com.hackios.layers) for `safari`
+INJECT = ('/hackios/lib/libhackios.dylib backboardd containermanagerd containermanagerd_system\n'
+          '/hackios/lib/libhackios-sb.dylib SpringBoard MobileSafari CalendarWidgetExtension WeatherWidget chronod\n/hackios/lib/libhackios-media.dylib mediaserverd\n'
+          '/hackios/lib/libhackios-app.dylib Sileo\n/hackios/lib/libhackios-tweaks.dylib Preferences')
+
+
+def build_userland(jobs):
+    """(root.apfs, flashboot.apfs) for this job and these sources: from the cache, or built once."""
+    cache = f'out/tcache/{userland_hash(jobs)}'
+    if os.path.exists(f'{cache}/root.apfs'):
+        return cache, 'userland from the cache'
+    with open('userland/rc.jobs.t', 'w') as f:
+        f.write(jobs)
+    env = dict(os.environ, INJECT=INJECT) if any(w in jobs for w in ('MobileSafari', 'mobilesafari', 'widgetprof', 'wakeprof', 'prof.start')) else None
+    r = subprocess.run("nix-shell --run 'GL=1 REST=1 FLASHBOOT=1 CRYPTEXES=flash RC_JOBS=rc.jobs.t userland/build.sh'", shell=True, text=True, capture_output=True, env=env)
+    if r.returncode != 0 or not os.path.exists('userland/flashboot.apfs'):
+        return None, 'USERLAND BUILD FAILED: ' + (r.stderr or r.stdout)[-400:]
+    os.makedirs(cache, exist_ok=True)
+    for name in ('root.apfs', 'flashboot.apfs'):
+        shutil.copy(f'userland/{name}', f'{cache}/{name}')
+    return cache, 'userland built'
+
+
+# ---- the run ------------------------------------------------------------------------------------------------------
+def job_text(names):
+    lines = ['# generated by tools/t: ' + ' '.join(names)]
+    est = 0
+    for n in names:
+        lines += CHECKS[n][0]
+        est += CHECKS[n][1]
+    lines.append(f'{RW} mark done')
+    return '\n'.join(lines) + '\n', est
+
+
+def watch(logfile, state):
+    """While the run lives: a screenshot at each `t-mark: shot-NAME`, and the boot's progress (stuck: stop it)."""
+    seen, began = set(), time.time()
+    sizes = []
+    while not state['over']:
+        time.sleep(0.5)
+        try:
+            text = open(logfile, 'rb').read().decode('utf-8', 'replace')
+        except OSError:
+            continue
+        sizes.append((time.time(), len(text)))
+        for m in re.finditer(r't-mark: (shot-[\w-]+)', text):
+            if m.group(1) not in seen:
+                seen.add(m.group(1))
+                target = f'logs/t-{state["stamp"]}-{m.group(1)[5:]}.png'
+                r = sh(f'./xl screenshot {target}')
+                state['shots'][m.group(1)[5:]] = target if os.path.exists(target) else None
+        if state['booted'] is not None or 't-mark: boot-ok' in text:
+            state['booted'] = state['booted'] if state['booted'] is not None else time.time() - began
+        elif not state['stopped']:
+            age = time.time() - began
+            grew = len(text) > next((n for t, n in sizes if t >= time.time() - 20), len(text))
+            if age > BOOT_SLOW_S or (age > BOOT_STUCK_S and not grew):
+                state['stopped'] = f'no settled SpringBoard after {age:.0f} s, log {"still growing" if grew else "not growing"}'
+                sh('./xl stop')
+
+
+def run_phone(cache, names, est, max_s, stamp):
+    state = dict(over=False, stopped=None, booted=None, shots={}, stamp=stamp)
+    sleeps = 5 + sum(5 for n in names if n.startswith('sleep') or n == 'powerd') + 15
+    env = dict(os.environ, XL_SECS=str(max_s or int(est + 60 + sleeps)), XL_DONE='t-mark: done', XL_FOLLOW_KEEP='1',
+               XL_RAMDISK=f'{cache}/root.apfs', XL_CMDLINE=f'{BOOTARGS.replace("log_launchd=0", "") if os.environ.get("T_LAUNCHD") else BOOTARGS} sleep_max={max(8, 15 + 5)} ' + os.environ.get('T_BOOTARGS', ''))
+    sh(f'./xl wait 600')
+    r = sh(f'./xl ramdisk {cache}/flashboot.apfs')
+    if r.returncode != 0:
+        return None, state, 'upload failed: ' + (r.stdout + r.stderr)[-200:]
+    before = set(os.listdir('logs'))
+    th = None
+    p = subprocess.Popen('./xl run', shell=True, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for _ in range(100):                      # the log's name is the run's start: wait for it to appear
+        time.sleep(0.2)
+        fresh = sorted(f for f in set(os.listdir('logs')) - before if f.endswith('-run.log.live'))
+        if fresh:
+            break
+    live = 'logs/' + fresh[0] if fresh else None
+    if live:
+        th = threading.Thread(target=watch, args=(live, state), daemon=True)
+        th.start()
+    out = p.communicate()[0]
+    state['over'] = True
+    if th:
+        th.join(2)
+    log = next((l for l in re.findall(r'\[(logs/[\w.-]+)\]', out)), None)
+    return log, state, out.strip()
+
+
+def run_files(log):
+    """The run's log and every live copy of it (the log itself loses its middle past a megabyte; the copies, one every 2 s, keep it)."""
+    if not log:
+        return []
+    base = os.path.basename(log)
+    return [log] + sorted((f'logs/{f}' for f in os.listdir('logs') if f.startswith(base + '.live')), key=os.path.getmtime)
+
+
+def analyze(names, log, state, out):
+    files = run_files(log)
+    text = ''.join(open(f, 'rb').read().decode('utf-8', 'replace') for f in files)
+    say(f'  run: {out.splitlines()[-1][:160] if out else "(no output)"}')
+    if state['stopped']:
+        check('boot', False, state['stopped'])
+        say('  evidence (last kernel lines):')
+        for line in [l for l in text.splitlines() if l.startswith('[') and 'panic_trace' not in l][-12:]:
+            say('    ' + line[:160])
+        return
+    if 'boot' in names:
+        panics = [l for l in text.splitlines() if re.search(r'panic\(|Kernel panic|PANIC', l) and 'panic_trace' not in l]
+        gone = 'THE GPU IS NOT STARTED' in text or 'THE GPU IS LOST' in text
+        if gone:
+            check('gpu', False, 'the GPU did not start or was lost: ' + next(l for l in text.splitlines() if 'THE GPU IS NOT STARTED' in l or 'THE GPU IS LOST' in l)[:160])
+        up = re.search(r'rwtouch: frames: reached after ([\d.]+) s \((\d+) a second\)', text)
+        check('boot', state['booted'] is not None and bool(up) and not panics,
+              f'the window server draws {up.group(2)} frames a second, {up.group(1)} s after the job began; CPU settled' if up else
+              'the home screen never drew 20 frames a second' + (f'; {panics[0][:120]}' if panics else ''))
+    if 'pods' in names:
+        shot = state['shots'].get('library')
+        if not shot:
+            check('pods', False, 'no screenshot taken')
+        else:
+            r = sh(f"nix-shell -p python3Packages.numpy python3Packages.pillow --run 'python3 tools/look/check.py pods {shot}' 2>&1 | grep -v Using")
+            check('pods', 'PASS' in r.stdout, r.stdout.strip().split(': ', 1)[-1])
+    sleeps = re.findall(r't-sleep: (PASS|FAIL) ([^\n]*)', text)
+    sleeps = list(dict.fromkeys(sleeps))
+    want = 2 * ('sleep' in names) + ('sleep1' in names) + ('darkwake' in names) + 5 * ('sleep_rapid' in names) + ('powerd' in names)
+    if want:
+        bad = [s for s in sleeps if s[0] == 'FAIL']
+        mem = {k: int(v) for k, v in re.findall(r't-mem: (before|after) (\d+) MB/s', text)}
+        if 'before' in mem and 'after' in mem:
+            check('memory after wake', mem['after'] >= 0.8 * mem['before'], f'{mem["after"]} MB/s after the sleeps, {mem["before"]} before')
+        gsleep = re.findall(r'adreno: sleep: the GPU block is given back \(CX (\w+), GX (\w+)\) in (\d+) ms', text)
+        gwake = re.findall(r'adreno: wake: the GPU block is started again (\(takes commands\)|FAILED) in (\d+) ms', text)
+        if 'gpu_sleep=0' not in os.environ.get('T_BOOTARGS', ''):
+            on = [x for x in gsleep if x[:2] != ('off', 'off')]
+            lost = [w for w in gwake if 'takes commands' not in w[0]]
+            ms = sorted(int(m) for _, m in gwake)
+            check('gpu power in sleep', bool(gsleep) and bool(gwake) and not on and not lost,
+                  f'CX and GX off in every sleep; started again in {ms[0]}-{ms[-1]} ms and takes commands' if gsleep and gwake and not on and not lost else
+                  f'sleeps with the block on: {on[:2]}; wakes: {lost[:2] or gwake[:2]}; none seen' if not (gsleep and gwake) else f'{on[:2]} {lost[:2]}')
+        check('sleep', len(sleeps) >= want and not bad, f'{len(sleeps) - len(bad)} of {want} passed' + (f'; {bad[0][1]}' if bad else '') +
+              (f'; e.g. {sleeps[0][1]}' if sleeps and not bad else ''))
+        # what a lit panel and a working display look like after the wakes: no fallback to the firmware's autorefresh
+        fallbacks = [l for l in text.splitlines() if 'autorefresh back' in l or 'did not come' in l]
+        check('display after wake', not fallbacks, fallbacks[0][:140] if fallbacks else 'no push fell back, none lost its interrupt')
+    if 'frames' in names:
+        import report
+        phases = report.report(files)
+        for number, gestures, s in phases:
+            if s:
+                say(f'  frames phase {number}: {s["frames"]} frames, {s["fps"]:.1f} fps, p50 {s["p50"]:.1f} p95 {s["p95"]:.1f} p99 {s["p99"]:.1f} ms, {s["late"]:.1f}% late, {s["missed"]} refreshes missed')
+        frames_phases = [ph for ph in phases if ph[2]]
+        if names.count('frames') >= 2:
+            for ok, why in report.verdict(frames_phases):
+                check('frames after sleep', ok, why)
+        else:
+            check('frames', len(frames_phases) >= 1 and frames_phases[0][2]['fps'] > 40, 'frame pacing measured' if frames_phases else 'no frames')
+    if 'brightness' in names:
+        got = {k: (int(v), int(w)) for k, v, w in re.findall(r't-backlight: (\w+) value (\d+) writes (\d+)', text)}
+        want = {'20': 0x7ff * 0.2 ** 2, '90': 0x7ff * 0.9 ** 2, '5': 0x7ff * 0.05 ** 2, '100': 0x7ff}
+        bad = [f'{k}%: panel value {got[k][0]:#x}, want about {int(w):#x}' for k, w in want.items()
+               if k in got and abs(got[k][0] - w) > 0.03 * 0x7ff + 2]
+        missing = [k for k in want if k not in got]
+        writes = [got[k][1] for k in ('20', '90', '5', 'woken', '100') if k in got]
+        check('brightness', not bad and not missing and len(writes) == 5 and all(b > a for a, b in zip(writes, writes[1:])),
+              '; '.join(bad + [f'no {m}% reading' for m in missing]) if bad or missing else
+              f'iOS levels 20/90/5/100% reached the panel as {" ".join(hex(got[k][0]) for k in ("20", "90", "5", "100"))}; the DSI link took '
+              f'{writes[-1] if writes else "?"} writes, one more after the wake (the value is sent again when the panel is lit)')
+    if 'powerd' in names:
+        sp = {k: [int(x) for x in re.findall(r'speed (\d+)', v)] for k, v in re.findall(r't-cpu: (\w+) (.*)', text)}
+        if 'before' in sp and 'later' in sp and sp['before'] and len(sp['before']) == len(sp['later']):
+            ratio = [b and l / b for b, l in zip(sp['before'], sp['later'])]
+            check('cpu speed after wake', min(ratio) >= 0.85,
+                  'a core of each group runs at ' + ' '.join(f'{r:.0%}' for r in ratio) + f' of its speed before the sleep (just after the wake: {sp.get("wake")}, before: {sp["before"]}, later: {sp["later"]})')
+        else:
+            check('cpu speed after wake', False, f'no cpu readings: {sp}')
+    if 'darkwake' in names:
+        m = re.search(r't-mark: darkwake(.*?)t-display: on (reached|NOT reached) after ([\d.]+) s', text, re.S)
+        check('light after dark wake', bool(m) and m.group(2) == 'reached',
+              f'the lock button lit the screen after {m.group(3)} s' if m and m.group(2) == 'reached' else
+              'a press of the lock button after a dark (timer) wake of a locked phone did not light the screen' + (f' in {m.group(3)} s' if m else ''))
+    if any(n in names for n in ('sched', 'amp', 'schedpi', 'schedframes')):
+        for line in dict.fromkeys(re.findall(r't-sched: ([^\n]*)', text)):
+            say(f'  sched: {line[:200]}')
+        m = re.findall(r't-sched: check passed=(\d+) failed=(\d+)', text)
+        if 'sched' in names:
+            check('sched checks', bool(m) and m[-1][1] == '0' and int(m[-1][0]) > 0,
+                  f'the kernel\'s scheduler checks: {m[-1][0]} passed, {m[-1][1]} failed' if m else 'no result')
+            bad = [l for l in text.splitlines() if 'sched_check: FAIL' in l]
+            for l in list(dict.fromkeys(bad))[:6]:
+                say('    ' + l[l.find('sched_check'):][:180])
+        amp = [l for l in text.splitlines() if 't-amp ' in l]
+        if amp:
+            path = f'logs/t-{state.get("stamp", "x")}-amp.txt'
+            with open(path, 'w') as f:
+                f.write('\n'.join(dict.fromkeys(l[l.find('t-amp '):] for l in amp)) + '\n')
+            say(f'  kernel scheduler snapshots: {path} (tools/sched-test/amp.py {path})')
+    if 'idle' in names:
+        m = re.findall(r'power_test: panel (\w+).*?awake (\d+) s', text)
+        rows = re.findall(r'cpufreq: over the last \d+ ticks the groups ran at rows ([^;]*);', text)
+        check('idle', bool(rows), f'governor rows at idle: {rows[-1]}' if rows else 'no governor line in the log')
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h', '--help'):
+        print(__doc__)
+        return 0
+    opts = [a for a in args if a.startswith('--')]
+    words = [a for a in args if not a.startswith('--')]
+    max_s = int(args[args.index('--max') + 1]) if '--max' in args else None
+    words = [w for w in words if not w.isdigit()]
+    names = LEVELS[words[0]] if len(words) == 1 and words[0] in LEVELS else words
+    for n in names:
+        if n not in CHECKS or n == 'settle':
+            sys.exit(f't: unknown check or level "{n}"; tools/t --help')
+    needs_settle = [i for i, n in enumerate(names) if n in ('frames', 'sleep', 'sleep1', 'sleep_rapid', 'powerd', 'darkwake', 'idle', 'sched', 'schedpi', 'schedframes')]
+    if needs_settle:       # iOS refuses a sleep early in its start-up, and the governor takes over at 30 s
+        names = names[:needs_settle[0]] + ['settle'] + names[needs_settle[0]:]
+    stamp = time.strftime('%H%M%S')
+    say(f'tools/t {" ".join(args)}: {" ".join(names) or "host only"}')
+    t0 = time.time()
+
+    jobs, est = job_text(names) if names else ('', 0)
+    with timed('host+build'), cf.ThreadPoolExecutor(3) as pool:
+        h = pool.submit(host_checks)
+        k = pool.submit(build_kernel) if names else None
+        u = pool.submit(build_userland, jobs) if names else None
+        for name, ok, detail in h.result():
+            check(name, ok, '' if ok else detail)
+        if k:
+            kmsg = k.result()
+            say('  ' + kmsg)
+            if 'FAILED' in kmsg:
+                check('kernel build', False)
+                return finish(t0, True)
+        cache = None
+        if u:
+            cache, msg = u.result()
+            say('  ' + msg)
+    if not names or '--no-run' in opts or cache is None:
+        return finish(t0, cache is None and bool(names))
+    state = dict(stopped=None)
+    with timed('run'):
+        log, state, out = run_phone(cache, names, est, max_s, stamp)
+    if log is None and not state.get('stopped'):
+        check('run', False, out[-300:])
+    else:
+        with timed('analyze'):
+            analyze(names, log, state, out)
+    if log and all(v for _, v in verdicts) and '--keep' not in opts:
+        for f in run_files(log)[1:]:
+            os.remove(f)                      # (the copies are for a failure to be looked into)
+    if '--keep' not in opts:
+        try:
+            os.remove('userland/rc.jobs.t')
+        except OSError:
+            pass
+    return finish(t0, False)
+
+
+def finish(t0, failed):
+    total = time.time() - t0
+    say('  timing: ' + ', '.join(f'{k} {v:.0f} s' for k, v in times.items()) + f'; total {total:.0f} s')
+    ok = not failed and all(v for _, v in verdicts)
+    say(f'RESULT: {"PASS" if ok else "FAIL"} ({sum(v for _, v in verdicts)} of {len(verdicts)} checks)')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -42,12 +42,14 @@ struct hk_sta_scan {
 	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
 };
 
-enum { HK_STA_OPEN, HK_STA_WPA2_PSK };
+enum { HK_STA_OPEN, HK_STA_WPA2_PSK };     /* WPA2_PSK: a passphrase (or its key) -- WPA3's SAE too, which takes the passphrase */
 
 struct hk_sta_join {
 	uint8_t ssid[32], ssid_length;
 	uint8_t bssid[6];                       /* all zero: the access point of that name heard best */
 	int security;
+	int akm;                                /* the key management asked for (00-0f-ac-n: 2 PSK, 6 PSK-SHA256, 8 SAE); 0: the station's choice */
+	uint8_t address[6];                     /* ours for this network (iOS's private Wi-Fi address); all zero: the radio's own */
 	uint8_t pmk[32];                        /* WPA2 with a passphrase: the key made of the passphrase and the name ... */
 	uint8_t passphrase[64], passphrase_length;      /* ... or, if this is not empty, the passphrase itself */
 };
@@ -113,6 +115,13 @@ bool     hk_sta_heard(unsigned index, struct hk_sta_bss *bss);
 void     hk_sta_state(struct hk_sta_state *state);
 unsigned hk_sta_channels(struct hk_sta_channel *channels, unsigned most);
 bool     hk_sta_address(uint8_t *address);
+/*
+ * The system's sleep (bsd/dev/hk_wifi.c): the station's calls held, the network left and the radio stopped -- iOS
+ * is told the link is down, not that the radio is off; true if it was on. And after it: the calls go on, the radio
+ * is on again if it was, and the standing network is joined again.
+ */
+bool     hk_sta_suspend(void);
+void     hk_sta_resume(bool was_on);
 
 /* ---- the listener: bsd/dev/hk_apple80211.c ---- */
 void     hk_apple80211_event(enum hk_sta_event event, int status);

@@ -157,6 +157,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -167,6 +168,7 @@
 #include <sys/hk_input.h>
 #include <sys/hk_qrtr.h>
 #include <sys/hk_sta.h>
+#include <sys/instantnoodle.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -2754,6 +2756,14 @@ struct hk_qrtr_port {
 static LCK_MTX_DECLARE(qrtr_lock, &wifi_lock_group);    /* the tables below */
 static LCK_MTX_DECLARE(qrtr_calling, &wifi_lock_group); /* held by the link's thread around a callback */
 static struct hk_qrtr_port qrtr_ports[16];
+/*
+ * On PCI (the OnePlus 8's QCA6390) QRTR is not carried by GLINK but by the radio's MHI channel
+ * "IPCR" (wifi/lx/src/lx_mhi.c): what the radio sends comes in through hk_wifi_qrtr_input() into
+ * the queue the link's thread takes GLINK's messages from, and ours goes out through the function
+ * the driver's side gives when the channel is up (hk_wifi_qrtr_carrier()).
+ */
+static bool over_pci;
+static int (*volatile qrtr_carrier)(const void *data, unsigned long length);
 static struct {
 	uint32_t service, instance, node, port;
 	bool there;
@@ -2785,7 +2795,13 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	packet->to_node = to_node;
 	packet->to_port = to_port;
 	memcpy(packet + 1, data, length);
-	error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
+	if (over_pci) {
+		int (*send)(const void *, unsigned long) = qrtr_carrier;
+
+		error = send != NULL ? send(packet, sizeof(*packet) + padded) : ENOTCONN;
+	} else {
+		error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
+	}
 	kfree_data(packet, sizeof(*packet) + padded);
 	qrtr_out += error == 0;
 	return error;
@@ -2836,6 +2852,9 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		}
 		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
 		printf("wifi: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
+		if (error != 0) {
+			qrtr_hellos = 0;                /* (the next hello is answered: ours did not leave) */
+		}
 		break;
 	case QRTR_NEW_SERVER:
 		lck_mtx_lock(&qrtr_lock);
@@ -3078,8 +3097,9 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	dsp_words(&last);
 	while (link_wanted) {
 		link_wait();
-		doorbells();
-		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
+		if (over_pci) {
+			;                       /* (the datagrams are queued by hk_wifi_qrtr_input()) */
+		} else if (doorbells(), dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
 			last = words;
 			dsp_listen(&words);
 			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
@@ -3090,7 +3110,9 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		for (;;) {
 			lck_mtx_lock(&glink_lock);
-			glink_pump();
+			if (!over_pci) {
+				glink_pump();
+			}
 			packet = glink.first;
 			if (packet != NULL) {
 				glink.first = packet->next;
@@ -3140,6 +3162,62 @@ link_stop(void)
 	bzero(qrtr_servers, sizeof(qrtr_servers));
 	qrtr_peer = 0;
 	lck_mtx_unlock(&qrtr_lock);
+}
+
+/* A datagram from the radio's IPCR channel (PCI), copied into the link's queue. */
+void
+hk_wifi_qrtr_input(const void *data, unsigned long length)
+{
+	struct glink_packet *packet;
+
+	if (length == 0 || length > HK_QRTR_MAX + sizeof(struct qrtr_header) + 16 ||
+	    (packet = kalloc_data(sizeof(*packet) + length, Z_WAITOK)) == NULL) {
+		return;
+	}
+	packet->next = NULL;
+	packet->length = (uint32_t)length;
+	memcpy(packet->data, data, length);
+	lck_mtx_lock(&glink_lock);
+	if (glink.last != NULL) {
+		glink.last->next = packet;
+	} else {
+		glink.first = packet;
+	}
+	glink.last = packet;
+	lck_mtx_unlock(&glink_lock);
+}
+
+/*
+ * The radio's channel up (send given) or gone (NULL). When it goes, its node is gone with it:
+ * whoever looked its services up is told so, as Linux's QRTR does when an endpoint goes (a "bye"
+ * of the radio's node, through the link's queue); and its next hello is answered again.
+ */
+void
+hk_wifi_qrtr_carrier(int (*send)(const void *data, unsigned long length))
+{
+	qrtr_carrier = send;
+	if (send == NULL && qrtr_peer != 0) {
+		struct {
+			struct qrtr_header header;
+			struct qrtr_control control;
+		} bye = { { 1, QRTR_BYE, qrtr_peer, QRTR_CONTROL, 0, sizeof(struct qrtr_control), QRTR_US, QRTR_CONTROL },
+			  { .command = QRTR_BYE } };
+
+		hk_wifi_qrtr_input(&bye, sizeof(bye));
+	}
+	if (send == NULL) {
+		qrtr_hellos = 0;
+	}
+}
+
+/* Until the link's thread has handed on everything queued (the "bye" above, before the system sleeps): 200 ms at most. */
+static void
+link_drain(void)
+{
+	for (unsigned ms = 0; ms < 200 && link_runs && glink.first != NULL; ms++) {
+		sleep_ms(1);
+	}
+	sleep_ms(5);                            /* (and what it was handing on when the queue emptied) */
 }
 
 /* ---- step 12: GLINK's queues, looked at --------------------------------------------------------------- */
@@ -3541,8 +3619,14 @@ static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
 #define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define RADIO_STREAM            0x1c00
-#define RADIO_STREAM_MASK       0x0001
+/*
+ * The WCN6750's stream; the OnePlus 8's QCA6390 is the endpoint behind PCIe 0, stream 0x1c01 alone (dt iommu-map of
+ * qcom,pcie@1c00000: BDF 0x100 -> 0x1c01): its hypervisor refuses a match register with a mask (0x1c00/1 read back
+ * 0, phone, 25 October), as Android's has it the endpoint's own SID with mask 0. Set by pci_init().
+ */
+static uint32_t radio_stream = 0x1c00, radio_stream_mask = 0x0001;
+#define RADIO_STREAM            radio_stream
+#define RADIO_STREAM_MASK       radio_stream_mask
 
 static void
 smmu_look(void)
@@ -3607,7 +3691,8 @@ smmu_look(void)
  */
 #define RADIO_ADDRESSES         0xa0000000ull
 #define RADIO_ADDRESSES_SIZE    0x10000000u
-#define RADIO_TABLES            32              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
+#define RADIO_TABLES            48              /* of 4K: the root, one of the second level, and 2 MB of addresses each other
+	                                         * (the PCI radio's 64 MB pool and its MSI page take 34) */
 #define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
 	                                                                                  * privilege; shared, accessed, not
 	                                                                                  * global: Linux's for a device */
@@ -3986,12 +4071,25 @@ const uint8_t *
 hk_wifi_driver_file(const char *name, uint64_t *size)
 {
 	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	/*
+	 * The OnePlus 8's QCA6390 (ath11k/QCA6390/hw2.0/...): linux-firmware's firmware and M3 image -- the build of
+	 * it for hosts that run ath11k (WLAN.HST.1.0.1-05266 "V2_TO_X86"; Android's own, of the modem partition,
+	 * crashes under ath11k when the radio is switched on) -- and the board's data file Android chooses for this
+	 * phone (its log: project 12, board 15, RF 11 -> 12wlan.b0c, of the modem partition's image/). No regulatory
+	 * database (the driver does not ask).
+	 */
+	static const char *const files_pci[][2] = { { "amss.bin", "amss.bin" }, { "m3.bin", "m3.bin" }, { "board.bin", "12wlan.b0c" } };
 	const char *last = strrchr(name, '/');
 
 	last = last == NULL ? name : last + 1;
-	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+	for (unsigned i = 0; !over_pci && i < sizeof(files) / sizeof(files[0]); i++) {
 		if (strcmp(last, files[i][0]) == 0) {
 			return image_file(files[i][1], size);
+		}
+	}
+	for (unsigned i = 0; over_pci && i < sizeof(files_pci) / sizeof(files_pci[0]); i++) {
+		if (strcmp(last, files_pci[i][0]) == 0) {
+			return image_file(files_pci[i][1], size);
 		}
 	}
 	return NULL;
@@ -4013,8 +4111,19 @@ hk_wifi_radio_address(uint8_t *address)
 	bool good;
 
 	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
-		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\n", step);
-		return false;
+		/* (an installed boot has nobody to pass the boot-arg: fw/mac of the small image, the same text on one line) */
+		uint64_t size = 0;
+		const uint8_t *file = image_file("mac", &size);
+		unsigned n = 0;
+
+		for (; file != NULL && n < size && n + 1 < sizeof(text) && file[n] != '\n' && file[n] != '\r'; n++) {
+			text[n] = (char)file[n];
+		}
+		text[n] = 0;
+		if (text[0] == 0) {
+			printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac, fw/mac)\n", step);
+			return false;
+		}
 	}
 	good = true;
 	for (const char *c = text;; c++) {
@@ -4095,6 +4204,288 @@ static bool(*const steps[])(void) = {
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
+/* ---- the OnePlus 8: the QCA6390 on PCIe ---------------------------------------------------------------- */
+
+/*
+ * wifi=1 on board=instantnoodle. The radio is a QCA6390 on the SoC's PCIe 0 and its firmware runs
+ * on the radio itself: none of the steps above (the WPSS, SMEM, GLINK) is involved. What is
+ * kept of them is what stands between the driver and the rest: the memory the radio is shown
+ * through its SMMU stream (0x1c00 with the mask 1 covers the bus's two functions, 0x1c00 the
+ * bridge and 0x1c01 the radio: dt iommu-map of qcom,pcie@1c00000; the MSI register and SPIs are
+ * the same as the WCN6750's), QRTR (carried by the radio's MHI channel instead of GLINK) and the
+ * QMI helpers on it, the station and en0. In order:
+ *   1  the memory the radio will be shown, taken and entered in a context of the SMMU;
+ *   2  the radio powered and the link up (bsd/dev/instantnoodle_wifi.c);
+ *   3  the link's thread, for QRTR's datagrams;
+ *   4  the driver: ath11k's own pci.c probes the device, loads its firmware through MHI, and
+ *      the rest is as on the WCN6750 (hk_lx_start(): the station offered to the kernel);
+ *   5  the network of fw/network joined, if there is one.
+ * Stopped in the reverse order when the run ends; and for the system's sleep the driver's own
+ * suspend, then the radio off, and after the wake all of it again (hk_wifi_sleep(), hk_wifi_wake()).
+ */
+static void join_given(uint64_t began);
+static volatile bool pci_up;                    /* the driver is up on the radio */
+static bool pci_slept, pci_was_on;              /* the radio was taken down for the system's sleep; and the station was on */
+static LCK_MTX_DECLARE(pci_lock, &wifi_lock_group);     /* up, down, sleep and wake: one at a time */
+
+static bool
+pci_link_thread(void)
+{
+	thread_t thread;
+
+	if (link_runs) {
+		return true;
+	}
+	qrtr_hellos = qrtr_in = qrtr_out = 0;
+	link_wanted = link_runs = true;
+	if (kernel_thread_start(link_thread, NULL, &thread) != KERN_SUCCESS) {
+		link_wanted = link_runs = false;
+		return false;
+	}
+	link_thread_is = thread;
+	thread_deallocate(thread);
+	return true;
+}
+
+/* The driver brought up on the radio, which is powered and its link up first. 0, or an errno. Under pci_lock. */
+static int
+pci_bring_up(uint64_t began)
+{
+	int error;
+
+	if (!instantnoodle_wifi_power(true)) {
+		tell("wifi: THE RADIO'S LINK DID NOT COME UP: no Wi-Fi. The last of what was said on the way:\n");
+		say_kept();
+		return EIO;
+	}
+	tell("wifi: the radio's PCIe link is up, %llu ms in; now the driver\n", (now_us() - began) / 1000);
+	if (!pci_link_thread()) {
+		tell("wifi: no thread for the radio's link\n");
+		instantnoodle_wifi_power(false);
+		return ENOMEM;
+	}
+	if ((error = hk_lx_start()) != 0) {
+		radio_space_faults();
+		tell("wifi: THE DRIVER DID NOT COME UP ON THE RADIO (%d). The last of what was said on the way:\n", error);
+		say_kept();
+		link_stop();
+		hk_wifi_qrtr_carrier(NULL);
+		instantnoodle_wifi_power(false);
+		return error;
+	}
+	radio_space_faults();
+	pci_up = true;
+	return 0;
+}
+
+/* The driver down, the link's thread stopped, the radio off, the SMMU as it was found. */
+static void
+pci_down(const char *why)
+{
+	for (unsigned ms = 0; whole_runs && ms < 40000; ms += 10) {
+		sleep_ms(10);           /* (a radio still on its way up is let get there first, or fail) */
+	}
+	lck_mtx_lock(&pci_lock);
+	if (pci_up) {
+		hk_lx_stop();
+		pci_up = false;
+	}
+	link_stop();
+	hk_wifi_qrtr_carrier(NULL);
+	instantnoodle_wifi_power(false);
+	radio_space_off();
+	lck_mtx_unlock(&pci_lock);
+	tell("wifi: the radio is off (%s)\n", why);
+}
+
+static void
+pci_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t began = now_us();
+
+	step = 15;
+	if (hk_lx_prepare() != 0) {
+		tell("wifi: NO MEMORY FOR THE RADIO in one piece, or no SMMU context for it: it is not brought up\n");
+		say_kept();
+		whole_runs = false;
+		thread_terminate(current_thread());
+	}
+	lck_mtx_lock(&pci_lock);
+	if (pci_bring_up(began) == 0) {
+		lck_mtx_unlock(&pci_lock);
+		tell("wifi: THE RADIO IS UP, %llu.%llu s after the kernel began on it\n", (now_us() - began) / 1000000,
+		    (now_us() - began) / 100000 % 10);
+		join_given(began);
+	} else {
+		lck_mtx_unlock(&pci_lock);
+	}
+	whole_runs = false;
+	thread_terminate(current_thread());
+}
+
+static void
+pci_init(void)
+{
+	uint64_t size = 0;
+	uint32_t loud = 0;
+	thread_t thread;
+
+	if (image_file("amss.bin", &size) == NULL || image_file("m3.bin", &size) == NULL ||
+	    image_file("12wlan.b0c", &size) == NULL) {
+		printf("wifi: wifi=1, but the radio's firmware is not in the small image (fw-wifi/: amss.bin, m3.bin, 12wlan.b0c; "
+		    "see the README): no Wi-Fi\n");
+		return;
+	}
+	over_pci = true;
+	radio_stream = 0x1c01;
+	radio_stream_mask = 0;
+	whole = whole_runs = true;
+	quiet = !(PE_parse_boot_argn("wifi_loud", &loud, sizeof(loud)) && loud);
+	pause_ms = watch_seconds = 0;
+	new_from = STEPS + 1;
+	hk_qmi_set_transport(&qrtr_ops);
+	hk_lx_net_early();
+	if (kernel_thread_start(pci_thread, NULL, &thread) != KERN_SUCCESS) {
+		whole_runs = false;
+		tell("wifi: no thread: the radio is not brought up\n");
+		return;
+	}
+	thread_deallocate(thread);
+	tell("wifi: the radio (QCA6390, PCIe) is being brought up beside the system's start (wifi=1)\n");
+}
+
+/*
+ * The system's sleep: interrupts are off for all of it and nothing of the driver runs, so the
+ * radio is not left to itself on the network -- the station leaves it and stops (iOS is told the
+ * link is down), the driver's suspend stops the firmware (lx_suspend()), and the radio and its
+ * link are switched off. After the wake it all comes back, the firmware loaded anew, and the
+ * standing network joined again (iOS joins the ones it knows itself).
+ *
+ * Both are done by one thread of this file's, the same every time ("wifi-power"): the driver's
+ * side keeps a record of each thread that enters it, and a new thread at every wake would fill
+ * its table. The sleep waits for its part to be done; the wake does not.
+ */
+enum { POWER_NOTHING, POWER_SLEEP, POWER_WAKE };
+static volatile int power_asked;
+static volatile bool power_busy;
+static thread_t power_thread_is;
+
+static void
+pci_sleep_now(void)
+{
+	lck_mtx_lock(&pci_lock);
+	pci_was_on = hk_sta_suspend();
+	if (hk_lx_suspend() == 0) {
+		/* (the radio's node is gone with its channel: the driver's QMI is told before the processors stop) */
+		hk_wifi_qrtr_carrier(NULL);
+		link_drain();
+		instantnoodle_wifi_power(false);
+		pci_slept = true;
+	}
+	lck_mtx_unlock(&pci_lock);
+	if (!pci_slept) {
+		hk_sta_resume(pci_was_on);
+	}
+}
+
+static void
+pci_wake_now(void)
+{
+	uint64_t began = now_us();
+	int error = ENXIO;
+
+	lck_mtx_lock(&pci_lock);
+	if (instantnoodle_wifi_power(true) && pci_link_thread()) {
+		error = hk_lx_resume();
+	}
+	if (error != 0) {
+		/* the driver could not be had back as it was: it is started afresh (the link's thread stays) */
+		tell("wifi: wake: the driver did not resume (%d): it is started afresh\n", error);
+		pci_up = false;
+		hk_lx_stop();
+		hk_wifi_qrtr_carrier(NULL);
+		link_drain();
+		instantnoodle_wifi_power(false);
+		error = pci_bring_up(began);
+	}
+	pci_slept = false;
+	lck_mtx_unlock(&pci_lock);
+	if (error == 0) {
+		hk_sta_resume(pci_was_on);
+		tell("wifi: wake: the radio is back, %llu ms after the wake\n", (now_us() - began) / 1000);
+	} else {
+		tell("wifi: wake: THE RADIO DID NOT COME BACK (%d)\n", error);
+	}
+}
+
+static void
+power_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	for (;;) {
+		int asked;
+
+		lck_mtx_lock(&pci_lock);
+		while (power_asked == POWER_NOTHING) {
+			lck_mtx_sleep(&pci_lock, LCK_SLEEP_DEFAULT, (event_t)&power_asked, THREAD_UNINT);
+		}
+		asked = power_asked;
+		power_asked = POWER_NOTHING;
+		power_busy = true;
+		lck_mtx_unlock(&pci_lock);
+		if (asked == POWER_SLEEP) {
+			pci_sleep_now();
+		} else {
+			pci_wake_now();
+		}
+		lck_mtx_lock(&pci_lock);
+		power_busy = false;
+		lck_mtx_unlock(&pci_lock);
+		thread_wakeup((event_t)&power_busy);
+	}
+}
+
+static bool
+power_ask(int what)
+{
+	thread_t thread;
+
+	lck_mtx_lock(&pci_lock);
+	if (power_thread_is == THREAD_NULL) {
+		if (kernel_thread_start(power_thread, NULL, &thread) != KERN_SUCCESS) {
+			lck_mtx_unlock(&pci_lock);
+			tell("wifi: no thread for the radio's sleep and wake: it is left as it is\n");
+			return false;
+		}
+		power_thread_is = thread;
+		thread_deallocate(thread);
+	}
+	power_asked = what;
+	lck_mtx_unlock(&pci_lock);
+	thread_wakeup((event_t)&power_asked);
+	return true;
+}
+
+void
+hk_wifi_sleep(void)
+{
+	if (!over_pci || !pci_up || whole_runs || !power_ask(POWER_SLEEP)) {
+		return;
+	}
+	lck_mtx_lock(&pci_lock);
+	while (power_asked != POWER_NOTHING || power_busy) {
+		lck_mtx_sleep(&pci_lock, LCK_SLEEP_DEFAULT, (event_t)&power_busy, THREAD_UNINT);
+	}
+	lck_mtx_unlock(&pci_lock);
+}
+
+void
+hk_wifi_wake(void)
+{
+	if (over_pci && pci_slept) {
+		(void)power_ask(POWER_WAKE);
+	}
+}
+
 /*
  * Where a run ends in order while the DSP runs (the run's time is up, the host asks for its
  * end), and when the steps are over: the DSP is stopped (dsp_shutdown()).
@@ -4107,6 +4498,10 @@ hk_wifi_stop(void)
 		sleep_ms(10);
 	}
 	hk_apple80211_summary();
+	if (over_pci) {
+		pci_down("the run is about to end");
+		return;
+	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && !dirty) {
 		bool down = dsp_shutdown("the run is about to end");
@@ -4131,6 +4526,13 @@ void
 hk_wifi_quiesce(void)
 {
 	hk_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
+	if (over_pci) {
+		instantnoodle_wifi_quiesce();   /* (the radio held in reset: it writes to no memory of ours any more) */
+		leaving = true;
+		new_from = ~0u;
+		radio_space_off();
+		return;
+	}
 	if (!dsp_started || dirty) {
 		return;
 	}
@@ -4272,6 +4674,14 @@ hk_wifi_init(void)
 	}
 	if (last_step == 0 && on != 1) {
 		printf("wifi: wifi=%u is not understood: wifi=1 turns the radio on, wifi_step=N goes the first N steps of that\n", on);
+		return;
+	}
+	if (instantnoodle_board()) {
+		if (last_step != 0) {
+			printf("wifi: wifi_step=N is for the WCN6750's DSP; this phone's radio is on PCIe: wifi=1\n");
+			return;
+		}
+		pci_init();
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != HK_SOC_BASE) {

@@ -885,6 +885,39 @@ extern "C" void hk_power_display(bool on);
 
 
 /*
+ * The brightness: DCS write_display_brightness (0x51) with 11 bits, 1..0x7ff, high byte first -- the ANA6705's device
+ * tree (qcom,mdss-dsi-bl-max-level 0x7ff, bl_ctrl_dcs; its own hbm commands are "51 0c 7c" and "51 0e ec" in that order),
+ * in high-speed mode as the panel's brightness commands are. What iOS asks for comes from MiniAppleARMBacklight.cpp
+ * as 0..65536 (its "backlight-level"); a slider position is perceptual, the panel's value is linear in light, so the
+ * level is squared. gBacklight 0: iOS has not asked yet, the panel stays as the firmware left it (default 0x168).
+ * gPanelLock held; sent again when the panel is lit after a dark.
+ */
+#define BACKLIGHT_FIRMWARE      0x168   /* qcom,mdss-brightness-default-val: what the panel has until iOS asks */
+static uint32_t gBacklight;
+static uint64_t gBacklightSent;                 /* how many times the panel took one (kern.hackios.backlight_sent) */
+
+static bool
+backlightSendLocked(void)
+{
+	uint8_t bytes[3] = { 0x51, (uint8_t)(gBacklight >> 8), (uint8_t)(gBacklight & 0xff) };
+	uint32_t dma;
+	bool ok;
+
+	if (gBacklight == 0 || !gPushing || !instantnoodle() || !dsiReady()) {
+		return false;
+	}
+	if (!gPanelOff && gPushed != 0) {
+		pushWait();                     /* (the frame on its way finishes first) */
+	}
+	dma = displayReg(gDSI, DSI_CMD_DMA_CTRL);
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma & ~DSI_CMD_DMA_LOW_POWER;     /* "dsi_hs_mode" */
+	ok = dsiPacket(gDSI, 0x39, bytes, sizeof(bytes));
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma;
+	gBacklightSent += ok;
+	return ok;
+}
+
+/*
  * The panel dark and lit again, for IOMobileFramebufferRequestPowerChange (backboardd: 0 when the screen locks or dims
  * out, 1 when it wakes): display off (0x28) and display on (0x29), DCS short writes, nothing else. The OLED's pixels
  * are off meanwhile, its TE goes on but nothing is pushed and no VSync is told; the display engine and the memory
@@ -931,6 +964,7 @@ panelPower(bool on)
 	static const uint8_t kOn[] = { 0x05, 0, 1, 0x29, 0 };
 	unsigned sent = dsiSequence(kOn);
 
+	backlightSendLocked();          /* (the brightness iOS had set, before the first lit frame) */
 	displayWrite(INTF1_TEAR_INTR_CLEAR, TEAR_RD_PTR);
 	if (gPushIrq) {
 		displayWrite(INTF1_TEAR_INTR_EN, displayReg(gDPU, INTF1_TEAR_INTR_EN) | TEAR_RD_PTR);
@@ -943,6 +977,39 @@ panelPower(bool on)
 
 /* The panel to sleep and back for the system's sleep (bsd/dev/hk_power.c), when iOS had left it lit: thread context */
 extern "C" void hk_display_power(bool on);
+
+/* iOS's brightness (MiniAppleARMBacklight.cpp: "backlight-level", 0..65536) to the panel. Thread context. */
+extern "C" void
+hk_display_set_backlight(uint32_t level)
+{
+	uint64_t squared = (uint64_t) MIN(level, 65536u) * MIN(level, 65536u) >> 16;
+	uint32_t dcs = 1 + (uint32_t)(squared * 2046 >> 16);
+	bool sent = false;
+
+	if (gPanelLock != NULL) {
+		IOLockLock(gPanelLock);
+		gBacklight = dcs;
+		sent = backlightSendLocked();
+		IOLockUnlock(gPanelLock);
+	}
+	displayLog("display: brightness level %u of 65536: panel value %#x (%s)\n", level, dcs,
+	    sent ? "sent" : gPanelOff ? "kept for when the panel is lit" : "not sent: no DSI command path");
+}
+
+/* What the panel has been told (kern.hackios.backlight: its 11-bit value, 0 not yet; backlight_sent: how many writes) */
+extern "C" uint32_t
+hk_display_backlight(uint64_t * sent)
+{
+	*sent = gBacklightSent;
+	return gBacklight;
+}
+
+/* The window server's swaps so far, as the last push carries them (kern.hackios.frames, bsd/dev/hk_power.c: tests wait for a rate) */
+extern "C" uint32_t
+hk_display_frames(void)
+{
+	return gPushId;
+}
 
 /* Whether the panel is lit (bsd/dev/hk_power.c): asleep only after a power change to 0 */
 extern "C" bool
@@ -968,6 +1035,11 @@ hk_display_quiesce(void)
 	for (unsigned i = 0; i < PUSH_TIMEOUT_MS * 10 && gPushed != 0 &&
 	    !(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE) && __atomic_load_n(&gPushDone, __ATOMIC_ACQUIRE) == 0; i++) {
 		IODelay(100);
+	}
+	if (gBacklight != 0 && gBacklight != BACKLIGHT_FIRMWARE) {
+		/* the loader's menu is read at the brightness the firmware chose, not at one iOS left (a shutdown sets 0) */
+		gBacklight = BACKLIGHT_FIRMWARE;
+		backlightSendLocked();
 	}
 	pushStop();
 }

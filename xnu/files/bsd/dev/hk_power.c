@@ -12,8 +12,9 @@
  * and IOPMrootDomain takes it to IOCPUSleepKernel(): every processor but the boot one is switched off through
  * the firmware (PSCI CPU_OFF, GenericARMCPU::quiesceCPU()), and on the boot processor GenericARMCPU::haltCPU()
  * comes here, in thread context. What is done, in order:
- *   - before the other processors go (hk_power_will_sleep()): the audio path parked, the panel dark if iOS had
- *     left it lit (lit again by hk_power_did_wake(), once they are back);
+ *   - before the other processors go (hk_power_will_sleep()): the audio path parked, the Wi-Fi radio off (the
+ *     network left, the firmware stopped, the PCIe link down: bsd/dev/hk_wifi.c; back on a thread of its own after
+ *     the wake), the panel dark if iOS had left it lit (lit again by hk_power_did_wake(), once they are back);
  *   - every group of cores at its lowest row, the memory's vote at its floor (hk_cpufreq_sleep());
  *   - every interrupt but the wake's disabled at the distributor, the wake's -- the PMIC arbiter's, for the power
  *     key (bsd/dev/hk_buttons.c) -- routed here; this processor's interrupts masked;
@@ -51,6 +52,8 @@ extern void hk_buttons_woken(void);
 extern void hk_buttons_kick(void);
 /* iokit/Kernel/MiniIOMobileFramebuffer.cpp */
 extern bool hk_display_on(void);
+extern uint32_t hk_display_frames(void);
+extern uint32_t hk_display_backlight(uint64_t * sent);
 extern void hk_display_power(bool on);
 /* bsd/dev/hk_cpufreq.c */
 extern void hk_cpufreq_sleep(bool asleep);
@@ -58,6 +61,9 @@ extern void hk_cpufreq_sleep(bool asleep);
 extern void hk_gpu_speed_kick(void);
 /* bsd/dev/hk_sound.c */
 extern void hk_sound_park(void);
+extern int hk_gpu_power_bits(void);
+extern void hk_gpu_sleep_begin(void);           /* iokit/Kernel/HKGPU.cpp: the GPU block given back, its lock held */
+extern void hk_gpu_sleep_end(void);
 /* bsd/dev/instantnoodle_battery.c */
 extern bool instantnoodle_battery_low(void);
 /* bsd/dev/instantnoodle_touch.c */
@@ -71,6 +77,8 @@ extern uint64_t ml_sleep_timebase_freeze(void);
 extern void ml_sleep_timebase_thaw(uint64_t frozen);
 extern uint64_t ml_get_hwclock(void);
 extern void loader_live_beat(void);
+extern void loader_return_wake(void);           /* osfmk/arm64/loader_return.c: the timed return, as wall time */
+extern bool ml_cpu_online(int cpu_id);
 extern void loader_log_putc(char c);
 extern void PEGetUTCTimeOfDay(clock_sec_t *secs, clock_usec_t *usecs);
 
@@ -88,18 +96,49 @@ extern void PEGetUTCTimeOfDay(clock_sec_t *secs, clock_usec_t *usecs);
 static int power_display_on = 1;
 static uint64_t power_display_offs;
 static uint32_t sleep_enabled;          /* boot-arg syssleep, by default on with board=instantnoodle */
+static uint32_t gpu_sleep_enabled = 1;  /* boot-arg gpu_sleep=0: the GPU block stays powered through a sleep */
 static uint64_t sleep_max;              /* boot-arg sleep_max: seconds; 0, none */
 static uint64_t sleep_count, sleep_seconds_total, sleep_wake_at;  /* sleep_wake_at: calendar seconds, 0 none */
-static char sleep_last[96] = "never slept";
+static char sleep_last[128] = "never slept";
+static uint64_t sleep_timer;            /* sysctl kern.hackios.sleep_timer: the next sleep's own wake, seconds (once) */
+static int sleep_timer_key;             /* sysctl kern.hackios.sleep_timer_key: ... and that wake is the power key's: a user's (once) */
 
 SYSCTL_DECL(_kern_hackios);
 SYSCTL_INT(_kern_hackios, OID_AUTO, display_on, CTLFLAG_RD | CTLFLAG_LOCKED, &power_display_on, 0,
     "whether the panel is lit (0: asleep, the display's power off)");
+static int
+sysctl_frames(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	uint32_t frames = hk_display_frames();
+
+	return SYSCTL_OUT(req, &frames, sizeof(frames));
+}
+SYSCTL_PROC(_kern_hackios, OID_AUTO, frames, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_frames, "I",
+    "swaps of the window server so far (its frames: a rate over 30 a second is a home screen that is alive)");
+static int
+sysctl_backlight(__unused struct sysctl_oid *oidp, __unused void *arg1, int arg2, struct sysctl_req *req)
+{
+	uint64_t sent = 0;
+	uint32_t value = hk_display_backlight(&sent);
+	uint64_t out = arg2 ? sent : value;
+
+	return SYSCTL_OUT(req, &out, sizeof(out));
+}
+SYSCTL_PROC(_kern_hackios, OID_AUTO, backlight, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_backlight, "Q",
+    "the panel's brightness value as iOS last set it (1..2047; 0: iOS has not set it)");
+SYSCTL_PROC(_kern_hackios, OID_AUTO, backlight_sent, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 1, sysctl_backlight, "Q",
+    "how many brightness writes the panel's DSI link has taken");
 SYSCTL_QUAD(_kern_hackios, OID_AUTO, display_offs, CTLFLAG_RD | CTLFLAG_LOCKED, &power_display_offs,
     "how many times the panel was put to sleep");
 SYSCTL_QUAD(_kern_hackios, OID_AUTO, sleeps, CTLFLAG_RD | CTLFLAG_LOCKED, &sleep_count, "how many times the system slept");
 SYSCTL_QUAD(_kern_hackios, OID_AUTO, sleep_seconds, CTLFLAG_RD | CTLFLAG_LOCKED, &sleep_seconds_total,
     "seconds spent asleep, all sleeps together");
+SYSCTL_QUAD(_kern_hackios, OID_AUTO, sleep_timer, CTLFLAG_RW | CTLFLAG_LOCKED, &sleep_timer,
+    "seconds after which the next sleep wakes by itself (the kernel's own timer, once; 0: none). Tests use it instead of "
+    "asking powerd for a wake, which it does not give for less than about 10 s");
+SYSCTL_INT(_kern_hackios, OID_AUTO, sleep_timer_key, CTLFLAG_RW | CTLFLAG_LOCKED, &sleep_timer_key, 0,
+    "1: the next sleep's timer wake counts as a press of the power key (iOS wakes fully and lights the screen, as for a user), "
+    "0: as a timer wake (a dark wake: the screen stays off)");
 SYSCTL_STRING(_kern_hackios, OID_AUTO, sleep_last, CTLFLAG_RD | CTLFLAG_LOCKED, sleep_last, sizeof(sleep_last),
     "the last sleep: how long, and what woke it");
 
@@ -152,6 +191,7 @@ hk_power_sleep_supported(void)
 		sleep_enabled = PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "instantnoodle") == 0;
 		PE_parse_boot_argn("syssleep", &sleep_enabled, sizeof(sleep_enabled));
 		PE_parse_boot_argn("sleep_max", &sleep_max, sizeof(sleep_max));
+		PE_parse_boot_argn("gpu_sleep", &gpu_sleep_enabled, sizeof(gpu_sleep_enabled));
 	}
 	return sleep_enabled != 0;
 }
@@ -199,16 +239,22 @@ hk_power_will_sleep(void)
 		return;
 	}
 	hk_sound_park();
+	hk_wifi_sleep();
 	sleep_lit = hk_display_on();
 	if (sleep_lit) {
 		hk_display_power(false);
+	}
+	if (gpu_sleep_enabled) {
+		hk_gpu_sleep_begin();
 	}
 }
 
 void
 hk_power_did_wake(void)
 {
+	hk_gpu_sleep_end();             /* (before the panel: its first frame may be the GPU's) */
 	hk_buttons_kick();
+	hk_wifi_wake();
 	if (sleep_lit) {
 		sleep_lit = false;
 		hk_display_power(true);
@@ -226,9 +272,9 @@ hk_power_sleep(void)
 {
 	const char *reason = NULL;
 	uint64_t frozen, began, now, freq = __builtin_arm_rsr64("CNTFRQ_EL0"), wake_hw = 0, polled_cable = 0, ns;
-	uint64_t wakes = 0, beats = 0, unrecognized = 0;
-	uint32_t wake_intid;
-	bool irq, low = false, limited = false;
+	uint64_t wakes = 0, beats = 0, unrecognized = 0, timer_s;
+	uint32_t wake_intid, cpus_off = 0, cpus = ml_get_topology_info()->num_cpus;
+	bool irq, low = false, limited = false, timed = false, key_wake;
 	int cable;
 	clock_sec_t cal;
 	clock_usec_t us;
@@ -237,14 +283,30 @@ hk_power_sleep(void)
 	if (!hk_power_sleep_supported() || freq == 0) {
 		return NULL;
 	}
+	for (uint32_t i = 0; i < cpus; i++) {
+		cpus_off += !ml_cpu_online((int)i);
+	}
+	timer_s = sleep_timer;
+	key_wake = timer_s != 0 && sleep_timer_key != 0;
+	sleep_timer = 0;
+	sleep_timer_key = 0;
 	hk_cpufreq_sleep(true);
 	cable = cable_in();
 	irq = hk_buttons_wake_armed();
 	PEGetUTCTimeOfDay(&cal, &us);
-	printf("sleep: the system sleeps (%s; the panel %s; the cable %s; %s)\n",
+	printf("sleep: the system sleeps (%s; the panel %s; the cable %s; %u of %u cores off; wake: %s)\n",
 	    irq ? "the power key's interrupt wakes it" : "the power key looked at every 40 ms",
 	    sleep_lit ? "lit by iOS: dark for the sleep" : "dark", cable < 0 ? "not known" : cable ? "in" : "out",
-	    sleep_wake_at > (uint64_t)cal ? "a wake is asked for" : "no wake asked for");
+	    cpus_off, cpus, timer_s != 0 ? "the kernel's timer" : sleep_wake_at > (uint64_t)cal ? "iOS's, in some seconds" :
+	    sleep_wake_at != 0 ? "iOS's, already past" : "none asked for");
+	{
+		int gpu = hk_gpu_power_bits();
+
+		printf("sleep: the GPU block: %s\n", gpu < 0 ? "not kept" : gpu == 3 ? "CX and GX (the 3D core) powered" : gpu == 1 ? "CX powered, GX off" : "off");
+	}
+	if (sleep_wake_at != 0) {
+		note("sleep: iOS asked for a wake at calendar second %llu, now %llu\n", sleep_wake_at, (uint64_t)cal);
+	}
 
 	interrupts = ml_set_interrupts_enabled(FALSE);
 	if (irq) {
@@ -260,6 +322,10 @@ hk_power_sleep(void)
 	if (instantnoodle_battery_low() && (wake_hw == 0 || wake_hw > began + SLEEP_LOW_SECONDS * freq)) {
 		wake_hw = began + SLEEP_LOW_SECONDS * freq;
 		low = true;
+	}
+	if (timer_s != 0 && (wake_hw == 0 || wake_hw > began + timer_s * freq)) {
+		wake_hw = began + timer_s * freq;
+		timed = true;
 	}
 	/* sleep_max=S, for a timed run from the computer: its end (loader_return_after) is a timer, and none runs here */
 	if (sleep_max != 0 && (wake_hw == 0 || wake_hw > began + sleep_max * freq)) {
@@ -304,7 +370,7 @@ hk_power_sleep(void)
 			continue;               /* (not the timer: something else ended the WFI) */
 		}
 		if (wake_hw != 0 && now >= wake_hw) {
-			reason = limited ? "sleep_max" : low ? "battery" : "rtc";
+			reason = limited ? "sleep_max" : timed ? (key_wake ? "pwrkey" : "timer") : low ? "battery" : "rtc";
 			break;
 		}
 		if (irq || now - polled_cable >= SLEEP_CABLE_SECONDS * freq) {
@@ -333,12 +399,13 @@ hk_power_sleep(void)
 
 	sleep_count++;
 	sleep_seconds_total += ns / NSEC_PER_SEC;
-	snprintf(sleep_last, sizeof(sleep_last), "%llu.%03llu s, woken by %s", ns / NSEC_PER_SEC, ns / NSEC_PER_MSEC % 1000,
-	    reason);
+	snprintf(sleep_last, sizeof(sleep_last), "%llu.%03llu s, woken by %s%s, %u of %u cores off", ns / NSEC_PER_SEC,
+	    ns / NSEC_PER_MSEC % 1000, reason, timed && key_wake ? " (the timer, as a key)" : "", cpus_off, cpus);
 	if (strcmp(reason, "rtc") == 0) {
 		sleep_wake_at = 0;
 	}
 	hk_cpufreq_sleep(false);
+	loader_return_wake();
 	if (strcmp(reason, "pwrkey") == 0) {
 		hk_buttons_woken();
 	}

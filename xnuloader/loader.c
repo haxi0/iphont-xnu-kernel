@@ -1257,6 +1257,7 @@ struct kernel_live {
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
 	uint64_t magic3;                /* "XNULIVE3": the kernel is new enough to have what follows */
 	uint64_t screen;                /* (a virtual address too) { physical address, bytes a row } of what the panel shows; 0: SCREEN */
+	uint64_t magic4, log_total, agent; /* XNULIVE4: iphont mailbox */
 };
 
 /*
@@ -4188,6 +4189,8 @@ static uint64_t download_len;           /* the last download into the payload wi
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
  */
+#include "iphont.c"
+
 static void
 fb_command(char *cmd)
 {
@@ -4200,6 +4203,8 @@ fb_command(char *cmd)
 		    starts_with(cmd, "oem install") || starts_with(cmd, "oem flashstate") || starts_with(cmd, "oem readpart") ||
 		    starts_with(cmd, "oem flashboot") || starts_with(cmd, "oem flashpart") || starts_with(cmd, "oem settime"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
+		} else if (starts_with(cmd, "oem iphont-")) {
+			iphont_command(cmd);
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
 			if (busy) {
@@ -4208,7 +4213,11 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "getvar:")) {
 			const char *var = cmd + 7;
-			if (str_eq(var, "product")) {
+			if (str_eq(var, "board")) {
+				fb_reply("OKAY", PLAT->name);
+			} else if (str_eq(var, "iphont")) {
+				fb_reply("OKAY", "1");
+			} else if (str_eq(var, "product")) {
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
 				fb_reply("OKAY", "0.5");

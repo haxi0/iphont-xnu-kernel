@@ -1,6 +1,10 @@
 /*
- * The radio's bus, for as long as ath11k's own (ahb.c, pcic.c) is not built: what stands between
- * the driver's core and this phone's WCN6750. It does what ahb.c's probe does for this chip, in
+ * The driver's entries (lx_start() and the rest of hk_lx.h's), and the radio's bus where it is
+ * the WCN6750 inside redwood's SoC: ath11k's ahb.c is not built, and this stands between the
+ * driver's core and that radio. (On PCI -- the OnePlus 8's QCA6390 -- the driver's own pci.c and
+ * pcic.c are the bus, on lx_pci.c and lx_mhi.c; lx_start() below hands over to them.)
+ *
+ * The WCN6750's bus: It does what ahb.c's probe does for this chip, in
  * its order, with what the files built so far need of it -- the chip's registers through the
  * three fixed windows, and a thread that looks at the copy engines every millisecond where the
  * driver would have their interrupts -- and it is where the driver's calls into the parts not
@@ -535,7 +539,7 @@ bus_start(struct ath11k_base *ab)
 		}
 	}
 	bus.looking = true;
-	if (lx_os_thread("wifi-rings", bus_looks, ab) != 0) {
+	if (lx_spawn("wifi-rings", bus_looks, ab) != 0) {
 		bus.looking = false;
 		return (-ENOMEM);
 	}
@@ -714,39 +718,131 @@ say_radio(struct ath11k_base *ab)
 /* ---- the entries ---------------------------------------------------------------------------------- */
 
 static struct ath11k_base *volatile driver;	/* the driver, while it is up: between lx_start() and lx_stop() */
+static unsigned radio_bus;			/* lx_os_bus() */
 
-int
-lx_start(void)
+/*
+ * The driver's start, past its probe: on the driver's own threads, until core.c has been through
+ * its start (it says so with ATH11K_FLAG_REGISTERED, whether that went well or not) or the
+ * exchange has failed. Then what the kernel's options ask: the station offered to the kernel, a
+ * network joined, a scan. 0, or an errno; with an errno the driver is down again.
+ */
+/*
+ * After a crash of the firmware: what it left in the memory it was given that reads like its
+ * reason -- text with "error", "assert", "fatal", "exception" or a C file's name in it, as many
+ * as 24 pieces.
+ */
+static bool
+has(const char *text, const char *mark)		/* (the kernel has no strstr()) */
+{
+	size_t n = strlen(mark);
+
+	for (; *text != 0; text++) {
+		if (strncmp(text, mark, n) == 0) {
+			return (true);
+		}
+	}
+	return (false);
+}
+
+static void
+crash_words(struct ath11k_base *ab)
+{
+	static const char *const marks[] = { "rror", "ssert", "atal", "xcept", ".c" };
+	unsigned said = 0;
+
+	for (int i = 0; i < ab->qmi.mem_seg_count && said < 24; i++) {
+		const unsigned char *m = (const unsigned char *)ab->qmi.target_mem[i].vaddr;
+		size_t size = ab->qmi.target_mem[i].size, run = 0;
+
+		for (size_t at = 0; m != NULL && at <= size && said < 24; at++) {
+			if (at < size && m[at] >= 0x20 && m[at] < 0x7f) {
+				run++;
+				continue;
+			}
+			if (run >= 10) {
+				char text[121];
+				size_t n = run < 120 ? run : 120;
+
+				memcpy(text, m + at - run, n);
+				text[n] = 0;
+				for (unsigned k = 0; k < sizeof(marks) / sizeof(marks[0]); k++) {
+					if (has(text, marks[k])) {
+						lx_tell("lx: the firmware's memory %d at %#zx: \"%s\"\n", i, at - run, text);
+						said++;
+						break;
+					}
+				}
+			}
+			run = 0;
+		}
+	}
+	lx_tell("lx: %u piece(s) of text like a crash's reason in the firmware's memory\n", said);
+}
+
+static int
+driver_up(struct ath11k_base *ab)
+{
+	unsigned long long began = lx_os_nanoseconds();
+	bool up;
+	int ret;
+
+	while (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) &&
+	    lx_os_nanoseconds() - began < 60000000000ull) {
+		lx_pause_ms(10);
+	}
+	/* it went well if the bus is still up (core.c stops it where it gives up) and the radio is there */
+	up = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) &&
+	    (radio_bus == LX_BUS_PCI ? ab->pdevs[0].ar != NULL : bus.looks);
+	lx_tell("lx: %llu ms after its start the driver %s; its flags: %#lx\n", (lx_os_nanoseconds() - began) / 1000000ull,
+	    up ? "IS UP: the firmware has said \"unified ready\"" : test_bit(ATH11K_FLAG_REGISTERED,
+	    &ab->dev_flags) ? "HAS GIVEN UP on the way and wound itself down" : "HAS NOT GOT THROUGH its exchange with the firmware",
+	    ab->dev_flags);
+	if (!up) {
+		ret = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) ? ETIMEDOUT : EIO;	/* (ab is gone after a removal) */
+		if (radio_bus == LX_BUS_PCI) {
+			crash_words(ab);
+			lx_pci_remove();
+		} else {
+			lx_pause_ms(600);	/* (for core.c to have wound down: the mode "off") */
+			ath11k_qmi_deinit_service(ab);
+		}
+		return (ret);
+	}
+	lx_pause_ms(1000);			/* (for what the firmware says unasked once it is ready) */
+	say_radio(ab);
+
+	driver = ab;
+	if (lx_os_option("wifi_station")) {
+		/* whoever wants a network asks the kernel, and the kernel asks the station: the driver stays up until lx_stop() */
+		if ((ret = lx_station_offer()) == 0) {
+			return (0);
+		}
+	} else if (lx_os_option("wifi_join")) {
+		if ((ret = lx_station_join()) == 0) {
+			if (lx_os_option("wifi_hold")) {	/* (seconds to stay before returning: to see frames pass) */
+				lx_pause_ms(1000 * lx_os_option("wifi_hold"));
+				lx_station_say();
+			}
+			return (0);			/* the network is joined, and the driver stays up until lx_stop() */
+		}
+	} else {
+		ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
+	}
+	lx_stop();
+	return (ret);
+}
+
+/* ahb.c: ath11k_ahb_probe(), for the WCN6750 */
+static int
+ahb_start(void)
 {
 	static struct device device;
 	static struct device_node node;
 	struct ath11k_base *ab;
-	unsigned long long began;
-	bool up;
 	int ret;
 
-	bus.how = lx_os_option("wifi_lx");
-	if (lx_prepare() != 0) {
-		lx_tell("lx: no thread, or no memory the radio can be given\n");
-		return (ENOMEM);
-	}
-	/* what the driver has to say while it is being looked into; not in a session that just uses the radio */
-	if (lx_os_option("wifi_quiet")) {
-		ath11k_debug_mask = 0;
-		bus.said = SAID_FIRST;
-	} else {
-		ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_WMI | ATH11K_DBG_REG | ATH11K_DBG_MAC;
-	}
-	/*
-	 * The driver's parameter "frame_mode": Ethernet. The firmware then puts frames into 802.11
-	 * and takes them out of it, and ciphers them: what passes between the driver and the layer
-	 * above is what goes over a cable.
-	 */
-	ath11k_frame_mode = ATH11K_HW_TXRX_ETHERNET;
 	device.of_node = &node;
 	device.kobj.name = "wifi";
-
-	/* ahb.c: ath11k_ahb_probe(), for this chip */
 	ab = ath11k_core_alloc(&device, 0, ATH11K_BUS_AHB);
 	if (ab == NULL) {
 		return (ENOMEM);
@@ -788,49 +884,54 @@ lx_start(void)
 		lx_tell("lx: the driver's start fails: %d\n", ret);
 		return (-ret);
 	}
+	return (driver_up(ab));
+}
 
-	/*
-	 * The rest happens on the driver's own threads, until core.c has been through its start (it
-	 * says so with the flag below, whether that went well or not) or the exchange has failed.
-	 * It went well if the bus is still up: core.c stops it where it gives up.
-	 */
-	began = lx_os_nanoseconds();
-	while (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) &&
-	    lx_os_nanoseconds() - began < 60000000000ull) {
-		lx_pause_ms(10);
-	}
-	up = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && bus.looks;
-	lx_tell("lx: %llu ms after its start the driver %s; its flags: %#lx\n", (lx_os_nanoseconds() - began) / 1000000ull,
-	    up ? "IS UP as far as it is built: the firmware has said \"unified ready\"" : test_bit(ATH11K_FLAG_REGISTERED,
-	    &ab->dev_flags) ? "HAS GIVEN UP on the way and wound itself down" : "HAS NOT GOT THROUGH its exchange with the firmware",
-	    ab->dev_flags);
-	if (!up) {
-		lx_pause_ms(600);		/* (for core.c to have wound down: the mode "off") */
-		ath11k_qmi_deinit_service(ab);
-		return (test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) ? ETIMEDOUT : EIO);
-	}
-	lx_pause_ms(1000);			/* (for what the firmware says unasked once it is ready) */
-	say_radio(ab);
+/*
+ * pci.c's own probe, on the device behind the kernel's host bridge (lx_pci.c): it claims the
+ * device, sets up its MSI vectors, the MHI controller, the rings and the interrupts, starts its
+ * QMI client and powers the device up -- its firmware loaded through MHI (lx_mhi.c) -- and the
+ * rest follows as with the WCN6750.
+ */
+static int
+pci_start(void)
+{
+	struct ath11k_base *ab;
+	int ret;
 
-	driver = ab;
-	if (lx_os_option("wifi_station")) {
-		/* whoever wants a network asks the kernel, and the kernel asks the station: the driver stays up until lx_stop() */
-		if ((ret = lx_station_offer()) == 0) {
-			return (0);
-		}
-	} else if (lx_os_option("wifi_join")) {
-		if ((ret = lx_station_join()) == 0) {
-			if (lx_os_option("wifi_hold")) {	/* (seconds to stay before returning: to see frames pass) */
-				lx_pause_ms(1000 * lx_os_option("wifi_hold"));
-				lx_station_say();
-			}
-			return (0);			/* the network is joined, and the driver stays up until lx_stop() */
-		}
+	if ((ret = lx_pci_probe()) != 0) {
+		return (ret);
+	}
+	if ((ab = lx_pci_driver()) == NULL) {
+		return (ENXIO);
+	}
+	return (driver_up(ab));
+}
+
+int
+lx_start(void)
+{
+	bus.how = lx_os_option("wifi_lx");
+	radio_bus = lx_os_bus();
+	if (lx_prepare() != 0) {
+		lx_tell("lx: no thread, or no memory the radio can be given\n");
+		return (ENOMEM);
+	}
+	/* what the driver has to say while it is being looked into; not in a session that just uses the radio */
+	if (lx_os_option("wifi_quiet")) {
+		ath11k_debug_mask = 0;
+		bus.said = SAID_FIRST;
 	} else {
-		ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
+		ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_PCI | ATH11K_DBG_WMI |
+		    ATH11K_DBG_REG | ATH11K_DBG_MAC;
 	}
-	lx_stop();
-	return (ret);
+	/*
+	 * The driver's parameter "frame_mode": Ethernet. The firmware then puts frames into 802.11
+	 * and takes them out of it, and ciphers them: what passes between the driver and the layer
+	 * above is what goes over a cable.
+	 */
+	ath11k_frame_mode = ATH11K_HW_TXRX_ETHERNET;
+	return (radio_bus == LX_BUS_PCI ? pci_start() : ahb_start());
 }
 
 /* The thread that counts the ticks, and the memory the radio is shown: once. 0, or an errno. */
@@ -852,7 +953,11 @@ lx_stop(void)
 	driver = NULL;
 	lx_station_withdraw();
 	lx_station_leave();
-	ath11k_core_deinit(ab);
+	if (radio_bus == LX_BUS_PCI) {
+		lx_pci_remove();		/* (ath11k_pci_remove(): the core down, the firmware off, MHI and the interrupts let go of) */
+	} else {
+		ath11k_core_deinit(ab);
+	}
 	lx_tell("lx: the driver is down again\n");
 }
 
@@ -860,4 +965,56 @@ int
 lx_transmit(const unsigned char *frame, unsigned long length)
 {
 	return (driver != NULL ? lx_station_send(frame, length) : ENETDOWN);
+}
+
+/*
+ * The system's sleep (PCI): core.c's own suspend without WoW -- the firmware stopped and the
+ * device reset (ath11k_core_suspend_late(): hif power down) -- once the kernel has had the
+ * station stop the radio (the driver suspends only a radio that is off). Its resume powers the
+ * device up again, the firmware is loaded anew, and core.c's restart work sets the driver up on
+ * it again (ath11k_core_resume() waits for that).
+ */
+int
+lx_suspend(void)
+{
+	struct ath11k_base *ab = driver;
+	int ret;
+
+	if (ab == NULL) {
+		return (0);
+	}
+	if (radio_bus != LX_BUS_PCI) {
+		return (EOPNOTSUPP);
+	}
+	if (ab->pdevs[0].ar != NULL && ab->pdevs[0].ar->state != ATH11K_STATE_OFF) {
+		lx_tell("lx: suspend: the radio is not off: the firmware is left running\n");
+		return (EBUSY);
+	}
+	if ((ret = ath11k_core_suspend(ab)) < 0 || (ret = ath11k_core_suspend_late(ab)) < 0) {
+		lx_tell("lx: suspend: the driver does not suspend: %d\n", ret);
+		return (-ret);
+	}
+	lx_tell("lx: suspend: the firmware is stopped and the device reset\n");
+	return (0);
+}
+
+int
+lx_resume(void)
+{
+	struct ath11k_base *ab = driver;
+	unsigned long long began = lx_os_nanoseconds();
+	int ret;
+
+	if (ab == NULL || radio_bus != LX_BUS_PCI) {
+		return (0);
+	}
+	lx_pci_resumed();
+	if ((ret = ath11k_core_resume_early(ab)) < 0 || (ret = ath11k_core_resume(ab)) < 0) {
+		lx_tell("lx: resume: the driver does not come back (%d): it is taken down\n", ret);
+		lx_stop();
+		return (-ret);
+	}
+	lx_tell("lx: resume: the firmware runs again, the driver is set up on it: %llu ms\n", (lx_os_nanoseconds() - began) /
+	    1000000ull);
+	return (0);
 }

@@ -202,13 +202,17 @@ struct cmd_db_entry {
 	uint16_t length, offset;
 };
 
+/*
+ * A resource's address in RPMh's command database, and its auxiliary data there (an ARC rail's
+ * levels, a BCM's units) if `aux` is given: 0 if the database has no such name.
+ */
 static uint32_t
-rpmh_address(const char *name)
+rpmh_entry(const char *name, const uint8_t **aux, unsigned *aux_length)
 {
 	const struct cmd_db_header *db = (const struct cmd_db_header *)cmd_db;
 	char id[8] = { 0 };
 
-	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
+	if (db == NULL || db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
 		return 0;
 	}
 	strlcpy(id, name, sizeof(id));
@@ -221,11 +225,23 @@ rpmh_address(const char *name)
 		}
 		for (unsigned i = 0; i < slave->count; i++) {
 			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
+				if (aux != NULL) {
+					uint32_t at = (uint32_t)slave->data_offset + entry[i].offset;
+
+					*aux = at + entry[i].length < CMD_DB_SIZE - 0x40 ? db->data + at : NULL;
+					*aux_length = *aux != NULL ? entry[i].length : 0;
+				}
 				return entry[i].address;
 			}
 		}
 	}
 	return 0;
+}
+
+static uint32_t
+rpmh_address(const char *name)
+{
+	return rpmh_entry(name, NULL, NULL);
 }
 
 static bool
@@ -276,30 +292,130 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* (also the alert slider's sensors' supply, instantnoodle_slider.c: one request at a time) */
+/* (also the alert slider's sensors' supply, instantnoodle_slider.c, and the Wi-Fi's, instantnoodle_wifi.c: one request at a time) */
 static LCK_GRP_DECLARE(supply_lck_grp, "instantnoodle-supply");
 static LCK_MTX_DECLARE(supply_lock, &supply_lck_grp);
 
-bool
-instantnoodle_supply_on(const char *name, uint32_t mv)
+/* The sequencer's registers and the command database mapped, once (whoever comes first). Under supply_lock. */
+static bool
+rpmh_mapped(void)
 {
-	uint32_t base = rpmh_address(name);
-	bool done;
-	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_MODE, base + VRM_ENABLE };
-	uint32_t data[3] = { mv, VRM_MODE_LDO_HPM, 1 };         /* enable last */
+	if (rsc == 0) {
+		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	}
+	if (cmd_db == 0) {
+		cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);    /* memory, not registers */
+	}
+	return rsc != 0 && cmd_db != 0;
+}
 
+#define BCM_COMMIT              (1u << 30)
+#define BCM_VALID               (1u << 29)
+
+/* One to three writes to RPMh, under the lock. */
+static bool
+rpmh_send(const char *what, const uint32_t *address, const uint32_t *data, unsigned count)
+{
+	bool done;
+
+	lck_mtx_lock(&supply_lock);
+	done = rpmh_mapped() && rpmh_write(address, data, count);
+	lck_mtx_unlock(&supply_lock);
+	if (!done) {
+		printf("touch: RPMh: %s: no answer\n", what);
+	}
+	return done;
+}
+
+bool
+instantnoodle_supply(const char *name, uint32_t mv, bool on)
+{
+	uint32_t base;
+	bool ldo = strncmp(name, "ldo", 3) == 0;
+
+	lck_mtx_lock(&supply_lock);
+	base = rpmh_mapped() ? rpmh_address(name) : 0;
+	lck_mtx_unlock(&supply_lock);
 	if (base == 0 || (base >> 16 & 0xf) != 4) {
 		printf("touch: RPMh: no regulator \"%s\" (address %#x)\n", name, base);
 		return false;
 	}
-	lck_mtx_lock(&supply_lock);
-	done = rpmh_write(address, data, 3);
-	lck_mtx_unlock(&supply_lock);
-	if (!done) {
-		printf("touch: RPMh: %s %u mV: no answer\n", name, mv);
-		return false;
+	if (!on) {
+		uint32_t address = base + VRM_ENABLE, data = 0;
+
+		return rpmh_send(name, &address, &data, 1);
+	}
+	/* an LDO in its high-power mode; a switcher's mode is left to RPMh. Enable last */
+	{
+		uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_MODE, base + VRM_ENABLE };
+		uint32_t data[3] = { mv, VRM_MODE_LDO_HPM, 1 };
+		uint32_t address2[2] = { base + VRM_VOLTAGE, base + VRM_ENABLE }, data2[2] = { mv, 1 };
+
+		if (!(ldo ? rpmh_send(name, address, data, 3) : rpmh_send(name, address2, data2, 2))) {
+			return false;
+		}
 	}
 	printf("touch: %s at %#x on, %u mV\n", name, base, mv);
+	return true;
+}
+
+bool
+instantnoodle_supply_on(const char *name, uint32_t mv)
+{
+	return instantnoodle_supply(name, mv, true);
+}
+
+bool
+instantnoodle_rail_level(const char *name, uint32_t level)
+{
+	const uint8_t *aux = NULL;
+	unsigned length = 0, position = 0;
+	uint32_t base;
+
+	lck_mtx_lock(&supply_lock);
+	base = rpmh_mapped() ? rpmh_entry(name, &aux, &length) : 0;
+	lck_mtx_unlock(&supply_lock);
+	if (base == 0 || (base >> 16 & 0xf) != 3 || aux == NULL) {
+		printf("touch: RPMh: no rail \"%s\" (address %#x)\n", name, base);
+		return false;
+	}
+	/* its levels, a 16-bit word each, ascending: the vote is the position of the first at or above the one wanted */
+	if (level != 0) {
+		for (position = 0; position < length / 2; position++) {
+			uint16_t at = (uint16_t)(aux[2 * position] | aux[2 * position + 1] << 8);
+
+			if (at >= level) {
+				break;
+			}
+		}
+		if (position == length / 2) {
+			printf("touch: RPMh: %s has no level %u\n", name, level);
+			return false;
+		}
+	}
+	if (!rpmh_send(name, &base, &position, 1)) {
+		return false;
+	}
+	printf("touch: %s at %#x: level %u (position %u)\n", name, base, level, position);
+	return true;
+}
+
+bool
+instantnoodle_bcm_vote(const char *name, uint32_t x, uint32_t y)
+{
+	uint32_t base, data = (x | y) == 0 ? BCM_COMMIT : BCM_COMMIT | BCM_VALID | (x & 0x3fff) << 14 | (y & 0x3fff);
+
+	lck_mtx_lock(&supply_lock);
+	base = rpmh_mapped() ? rpmh_address(name) : 0;
+	lck_mtx_unlock(&supply_lock);
+	if (base == 0 || (base >> 16 & 0xf) != 5) {
+		printf("touch: RPMh: no BCM \"%s\" (address %#x)\n", name, base);
+		return false;
+	}
+	if (!rpmh_send(name, &base, &data, 1)) {
+		return false;
+	}
+	printf("touch: BCM %s at %#x: %u %u\n", name, base, x, y);
 	return true;
 }
 
@@ -444,8 +560,9 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 	unsigned errors = 0, unowned = 0;
 	uint64_t previous = 0, report_since = 0;
 
-	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
-	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);    /* memory, not registers */
+	lck_mtx_lock(&supply_lock);
+	(void)rpmh_mapped();
+	lck_mtx_unlock(&supply_lock);
 	printf("touch: S6SY761: pins sda %u scl %u reset %u irq %u: cfg %#x %#x %#x %#x\n", bus.sda.pin, bus.scl.pin,
 	    PIN_RESET.pin, PIN_IRQ.pin, instantnoodle_gpio_cfg(bus.sda), instantnoodle_gpio_cfg(bus.scl),
 	    instantnoodle_gpio_cfg(PIN_RESET), instantnoodle_gpio_cfg(PIN_IRQ));

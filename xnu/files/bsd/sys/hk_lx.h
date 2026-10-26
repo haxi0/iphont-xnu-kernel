@@ -56,6 +56,31 @@ unsigned lx_os_option(const char *name);
 int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
 /* the processor that runs the radio's firmware: started, and up when this returns; 0 or an errno */
 int	 lx_os_rproc_boot(void);
+
+/*
+ * ---- the radio's bus. LX_BUS_AHB: a WCN6750 inside the SoC, its firmware on a processor of its
+ * own (the above); LX_BUS_PCI: a PCIe device (the OnePlus 8's QCA6390), alone behind the
+ * kernel's host bridge, whose firmware the driver loads itself (through MHI, wifi/lx/src/lx_mhi.c).
+ */
+#define LX_BUS_AHB	0
+#define LX_BUS_PCI	1
+unsigned lx_os_bus(void);
+/*
+ * PCI: the device's configuration space (offsets from 0, widths 1, 2 or 4), which reads all ones
+ * when the link is down; and where its memory window (BAR) is in the machine's physical
+ * addresses (1, or 0: it has none). The device is powered and its link up before lx_start() and
+ * after lx_resume() is called; it is the kernel's to switch off and on around those.
+ */
+unsigned lx_os_pci_config_read(unsigned offset, unsigned width);
+void	 lx_os_pci_config_write(unsigned offset, unsigned value, unsigned width);
+int	 lx_os_pci_bar(unsigned bar, unsigned long long *physical, unsigned long *size);
+/*
+ * QRTR, on PCI carried by the radio's MHI channel "IPCR": a datagram that came from the radio
+ * (copied; any thread), and the function through which the kernel's QRTR sends one to it (0 or
+ * an errno; called on one thread at a time). NULL: there is none any more.
+ */
+void	 lx_os_qrtr_input(const void *data, unsigned long length);
+void	 lx_os_qrtr_attach(int (*send)(const void *data, unsigned long length));
 /* the radio's own address (six bytes), if the machine has one for it: 1, or 0 and nothing written */
 int	 lx_os_radio_address(unsigned char *address);
 /*
@@ -67,6 +92,7 @@ int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *pa
 /* ---- frames: the radio as what carries the machine's network interface ---- */
 void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
 void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
+void	 lx_os_net_address(const unsigned char address[6]);	/* the interface's address from now on (the radio's, or a private one) */
 void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
 
 /*
@@ -100,5 +126,13 @@ void	 lx_stop(void);
 int	 lx_transmit(const unsigned char *frame, unsigned long length);
 /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
 int	 lx_prepare(void);
+/*
+ * The system's sleep: lx_suspend() leaves the network, stops the radio and its firmware (after it
+ * the kernel may take the radio's power away); lx_resume(), with the power back, starts the
+ * firmware again and the radio as it was. 0, or an errno (lx_resume: the driver could not be had
+ * back, and stays down). Both return at once if the driver is not up.
+ */
+int	 lx_suspend(void);
+int	 lx_resume(void);
 
 #endif

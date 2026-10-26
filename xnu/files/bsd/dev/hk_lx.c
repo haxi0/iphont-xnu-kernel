@@ -27,6 +27,7 @@
 #include <sys/hk_input.h>
 #include <sys/hk_lx.h>
 #include <sys/hk_net.h>
+#include <sys/instantnoodle.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -231,6 +232,54 @@ lx_os_rproc_boot(void)
 	return hk_wifi_dsp_is_up() ? 0 : ENXIO;
 }
 
+/* ---- the radio's bus -------------------------------------------------------------------------------- */
+
+/* The OnePlus 8's QCA6390 is on PCIe (bsd/dev/instantnoodle_wifi.c); redwood's WCN6750 is inside the SoC. */
+unsigned
+lx_os_bus(void)
+{
+	return instantnoodle_board() ? LX_BUS_PCI : LX_BUS_AHB;
+}
+
+unsigned
+lx_os_pci_config_read(unsigned offset, unsigned width)
+{
+	return instantnoodle_board() ? instantnoodle_wifi_config_read(offset, width) : ~0u;
+}
+
+void
+lx_os_pci_config_write(unsigned offset, unsigned value, unsigned width)
+{
+	if (instantnoodle_board()) {
+		instantnoodle_wifi_config_write(offset, value, width);
+	}
+}
+
+int
+lx_os_pci_bar(unsigned bar, unsigned long long *physical, unsigned long *size)
+{
+	uint64_t at = 0, length = 0;
+
+	if (!instantnoodle_board() || !instantnoodle_wifi_bar(bar, &at, &length)) {
+		return 0;
+	}
+	*physical = at;
+	*size = (unsigned long)length;
+	return 1;
+}
+
+void
+lx_os_qrtr_input(const void *data, unsigned long length)
+{
+	hk_wifi_qrtr_input(data, length);
+}
+
+void
+lx_os_qrtr_attach(int (*send)(const void *data, unsigned long length))
+{
+	hk_wifi_qrtr_carrier(send);
+}
+
 int
 lx_os_radio_address(unsigned char *address)
 {
@@ -352,6 +401,14 @@ lx_os_net_link(int up)
 {
 	if (lx_link_attached) {
 		hk_net_link_state(up != 0);
+	}
+}
+
+void
+lx_os_net_address(const unsigned char address[6])
+{
+	if (lx_link_attached) {
+		hk_net_address(address);
 	}
 }
 
@@ -563,6 +620,18 @@ lx_transmit(__unused const unsigned char *frame, __unused unsigned long length)
 	return ENXIO;
 }
 
+__attribute__((weak)) int
+lx_suspend(void)
+{
+	return ENXIO;
+}
+
+__attribute__((weak)) int
+lx_resume(void)
+{
+	return ENXIO;
+}
+
 int
 hk_lx_start(void)
 {
@@ -579,4 +648,16 @@ int
 hk_lx_prepare(void)
 {
 	return lx_prepare();
+}
+
+int
+hk_lx_suspend(void)
+{
+	return lx_suspend();
+}
+
+int
+hk_lx_resume(void)
+{
+	return lx_resume();
 }
