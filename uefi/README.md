@@ -1,4 +1,6 @@
-# UEFI for redwood
+# UEFI for redwood and the OnePlus 8
+
+Boot-chain facts (stock ABL, XNUP container, memory addresses): [../docs/research/boot-chain-and-recovery.md](../docs/research/boot-chain-and-recovery.md).
 
 A port of [Project Silicium / Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium) to the POCO X5 Pro 5G
 (redwood). The device is not upstream; the port follows `lisa` (the same SoC package, `KodiakPkg`).
@@ -49,4 +51,4 @@ and `tools/update-prebuilt.sh` refreshes `prebuilt/uefi`.
 `uefi/export.sh` is the reverse: save the changes made in `Mu-Silicium/` back here.
 
 A build from scratch by these instructions has not been re-run since (the tree was built along the way while
-the port was made). For a port to another phone, see `docs/PORTING.md`.
+the port was made). For a port to another phone, see [../docs/PORTING.md](../docs/PORTING.md). Build with `-d instantnoodle` for the OnePlus 8.

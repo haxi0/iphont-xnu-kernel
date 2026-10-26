@@ -211,3 +211,8 @@ William Hoskins
 Director, Office of Technology Licensing
 University of California, Berkeley
 ```
+
+## Fetched at build time, not in this repository (listed for completeness)
+
+- **Apple HFS+** (`hfs-627.100.6`, commit `31d5ec238dfab485e78a9a30b8b92d13e8914f03`, APSL 2.0): fetched by `xnu/hfs-stage.sh` into `bsd/hk_hfs/` and built into the kernel for the OnePlus 8's data volume. Apple's copyright notices are in the fetched files.
+- **libdeflate 1.24** (Eric Biggers, MIT, `xnu/files/bsd/miscfs/apfs/libdeflate/COPYING`) and **libzbitmap** (Corellium LLC, MIT here) are in the APFS driver (see the README "Licenses").

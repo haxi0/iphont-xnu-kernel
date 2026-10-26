@@ -1,4 +1,9 @@
-# Installing HackiOS as a dual boot
+# Installing HackiOS (dual boot, or standalone on the OnePlus 8)
+
+> Scope: written for **redwood** (dual boot next to Android); the OnePlus 8 section ("A phone without Android") is the one in daily
+> use and is verified on the phone (2026-10-24). A dual-boot install on a redwood phone is not recorded as verified here; do it with
+> the backup at hand. Boot internals and ABL quirks: [research/boot-chain-and-recovery.md](research/boot-chain-and-recovery.md).
+> Tooling for the installed phone: `xl health|install|flashboot|flashpart|lastlog|settime` (header of `xl`).
 
 The developer setup boots HackiOS from a computer: `fastboot boot` puts the UEFI in RAM, `xl` sends the kernel and
 the system image over USB, a session lasts as long as `XL_SECS`. An **installed** phone needs no computer: you
@@ -10,7 +15,7 @@ switch it on, a menu appears, and HackiOS runs until you switch it off -- next t
 |---|---|
 | Android's A/B slot (e.g. `_b`) | Android, as it was. Nothing of it is written. |
 | the spare slot's `boot` (e.g. `boot_a`) | the UEFI (Project Silicium port) with our loader, no payload in it |
-| `darwin`, blocks 0..2042367 | the iOS volume and both cryptexes (written once, see the userland README) |
+| `darwin`, blocks 0..2042367 | the iOS volume and both cryptexes (written once, see [subsystems/storage.md](subsystems/storage.md)) |
 | `darwin`, blocks 2042368.. | **boot area**: two bundle slots of 96 MiB -- kernel, boot volume, command line |
 | `darwin`, block 2091520 | the **boot state**: what the loader started, how often, what came up (the boot guard) |
 | `darwin`, blocks 2097152.. | the var store (what iOS writes survives a reboot), two slots |
@@ -107,7 +112,7 @@ the loader, the phone can be brought back with a cable.
 
 ## A phone without Android (OnePlus 8)
 
-The OnePlus 8's port took its whole `userdata` for the iOS volume (README, "On the phone"), so there is no Android
+The OnePlus 8's port took its whole `userdata` for the iOS volume ([devices/instantnoodle.md](devices/instantnoodle.md)), so there is no Android
 to install from, to switch slots in, or to go back to. The same loader, bundles, boot guard and var store are used;
 what differs is where the UEFI goes and how things are written:
 
@@ -117,7 +122,8 @@ what differs is where the UEFI goes and how things are written:
 | `userdata`, blocks 0..2042367 | the iOS volume and both cryptexes, as now (`tools/store-image.py`) |
 | `userdata`, blocks 2042368..2091519 | the boot area: two bundle slots of 96 MiB |
 | `userdata`, block 2091520 | the boot state (the boot guard) |
-| `userdata`, blocks 2097152..3145727 | the var store: `/private/var` between boots, two slots of 2 GiB |
+| `userdata`, blocks 2097152..3145727 | the var store (the older archive-based persistence): two slots of 2 GiB |
+| `userdata`, blocks 3145728..end | the **HFS+ data volume** (89 GB) that is `/private/var` on the installed boot (`hk_data=1 var_data=hfs`); formatted once by `init` if neither volume header is found (`var_data_format=1`) |
 | `boot_a`, `recovery_a`/`_b` (TWRP), `abl`, `xbl`, the GPT, the slots' attributes | not written |
 
 The loader finds `userdata` by its name, both GUIDs and its first and last LBA (`struct platform` in
@@ -141,7 +147,8 @@ The `uefi` step refuses until a bundle has come up once (the boot state's "last 
 any fastboot device but one `kona`, and for any partition but `boot_a`/`boot_b`. `common/hackios install instantnoodle`
 runs the bundle step and stops there until the preview. **Update**: `common/flash/install-xl.sh instantnoodle update`
 with the phone in the menu's Developer mode (or `xl enter` from fastboot); the previous version stays in the other
-slot. **Undo**: `fastboot flash boot_b ../ios-instantnoodle/backup/partitions/boot_b.img` -- fastboot is the
+slot. **Undo**: `fastboot flash boot_b ../ios-instantnoodle/backup/partitions/boot_b.img` (that backup lives in a sibling directory **outside this
+repository and is not in a fresh clone**; also `out/boot_b-restore.img` + `out/boot_b-now.sha256`, git-ignored, used by `xl flashpart`) -- fastboot is the
 bootloader's (key combination at power-on), never written, and TWRP is still in `recovery_a`/`_b`.
 
 A **timed** bundle (`loader_return_after=` on its command line: a test) does not reset when its kernel comes back:
@@ -159,11 +166,10 @@ partition, only when its SHA-256 is EXPECT, read back), `xl lastlog` (what the p
 (the date: an offset from the PMIC's clock, which Android never set). The loader's own reboots set the stock way of
 it (PS_HOLD a hard reset, the reason in the PON's soft spare register: `fastboot reboot bootloader` / `recovery`).
 
-What an installed run keeps: `/private/var` (home screen, settings, app data) is saved into the var store when iOS
-restarts or shuts down (launchd's SIGTERM to `var_store watch`), and every `var_save_every=` seconds (600 in the
-profile) against a reset with the keys, which saves nothing. Shut down switches the phone off (the kernel returns
+What an installed run keeps: since 2026-10-24 `/private/var` is a journaled HFS+ volume on the rest of `userdata`
+([subsystems/storage.md](subsystems/storage.md)), written as iOS runs and synced on shutdown (what a hard reset loses is not recorded). (Before that, `/private/var` was saved into the var store archive when iOS restarted or shut down.) Shut down switches the phone off (the kernel returns
 reason 3, the loader calls `ResetSystem(EfiResetShutdown)`); with the cable in, the phone then stays off and
-charges until the power key or the cable comes out (docs/POWER.md, off-mode charging). Restart starts it again
+charges until the power key or the cable comes out ([subsystems/power.md](subsystems/power.md), off-mode charging; built, not yet run on the phone). Restart starts it again
 through the menu.
 
 ## Things to know
@@ -173,8 +179,10 @@ through the menu.
   `common/flash/install.sh <device>` again.
 * **Do not lock the bootloader** with HackiOS installed.
 * The menu is a text console for now; the loader's own graphics are a later step.
-* Tested on every push (`.github/workflows/ci.yml`): the whole boot path in QEMU on a disk laid out like the phone,
-  every path of the menu -- `common/hackios test` runs the same eight scenarios (boot, previous version, the guard
-  skipping a generation, falling back to Android, Android by hand with both GPTs checked, a tampered bundle, a
-  signed one, a forged one). The loader's SHA-256 and Ed25519 are checked against Python's on every push too
-  (`tools/crypto-test/run.py`). The first install on a real phone should be done with the backup at hand.
+* Tested without a phone: `common/hackios test` (= `common/flash/qemu-test.sh`) runs **14 scenarios** (boot, previous version, the guard
+  skipping a generation, falling back to Android, Android by hand with both GPTs checked, remembered choice, not-ours, a tampered bundle,
+  a signed one, a forged one, darwin as a file of userdata with and without its marker, no-android, the off-charging flag); the loader's SHA-256 and Ed25519
+  against Python's: `tools/crypto-test/run.py`. **There is no CI any more**: the workflow was removed in commit `cd4210b` (the Forgejo host is a
+  Raspberry Pi with no runner), so these run only when someone runs them. The first install on a real phone should be done with the backup at hand.
+* Recovery when the phone will not boot: see "Getting Android back" above (redwood) or the OnePlus 8 undo steps; ABL's USB-after-reset limit is in
+  [research/boot-chain-and-recovery.md](research/boot-chain-and-recovery.md). **Never `fastboot flash userdata` without the owner's explicit approval.**

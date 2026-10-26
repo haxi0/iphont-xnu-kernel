@@ -1,5 +1,8 @@
 # Porting HackiOS to another device
 
+Start with [architecture.md](architecture.md), [research/hardware-qualcomm.md](research/hardware-qualcomm.md) (**rules for not crashing the phone**) and the
+worked example [devices/instantnoodle.md](devices/instantnoodle.md). Boot-args: [BOOT_ARGS.md](BOOT_ARGS.md).
+
 HackiOS was brought up on the POCO X5 Pro 5G (Snapdragon 778G), and the OnePlus 8 (`instantnoodle`, Snapdragon 865)
 is the second phone: read its profile, UEFI package and `board=instantnoodle` drivers as a worked example of
 everything below. A Qualcomm phone with an unlockable bootloader is the realistic next target: the boot chain
@@ -51,7 +54,7 @@ Rebuild with `xnuloader/build.sh`; QEMU must still pick `qemu-virt` (no match = 
 What is generic: GICv3, the timer, PSCI SMP, the display (the UEFI's framebuffer), APFS and ramfs, the driver
 replacements, the return-to-loader path. (A framebuffer the display hardware keeps rereading on its own tears under
 the processor's copy; a command-mode panel's can be pushed once per frame instead, as the OnePlus 8's is:
-`fb_probe=1` shows how the firmware left the pipeline, [instantnoodle latency](instantnoodle-latency.md) the rest.)
+`fb_probe=1` shows how the firmware left the pipeline, [display.md](subsystems/display.md) the rest.)
 What is redwood-specific and needs looking at:
 
 - **touch**: `bsd/dev/hk_goodix.c` (Goodix GT9916 over bit-banged SPI) — another panel needs its own driver
@@ -66,14 +69,20 @@ What is redwood-specific and needs looking at:
   controller's debug selectors, the SMMU stream the hypervisor accepts, and which CP registers exist differ by
   chip; the log names the bring-up step that stopped), `hk_wifi.c` (WCN6750 + ath11k),
   `hk_audio.c` — the same Qualcomm subsystems (SMEM, SMP2P, GLINK, QRTR, QMI) are reused, the addresses and
-  firmware differ. The OnePlus 8's Wi-Fi (QCA6390) is on PCIe, which nothing here drives yet.
+  firmware differ. The OnePlus 8's Wi-Fi (QCA6390) is on PCIe: `instantnoodle_wifi.c` brings PCIe 0 up and
+  ath11k's own PCI and MHI files run on it, with the MHI host of `wifi/lx/src/mhi_host.c`. What it took on the
+  phone: linux-firmware's QCA6390 firmware, not Android's (that one asserts under ath11k at its first mode
+  request); coherent DMA memory aligned as Linux promises (to its size's power of two -- the firmware's own
+  memory and M3's image count on it); channels started only after the device's own mission event and M0 (the
+  register says "mission" earlier, and a command sent then is lost); the SMMU stream the hypervisor takes
+  (0x1c01 with mask 0, not 0x1c00 with mask 1).
 
 Start with no extras: the system boots to the lock screen with only the framebuffer, touch and the CPU.
 
 ## 4. Firmware
 
 Vendor firmware never goes into the repository; it comes from the phone's own Android (`FIRMWARE` in the profile
-lists what to pull, see README "On the phone"). Without `fw-gpu/` the kernel does not start the GPU and says so only
+lists what to pull, see [BUILD.md](BUILD.md)). Without `fw-gpu/` the kernel does not start the GPU and says so only
 deep in the log (`adreno: THE GPU IS NOT STARTED`); `userland/build.sh` prints which firmware went into the image.
 
 ## 5. Run
@@ -84,7 +93,7 @@ common/run.sh <codename>
 ```
 
 The first useful milestone is the loader's own screen and log over USB (`./xl log`), the next one is the kernel's
-verbose boot text (`-v`), then SpringBoard. Read [checks.md](checks.md) before trusting a "it is not in the log".
+verbose boot text (`-v`), then SpringBoard. Read [research/checks.md](research/checks.md) before trusting a "it is not in the log".
 
 ## The SoC's blocks: BOARD_ARGS
 

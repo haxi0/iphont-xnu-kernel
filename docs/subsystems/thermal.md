@@ -1,9 +1,14 @@
-# Thermal service and sensors
+# Thermal service
+
+Device scope: written and run on **redwood** (POCO X5 Pro, `hk_thermal.c` reads the SM7325's 27 TSENS sensors). The
+OnePlus 8's SM8250 has the same TSENS layout (`board_tsens0/1`, and GPU sensors tsens0 15 / tsens1 8 used by GPU
+DCVS, see [gpu.md](gpu.md)), but the governor has **not been seen slowing cores on either phone**. Sensors other than
+temperature (accelerometer, light, GPS) are in [../TODO.md](../TODO.md).
 
 ## Thermal service (kernel: `bsd/dev/hk_thermal.c`, userland: `thermald`)
 
 With `cpufreq=1` every core this kernel uses starts at the top of its frequency table; the load governor
-(`docs/POWER.md`) lowers it when idle, but nothing would hold it down under load. The thermal service sets the
+([power.md](power.md)) lowers it when idle, but nothing would hold it down under load. The thermal service sets the
 ceiling the governor stays under, as Android's thermal engine would:
 
 | What | How |
@@ -25,7 +30,7 @@ thermald show                          # the same table, from the userland
 
 Boot arguments: on by default with `cpufreq=1`; `thermal=0` off; `thermal=2` watch and report without `cpufreq=1`.
 
-The governor's decisions are tested on the computer in 11 scenarios (`tools/thermal-test/run.sh`, in CI): heat-up,
+The governor's decisions are tested on the computer in 11 scenarios (`tools/thermal-test/run.sh`; there is no CI any more): heat-up,
 cool-down without see-saw, a single hot group, package heat, near-critical, a one-tick spike, a sustained emergency,
 silent sensors, a hot battery, a configuration with one group of cores. The kernel builds with it and boots in QEMU
 (where it stays off: QEMU has no TSENS). **On the phone** (POCO X5 Pro, 22 October 2026, `cpufreq=1 cpus=8`, the
@@ -33,7 +38,7 @@ cores at 1.8 / 2.4 / 2.4 GHz, one core kept busy for a minute and a half): all 2
 nominal, nothing slowed -- as it should be at that heat. The governor has not yet been seen slowing the cores on the
 phone itself: that needs a load that heats it past 95 C.
 
-## Sensors (accelerometer, gyroscope, compass, light, proximity, barometer)
+## Motion/light sensors (accelerometer, gyroscope, compass, light, proximity, barometer): not available
 
 On this phone they are not wired to the application processor: they hang off the audio DSP, behind its sensor
 framework (Qualcomm's "SEE"), reached through the QMI service 400 over QRTR. What is there and what is missing:
@@ -48,10 +53,10 @@ framework (Qualcomm's "SEE"), reached through the QMI service 400 over QRTR. Wha
 | a SEE client (service 400): find the sensors, stream their samples | to do |
 | the samples to iOS as the HID events CoreMotion reads | to do |
 
-The next run on the phone with `adsp=1` answers the first open question: `sysctl kern.hackios.adsp_services` shows
-whether service 400 appears and what the DSP is waiting for.
+`sysctl kern.hackios.adsp_services` shows whether service 400 appears and what the DSP is waiting for; the result of that
+run on a phone is not recorded.
 
-## Location (GPS)
+## Location (GPS): not available
 
 The GNSS receiver belongs to the modem (`qcom,mss@4080000`), which this port does not start yet; location comes
 with the modem, through its QMI location service (16).
