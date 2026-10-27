@@ -109,6 +109,8 @@ Implemented in `wifi/lx/src` (`lx_80211.c`, `lx_wpa.c`, `lx_sae.c`) and tested o
 - protected management frames (BIP-CMAC-128, SA Query) wherever both sides can;
 - block ack (`wifi_ba`), wide channels (`wifi_wide`), interrupts (`wifi_irq`): all on with `wifi=1`.
 
+**Pairwise key renewal** (2026-10-27, host-tested in `tools/wpa-test`, not seen on the phone): as wpa_supplicant does it, a new message 1 while joined derives into a temporary PTK (TPTK) that becomes the keys in use only when message 3 is signed with it (group messages meanwhile still checked with the keys in use); our nonce is fresh for each renewal (`next_nonce`/`renew_nonce`); the new pairwise key is installed after message 4 in mac80211's order (the old one out of the driver, then the new one in), its memory kept until the next renewal; a key already in use is never installed again, pairwise or group (KRACK). Before this, a router that renewed the pairwise key left the phone on the old key: traffic stopped.
+
 **Not done:** 802.11r (FT) roaming; TKIP between station and AP (the first WPA); WPA3's other groups and password
 identifiers; roaming. Built and host-tested but **not seen on the phone**: iOS's per-network private Wi-Fi address
 (`ASSOCIATE` offset `0x1fc` -> `hk_sta_join.address` -> `station_address()` -> `hk_net_address` sets en0's link-layer

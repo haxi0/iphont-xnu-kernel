@@ -79,10 +79,10 @@ index 4b83160780c3..d6bb1edb1aae 100644
  
  #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..be89ffb15144 100644
+index 44274016a4cf..553257659f87 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,49 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,51 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -96,6 +96,7 @@ index 44274016a4cf..be89ffb15144 100644
 +bsd/dev/instantnoodle_speaker.c	standard
 +bsd/dev/instantnoodle_slider.c	standard
 +bsd/dev/instantnoodle_wifi.c	standard
++bsd/dev/instantnoodle_bt.c	standard
 +bsd/dev/hk_battery.c	standard
 +bsd/dev/hk_ufs.c	standard
 +bsd/dev/hk_ufshc.c	standard
@@ -119,6 +120,7 @@ index 44274016a4cf..be89ffb15144 100644
 +bsd/dev/hk_camera.c	standard
 +bsd/dev/hk_mic.c		standard
 +bsd/dev/hk_wifi.c		standard
++bsd/dev/hk_bt.c		standard
 +bsd/dev/hk_adsp.c		standard
 +bsd/dev/hk_image.c		standard
 +bsd/dev/hk_virtio_blk.c	standard
@@ -132,7 +134,7 @@ index 44274016a4cf..be89ffb15144 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +198,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +200,55 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -188,7 +190,7 @@ index 44274016a4cf..be89ffb15144 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +453,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +455,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -196,7 +198,7 @@ index 44274016a4cf..be89ffb15144 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +476,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +478,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -204,7 +206,7 @@ index 44274016a4cf..be89ffb15144 100644
  bsd/kern/kern_event.c			standard
  bsd/kern/kern_control.c			optional networking
  bsd/kern/kern_exec.c			standard
-@@ -594,3 +688,5 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+@@ -594,3 +690,5 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
@@ -1963,10 +1965,10 @@ index 5219fb0d9ed6..29978e9cff43 100644
  		}
  	}
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..30d80f8217ea 100644
+index 5fb0a52062e0..2f44a01c7f1d 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,15 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,16 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1976,13 +1978,14 @@ index 5fb0a52062e0..30d80f8217ea 100644
 +iokit/Kernel/HKGPU.cpp				optional iokitcpp
 +iokit/Kernel/HKWLAN.cpp			optional iokitcpp
 +iokit/Kernel/HKBattery.cpp			optional iokitcpp
++iokit/Kernel/HKBluetooth.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleARMBacklight.cpp		optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp
-@@ -148,3 +157,5 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
+@@ -148,3 +158,5 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
  
  # Skywalk
  iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp skywalk
@@ -3933,6 +3936,57 @@ index d2d12f36dbad..f949bce31abc 100644
  uint32_t        thread_group_machine_data_size(void);
  boolean_t       thread_group_uses_immediate_ipi(struct thread_group *tg);
  cluster_type_t  thread_group_recommendation(struct thread_group *tg);
+diff --git a/osfmk/kern/thread_policy.c b/osfmk/kern/thread_policy.c
+index 1073c7edc2af..4bf0e021dcab 100644
+--- a/osfmk/kern/thread_policy.c
++++ b/osfmk/kern/thread_policy.c
+@@ -58,6 +58,31 @@ extern void     rethrottle_thread(void * uthread);
+ #define QOS_OVERRIDE_MODE_FINE_GRAINED_OVERRIDE 2
+ #define QOS_OVERRIDE_MODE_FINE_GRAINED_OVERRIDE_BUT_SINGLE_MUTEX_OVERRIDE 3
+ 
++/*
++ * HackiOS: a real-time request whose computation is over max_rt_quantum (50 ms) is taken with the computation
++ * cut to it instead of refused (rt_clamp=0: refused, as stock). Observed 2026-10-27 (011859): Voice Memos
++ * recording through Bluetooth HFP (8 kHz) -- CoreAudio's I/O thread asked, got KERN_INVALID_ARGUMENT, threw
++ * "thread_policy_set realtime failed" and the app died. Every refusal and cut is logged with what was asked.
++ */
++static TUNABLE(uint32_t, rt_clamp, "rt_clamp", 1);
++static uint32_t rt_refusals_said;
++
++static void
++rt_request_say(thread_t thread, thread_time_constraint_with_priority_policy_t info, const char *what)
++{
++	uint64_t period, computation, constraint;
++	void *bsd = get_bsdtask_info(get_threadtask(thread));
++
++	if (rt_refusals_said++ >= 16) {
++		return;
++	}
++	absolutetime_to_nanoseconds(info->period, &period);
++	absolutetime_to_nanoseconds(info->computation, &computation);
++	absolutetime_to_nanoseconds(info->constraint, &constraint);
++	printf("thread_policy: %s: real-time period %llu us, computation %llu us, constraint %llu us: %s\n",
++	    bsd ? proc_name_address(bsd) : "?", period / 1000, computation / 1000, constraint / 1000, what);
++}
++
+ TUNABLE(uint32_t, qos_override_mode, "qos_override_mode",
+     QOS_OVERRIDE_MODE_FINE_GRAINED_OVERRIDE_BUT_SINGLE_MUTEX_OVERRIDE);
+ 
+@@ -404,9 +429,14 @@ thread_policy_set_internal(
+ 		info = (thread_time_constraint_with_priority_policy_t)policy_info;
+ 
+ 
++		if (rt_clamp && info->computation > max_rt_quantum && info->constraint >= info->computation) {
++			rt_request_say(thread, info, "computation cut to 50 ms");
++			info->computation = max_rt_quantum;
++		}
+ 		if (info->constraint < info->computation ||
+ 		    info->computation > max_rt_quantum ||
+ 		    info->computation < min_rt_quantum) {
++			rt_request_say(thread, info, "refused");
+ 			result = KERN_INVALID_ARGUMENT;
+ 			break;
+ 		}
 diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
 index f2b9ce24bd8d..3aed167fe32e 100644
 --- a/osfmk/kern/work_interval.c

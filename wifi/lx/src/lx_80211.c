@@ -140,6 +140,7 @@ struct lx_radio {
 	volatile int handshake;			/* the last thing lx_wpa_message() said */
 	const char *handshake_why;
 	struct work_struct group_work;		/* a new group key, later on */
+	struct work_struct pairwise_work;	/* a new pairwise key, later on (the access point renewed it) */
 	/* block ack: the access point's requests to send us frames in aggregates, by traffic class (TID) */
 	struct work_struct ba_work;
 	volatile uint8_t ba_asked;		/* TIDs with a request (ADDBA or DELBA) not yet dealt with */
@@ -152,6 +153,7 @@ struct lx_radio {
 	} ba[8];
 	unsigned ba_sessions, ba_refused;
 	struct ieee80211_key_conf *pairwise_key, *group_key;
+	struct ieee80211_key_conf *retired_pairwise;	/* the one before the last renewal: frames queued with it may point at it */
 	volatile bool joined;			/* keys set (or an open network associated with): frames pass */
 	bool open;				/* the network joined or being joined is not protected */
 	volatile bool joining;
@@ -602,12 +604,14 @@ restart_runs(struct work_struct *work)
 	link_lost(radio, ENETRESET, "the firmware was restarted");
 	/* what the driver held of the network is gone with its firmware: only our side is let go of */
 	cancel_work_sync(&radio->group_work);
+	cancel_work_sync(&radio->pairwise_work);
 	cancel_work_sync(&radio->ba_work);
 	radio->ba_asked = 0;
 	bzero(radio->ba, sizeof(radio->ba));
 	kfree(radio->group_key);
 	kfree(radio->pairwise_key);
-	radio->group_key = radio->pairwise_key = NULL;
+	kfree(radio->retired_pairwise);
+	radio->group_key = radio->pairwise_key = radio->retired_pairwise = NULL;
 	explicit_bzero(&radio->wpa, sizeof(radio->wpa));
 	kfree(radio->sta_memory);
 	radio->sta_memory = radio->sta = NULL;
@@ -1098,6 +1102,9 @@ handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 	    said == LX_WPA_BAD ? "NOT GOOD: " : "not one to answer", why);
 	if (said == LX_WPA_GROUP && radio->joined) {
 		queue_work(radio->work, &radio->group_work);
+	}
+	if (said == LX_WPA_KEYS && radio->joined) {
+		queue_work(radio->work, &radio->pairwise_work);	/* the access point renewed the pairwise key */
 	}
 	if (said != LX_WPA_NOTHING) {
 		lx_os_lock();
@@ -2075,6 +2082,24 @@ key_drop(struct lx_radio *radio, struct ieee80211_key_conf **conf, bool pairwise
 	}
 }
 
+/*
+ * Whether the driver has this very key already. wpa_supplicant does not install a key that is in use again ("Not
+ * reinstalling already in-use GTK/TK", wpa_supplicant_install_gtk/_ptk): installing it again would start its packet
+ * numbers over, which is what a played-again message 3 or group message is after (KRACK, CVE-2017-13077..13080).
+ */
+static bool
+key_in_use(const struct ieee80211_key_conf *conf, const uint8_t *key, unsigned cipher, unsigned index)
+{
+	if (conf == NULL || conf->keyidx != index) {
+		return (false);
+	}
+	if (cipher == 2) {
+		return (memcmp(conf->key, key, 16) == 0 && memcmp(conf->key + NL80211_TKIP_DATA_OFFSET_TX_MIC_KEY, key + 24, 8) == 0 &&
+		       memcmp(conf->key + NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY, key + 16, 8) == 0);
+	}
+	return (memcmp(conf->key, key, 16) == 0);
+}
+
 /* The access point has changed the group's key (it does every so often): the new one to the driver, the old one gone. */
 static void
 group_rekey(struct work_struct *work)
@@ -2083,11 +2108,15 @@ group_rekey(struct work_struct *work)
 	struct ieee80211_key_conf *old = radio->group_key;
 	int error = 0;
 
-	radio->rekeys++;
 	if (radio->wpa.group_length != (radio->group_cipher == 2 ? 32u : 16u)) {
 		lx_tell("lx: the group's new key is %u bytes, not its cipher's: it is not taken\n", radio->wpa.group_length);
 		return;
 	}
+	if (key_in_use(old, radio->wpa.group, radio->group_cipher, radio->wpa.group_index)) {
+		lx_tell("lx: the group's key (number %u) is the one in use: not given to the driver again\n", radio->wpa.group_index);
+		return;
+	}
+	radio->rekeys++;
 	if (radio->mfp && radio->wpa.have_igtk && radio->wpa.igtk_index != radio->igtk_index) {
 		memcpy(radio->igtk, radio->wpa.igtk, sizeof(radio->igtk));
 		memcpy(radio->igtk_ipn, radio->wpa.igtk_counter, sizeof(radio->igtk_ipn));
@@ -2097,6 +2126,43 @@ group_rekey(struct work_struct *work)
 	radio->group_key = key_set(radio, radio->wpa.group, radio->group_cipher, radio->wpa.group_index, false, &error);
 	lx_tell("lx: the group's new key (number %u) is given to the driver: %d\n", radio->wpa.group_index, error);
 	key_drop(radio, &old, false);
+}
+
+/*
+ * The access point has renewed the pairwise key (a new 4-way handshake while joined; lx_wpa.c kept the keys in use
+ * until its message 3 was signed with the new ones): message 4 has gone out under the old key, then the new one to
+ * the driver, in mac80211's order for a key replaced under the same number (ieee80211_key_replace(): the old one out
+ * of the driver first, then the new one in), and the group's key that message 3 carried. The old one's memory is kept
+ * until the next renewal or the leave: frames queued before may still point at it. Our next nonce is made for the
+ * next renewal (wpa_supplicant's renew_snonce).
+ */
+static void
+pairwise_rekey(struct work_struct *work)
+{
+	struct lx_radio *radio = __containerof(work, struct lx_radio, pairwise_work);
+	struct ieee80211_key_conf *old = radio->pairwise_key;
+	int error = 0;
+
+	if (key_in_use(old, radio->wpa.pairwise, 4, 0)) {
+		lx_tell("lx: a message 3 again: the pairwise key is the one in use: not given to the driver again\n");
+		return;
+	}
+	lx_pause_ms(30);			/* (for message 4 to have left under the old key) */
+	if (old != NULL) {
+		mutex_lock(&radio->wiphy->mtx);
+		radio->ops->set_key(&radio->hw, DISABLE_KEY, radio->vif, radio->sta, old);
+		mutex_unlock(&radio->wiphy->mtx);
+	}
+	radio->pairwise_key = key_set(radio, radio->wpa.pairwise, 4, 0, true, &error);
+	if (radio->retired_pairwise != NULL) {
+		explicit_bzero(radio->retired_pairwise->key, radio->retired_pairwise->keylen);
+		kfree(radio->retired_pairwise);
+	}
+	radio->retired_pairwise = old;
+	get_random_bytes(radio->wpa.next_nonce, sizeof(radio->wpa.next_nonce));
+	radio->wpa.renew_nonce = 1;
+	lx_tell("lx: THE ACCESS POINT RENEWED THE PAIRWISE KEY: the new one is given to the driver: %d\n", error);
+	group_rekey(&radio->group_work);
 }
 
 /* One step of the station's state as the driver is told of it (mac80211: drv_sta_state()). */
@@ -2143,6 +2209,7 @@ station_leave(struct lx_radio *radio)
 		}
 	}
 	cancel_work_sync(&radio->group_work);
+	cancel_work_sync(&radio->pairwise_work);
 	cancel_work_sync(&radio->ba_work);
 	cancel_work_sync(&radio->sa_query_work);
 	if (!radio->countermeasures_running) {
@@ -2152,6 +2219,11 @@ station_leave(struct lx_radio *radio)
 	bzero(radio->ba, sizeof(radio->ba));		/* (the driver forgets the classes' queues with the station) */
 	key_drop(radio, &radio->group_key, false);
 	key_drop(radio, &radio->pairwise_key, true);
+	if (radio->retired_pairwise != NULL) {
+		explicit_bzero(radio->retired_pairwise->key, radio->retired_pairwise->keylen);
+		kfree(radio->retired_pairwise);
+		radio->retired_pairwise = NULL;
+	}
 	explicit_bzero(&radio->wpa, sizeof(radio->wpa));
 	explicit_bzero(&radio->sae, sizeof(radio->sae));
 	explicit_bzero(radio->igtk, sizeof(radio->igtk));
@@ -2275,6 +2347,7 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 		lx_tell("lx: the network joined before is left\n");
 	}
 	INIT_WORK(&radio->group_work, group_rekey);
+	INIT_WORK(&radio->pairwise_work, pairwise_rekey);
 	INIT_WORK(&radio->mic_work, countermeasures_run);
 	INIT_WORK(&radio->ba_work, ba_handle);
 	radio->ba_asked = 0;
@@ -2559,6 +2632,9 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 		error = -ret;
 		goto out;
 	}
+	/* a renewal of the keys later begins with a new nonce of ours (lx_wpa.c, at its message 1) */
+	get_random_bytes(radio->wpa.next_nonce, sizeof(radio->wpa.next_nonce));
+	radio->wpa.renew_nonce = 1;
 	/* the group's management key is ours to check broadcast management frames with (BIP: in software, as mac80211 does) */
 	if (radio->mfp) {
 		radio->have_igtk = radio->wpa.have_igtk != 0;

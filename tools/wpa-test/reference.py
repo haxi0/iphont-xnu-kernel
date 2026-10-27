@@ -51,12 +51,12 @@ def case(n):
     ptk = prf(pmk, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce, snonce) + max(anonce, snonce), 48)
     kck, kek, tk = ptk[:16], ptk[16:32], ptk[32:]
 
-    def wrapped(key, index, before=b''):
+    def wrapped(key, index, before=b'', wrap_kek=None):
         # the group key as a "key data encapsulation", padded to a multiple of eight bytes, wrapped with the KEK
         plain = before + bytes([0xdd, 6 + len(key), 0x00, 0x0f, 0xac, 1, index, 0]) + key
         if len(plain) % 8:
             plain += b'\xdd' + bytes(7 - len(plain) % 8)
-        return aes_key_wrap(kek, plain)
+        return aes_key_wrap(wrap_kek or kek, plain)
 
     rsc = rnd.randbytes(6) + bytes(2)
     m1 = key_message(version, 0x008a, replay(0), anonce, bytes(8), b'', None)
@@ -70,13 +70,25 @@ def case(n):
     other_ptk = prf(other, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce, snonce) + max(anonce, snonce), 48)
     m3_wrong = key_message(version, 0x13ca, replay(1), anonce, rsc, aes_key_wrap(other_ptk[16:32], bytes(24)), other_ptk[:16])
 
+    # the access point renews the pairwise key later (a second handshake, new nonces both sides); between its message 1
+    # and 3 a group message still signed with the keys in use
+    anonce2, snonce2 = rnd.randbytes(32), rnd.randbytes(32)
+    ptk2 = prf(pmk, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce2, snonce2) + max(anonce2, snonce2), 48)
+    kck2, kek2, tk2 = ptk2[:16], ptk2[16:32], ptk2[32:]
+    r1 = key_message(version, 0x008a, replay(6), anonce2, bytes(8), b'', None)
+    r2 = key_message(version, 0x010a, replay(6), snonce2, bytes(8), rsn, kck2)
+    g3 = key_message(version, 0x1382, replay(7), bytes(32), rsc, wrapped(group, group_index, b''), kck)
+    r3 = key_message(version, 0x13ca, replay(8), anonce2, rsc, wrapped(group, group_index, rsn, kek2), kck2)
+    r4 = key_message(version, 0x030a, replay(8), bytes(32), bytes(8), b'', kck2)
+
     text = ''.join(c_bytes('c%d_%s' % (n, k), v) for k, v in (
         ('passphrase', passphrase), ('name', name), ('ap', ap), ('station', station), ('snonce', snonce), ('rsn', rsn),
         ('pmk', pmk), ('tk', tk), ('group', group), ('group2', group2), ('m1', m1), ('m2', m2), ('m3', m3), ('m4', m4),
-        ('g1', g1), ('g2', g2), ('m3_wrong', m3_wrong)))
+        ('g1', g1), ('g2', g2), ('m3_wrong', m3_wrong), ('snonce2', snonce2), ('tk2', tk2), ('r1', r1), ('r2', r2),
+        ('g3', g3), ('r3', r3), ('r4', r4)))
     entry = '{ %s, %d }' % (', '.join('c%d_%s, sizeof(c%d_%s)' % (n, k, n, k) for k in (
         'passphrase', 'name', 'ap', 'station', 'snonce', 'rsn', 'pmk', 'tk', 'group', 'group2', 'm1', 'm2', 'm3', 'm4', 'g1',
-        'g2', 'm3_wrong')), group_index)
+        'g2', 'm3_wrong', 'snonce2', 'tk2', 'r1', 'r2', 'g3', 'r3', 'r4')), group_index)
     return text, entry
 
 

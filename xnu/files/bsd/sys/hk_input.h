@@ -101,6 +101,7 @@ void hk_adreno_quiesce(void);      /* on the way back to the loader: the GPU blo
 void hk_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
 void hk_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
 void hk_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
+void hk_bt_init(void);             /* boot-arg bt=1: the OnePlus 8's Bluetooth (bsd/dev/hk_bt.c) */
 void hk_adsp_init(void);           /* boot-arg adsp=1: the phone's audio DSP started and linked; adsp_step=N: the first N steps */
 void hk_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
 int hk_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */

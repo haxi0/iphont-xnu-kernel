@@ -870,12 +870,19 @@ cmd_db_address(const char *name)
 static bool
 ddr_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 {
-	uint32_t irq_enable = *(volatile uint32_t *)TCS_REG(0x00);
+	uint32_t irq_enable;
 	bool done = false;
 
+	/* (shared with the other drivers that write slot set 0: sys/hk_board.h) */
+	if (!hk_rpmh_claim(ml_get_interrupts_enabled())) {
+		tell("ddr: RPMh: another driver holds the command slots\n");
+		return false;
+	}
+	irq_enable = *(volatile uint32_t *)TCS_REG(0x00);
 	for (int i = 0; *(volatile uint32_t *)TCS_REG(0x18) == 0; i++) {
 		if (i > 2000) {
 			tell("ddr: RPMh: the command slots stay busy\n");
+			hk_rpmh_release();
 			return false;
 		}
 		delay_for_interval(100, NSEC_PER_USEC);
@@ -905,6 +912,7 @@ ddr_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	*(volatile uint32_t *)TCS_REG(0x10) = 0;
 	*(volatile uint32_t *)TCS_REG(0x08) = 1;
 	*(volatile uint32_t *)TCS_REG(0x00) = irq_enable;
+	hk_rpmh_release();
 	if (!done) {
 		tell("ddr: RPMh: no answer to the vote\n");
 	}
@@ -972,7 +980,7 @@ hk_ddr_quiesce(void)
  * The memory's bandwidth (ddr=2, the default) follows too: the most there is (ddr_vote=) while the screen is
  * lit and something is busy -- a core over half busy or over half its rows, a touch, the GPU above its lowest
  * speed -- and for GOV_DDR_IDLE_MS after; ddr_idle= (default 1024, the firmware's own middle range) when lit and
- * idle, ddr_dark= (default 1024) with the screen off. Both from this one thread: the RPMh slots are not shared.
+ * idle, ddr_dark= (default 1024) with the screen off. Both from this one thread; the RPMh slot set is shared with other drivers through hk_rpmh_claim().
  */
 #define GOV_TICK_MS             20
 #define GOV_TICK_DARK_MS        250

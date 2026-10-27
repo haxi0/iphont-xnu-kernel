@@ -268,18 +268,67 @@ reset_pulse(uint32_t bcr)
 
 /* ---- power and clocks ------------------------------------------------------------------------------ */
 
+/*
+ * The chip's own supplies are its two halves' (this file's Wi-Fi, instantnoodle_bt.c's Bluetooth): on while
+ * either wants them, S6 and S2 given back when neither does (S5 and S8 stay, see the top of this file). And
+ * the two enables, WLAN_EN and BT_EN, at least 100 ms apart (Linux pwrseq-qcom-wcn.c, qca6390: the chip's
+ * power management unit is still settling the first half's rails).
+ */
+static LCK_MTX_DECLARE(qca6390_lock, &wifi_pcie_lck_grp);
+static unsigned qca6390_users;
+static uint64_t qca6390_last_enable;
+
+bool
+instantnoodle_qca6390_supplies(unsigned user, bool on)
+{
+	bool done = true;
+
+	lck_mtx_lock(&qca6390_lock);
+	if (on) {
+		done = instantnoodle_supply("smpa6", 950, true) && instantnoodle_supply("smpf2", 950, true) &&
+		    instantnoodle_supply("smpa5", 1900, true) && instantnoodle_supply("smpc8", 1350, true);
+		if (done) {
+			qca6390_users |= user;
+		}
+	} else {
+		qca6390_users &= ~user;
+		if (qca6390_users == 0) {
+			instantnoodle_supply("smpf2", 950, false);
+			instantnoodle_supply("smpa6", 950, false);
+		}
+	}
+	lck_mtx_unlock(&qca6390_lock);
+	return done;
+}
+
+void
+instantnoodle_qca6390_enable_gap(void)
+{
+	uint64_t now, gap;
+
+	lck_mtx_lock(&qca6390_lock);
+	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &gap);
+	now = mach_absolute_time();
+	if (qca6390_last_enable != 0 && now - qca6390_last_enable < gap) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(gap - (now - qca6390_last_enable), &ns);
+		delay_for_interval((uint32_t)(ns / NSEC_PER_USEC) + 1, NSEC_PER_USEC);
+	}
+	qca6390_last_enable = mach_absolute_time();
+	lck_mtx_unlock(&qca6390_lock);
+}
+
 static bool
 radio_supplies(bool on)
 {
 	if (!on) {
 		/* (only the radio's own: the others are shared, see the top of this file) */
 		instantnoodle_supply("ldoc5", 1800, false);
-		instantnoodle_supply("smpf2", 950, false);
-		instantnoodle_supply("smpa6", 950, false);
+		instantnoodle_qca6390_supplies(INSTANTNOODLE_QCA6390_WIFI, false);
 		return true;
 	}
-	return instantnoodle_supply("smpa6", 950, true) && instantnoodle_supply("smpf2", 950, true) &&
-	       instantnoodle_supply("smpa5", 1900, true) && instantnoodle_supply("smpc8", 1350, true) &&
+	return instantnoodle_qca6390_supplies(INSTANTNOODLE_QCA6390_WIFI, true) &&
 	       instantnoodle_supply("ldoc5", 1800, true) && instantnoodle_supply("ldoa9", 1200, true) &&
 	       instantnoodle_supply("ldoa5", 880, true);
 }
@@ -543,6 +592,7 @@ instantnoodle_wifi_power(bool on)
 		    instantnoodle_gpio_cfg(PIN_WLAN_EN), instantnoodle_gpio_cfg(PIN_PERST), instantnoodle_gpio_cfg(PIN_CLKREQ));
 		done = radio_supplies(true);
 		if (done) {
+			instantnoodle_qca6390_enable_gap();
 			instantnoodle_gpio_output(PIN_WLAN_EN, true, INSTANTNOODLE_PULL_UP, 16);
 			sleep_us(1000);
 			pcie.powered = true;

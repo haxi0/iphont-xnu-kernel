@@ -24,6 +24,8 @@ struct lx_wpa {
 	unsigned char pmk[32];
 	unsigned char own[6], peer[6];		/* the station's address and the access point's */
 	unsigned char own_nonce[32];		/* 32 bytes nobody can guess, fresh for every handshake */
+	unsigned char next_nonce[32];		/* ... the next one: taken at the next message 1 when renew_nonce is set */
+	int renew_nonce;			/* (the caller's, once a handshake's keys are in use: wpa_supplicant's renew_snonce) */
 	const unsigned char *rsn;		/* the station's RSN element as its association request had it ... */
 	unsigned rsn_length;			/* ... which goes into message 2 */
 	const unsigned char *peer_rsn, *peer_rsnxe;	/* the access point's, as its beacon had them (RSNXE: NULL if none) ... */
@@ -33,6 +35,13 @@ struct lx_wpa {
 	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */
 	unsigned char replay[8];		/* the counter of the last message accepted */
 	int have_keys, replay_known;
+	/*
+	 * A later handshake's keys (a new message 1 while keys are in use: the access point renewing them) are kept apart
+	 * until its message 3 is signed with them -- wpa_supplicant's TPTK --, so that an unsigned message 1 cannot take
+	 * the keys the access point's group messages are checked with.
+	 */
+	unsigned char t_kck[16], t_kek[16], t_pairwise[16];
+	int have_tptk;
 	/* what comes out of it */
 	unsigned char pairwise[16];		/* the key for frames between the two ("TK", CCMP) */
 	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK") ... */

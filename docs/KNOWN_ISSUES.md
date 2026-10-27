@@ -15,7 +15,7 @@ Nothing is marked "works" merely because a driver exists: evidence is stated. Fo
 | K02 | Security | No fingerprint / biometric unlock | Unsupported | S2 | yes | yes |
 | K03 | Camera | No cameras | Unsupported | S2 | yes | works (no video) |
 | K04 | Audio | No headphones/USB-C audio, earpiece, call audio; one mic only | Unsupported / Partial | S2 | yes | partly |
-| K05 | Connectivity | No Bluetooth; Wi-Fi gaps and unverified sleep | Unsupported / Unverified | S2 | yes | yes |
+| K05 | Connectivity | Partial Bluetooth; Wi-Fi gaps and unverified sleep | Partial / Unverified | S2 | yes | yes |
 | K06 | Telephony | No cellular, calls, SMS, voicemail | Unsupported | S1 | yes | yes |
 | K07 | Sensors | No accelerometer/gyro/compass/light/proximity/barometer | Unsupported | S2 | yes | yes |
 | K08 | Battery | Charger/shutdown paths unverified; no drain figure; no fast charging | Unverified / Unsupported | S1 | yes | partly |
@@ -50,6 +50,15 @@ Nothing is marked "works" merely because a driver exists: evidence is stated. Fo
   other sleep of the run passing; other runs gave 3.3-4.1 s. The continuous clock after a sleep is corrected from the PMIC RTC (1 s resolution),
   so a short reading of up to ~1 s is possible; the check allows -0.3 s. **Work:** widen the lower bound or correct with sub-second time. Not a scheduler effect.
 
+## K25 A run's log loses the kernel's message buffer — tools · **Bug** · S3
+- **Observed (2026-10-27, `023834`):** the kernel returned 1.26 MB of log, `logs/<time>-run.log` came back with 24 KB and no `== KERNEL LOG ==`
+  section; the last log that had one is `000342` (2026-10-26). Kernel `printf` lines (any driver without its own `say()`) are only in that section.
+- **Cause (source):** `xnuloader/loader.c` `oem log` while not busy calls `compose_logs(NULL, 0)`, replacing what `write_logs(klog)` staged at the return.
+- **Workaround:** drivers print to the loader's log too (`say()`, as `hk_buttons.c`); `tools/t --keep` keeps the live copies. **Fix:** loader (reload deferred by the owner).
+
+## K26 `pods` fails while iOS shows "Low Battery" — OnePlus 8 · **Bug (test)** · S4
+- **Observed (2026-10-27, `024633`, `024827`):** battery 19-20 %: the alert covers the App Library, `pods` reads 202 against 212. Charge, or close the alert.
+
 ## K01 Metal graphics — OnePlus 8 · Graphics · **Partial** (experimental) · S2
 - **Expected:** apps and the system draw with Metal like an iPhone. **Actual:** OpenGL ES (Mesa) draws the whole UI and is solid. Metal is an experimental driver, off by default (`metal=1` test programs;
   `metal=2 metal_profile=1` hands it the whole system and reaches the home screen). See the exact breakdown in [gpu.md](subsystems/gpu.md#metal-work-in-progress-instantnoodle-only).
@@ -72,7 +81,7 @@ No driver, `biometrickitd`/`pearld` denied, no Secure Enclave. Passcode is not s
   the amp health polarity is only checked via MANALARM/MANSTATE. Work: T08, T24. Evidence: [audio.md](subsystems/audio.md).
 
 ## K05 Wi-Fi and Bluetooth — OnePlus 8
-- **Bluetooth: Unsupported** (shares the chip; `bluetooth`/`BTServer` denied). T05.
+- **Bluetooth: Partial.** Native service-filtered BLE discovery and initial GATT transfer verified. Post-wake reconnect fails at a MITM security request: no supported pairing session (4815/705). Later supervised Settings pairing of CMF Buds Pro 2 succeeds with authentication/encryption and AAC A2DP negotiation; owner reports silent audio and failed Voice Memos recording. Missing native Bluetooth HAL bundle found and packaging fixed; corrected image reaches A2DP STREAMING. Headset recording still fails: HFP route selected, format error and audio-server restart observed, fatal stack missing. Built-in recording passes in isolated `003355`; heard output and reliable reconnect remain unverified. See T05 and [bluetooth.md](subsystems/bluetooth.md). **2026-10-27:** A2DP heard by the owner (`010727`); the HFP/SCO UART stall that restarted mediaserverd/bluetoothd is fixed (SCO pacing + enhanced set-up, `hk_bt.c`). Voice Memos recording through the buds owner-verified in `012839` (crash in `011859` was CoreAudio's refused real-time thread; `rt_clamp` added, unproven). Not verified: calls, sleep reconnect, persistent bonds.
 - **Wi-Fi: Partial, verified in RAM runs only** (scan, join from Settings, DHCP, Safari; WPA2, WPA2/TKIP-mixed, WPA3 SAE).
   - Unsupported: 802.11r (iOS is told FT is absent and joins with PSK), TKIP pairwise, roaming, WPA3 other groups/password identifiers. T18.
   - **Unverified:** radio through system sleep and wake (T02), per-network private MAC address, WPA3 transition mode, firmware-crash recovery.
@@ -100,6 +109,8 @@ No screen rotation, motion, compass, proximity, light, barometer; no auto-bright
 ## K10 Sleep, wake and power — OnePlus 8 · **Partial** · S2
 - **Works:** screen off/on, system sleep (6 of 7 cores off, clocks frozen), wake by power key, timer, cable, `sleep_max`; GPU block and audio path and touch chip powered down; iOS's own idle sleep with maintenance wakes.
 - **Limits:** the SoC's lowest state is **not reached** (architecturally blocked: T12), so sleep draw is higher than an iPhone's and **unmeasured** (T13). Awake idle cores sit in WFI, not power-collapsed (T20).
+- **Fixed 2026-10-26:** Control Center, status bar items and app content missing after a wake (VSync times in the wrong clock; [power.md](subsystems/power.md#ui-missing-after-a-wake-fixed-2026-10-26)). Not yet in the installed build (T03).
+- **After a wake** closing Control Center runs at ~52 fps with 38% slow frame steps (before sleep ~87 fps); `tools/t power`'s "frames after sleep" fails on p95 or passes by margin. Uninvestigated.
 - **After a wake** widget extensions and chronod burn ~6 s CPU in 14 s (T17). (The 40%-of-a-core `vmd` spin that made the phone slow after wake is fixed.)
 - **Unverified:** Wi-Fi radio across sleep (T02); volume-key interrupts; slider wake behaviour. The thermal service ticks every 250 ms even asleep by design.
 

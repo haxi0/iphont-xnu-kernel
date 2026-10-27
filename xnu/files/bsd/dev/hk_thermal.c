@@ -46,6 +46,7 @@
 #include <sys/hk_thermal.h>
 #include <sys/sysctl.h>
 #include <sys/hk_board.h>
+#include <sys/instantnoodle.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -68,6 +69,20 @@ static int16_t readings[THERMAL_ZONES];
  * of block 1 -- its device tree's thermal-zones -- where the POCO X5 Pro has them at 1 and 2 of block 1).
  */
 static uint16_t zone_where[THERMAL_ZONES];
+/*
+ * The OnePlus 8 (board=instantnoodle, SM8250) where its sensors differ from the table's (SM7325's), before any
+ * board_thermal_ (the loader passes the gpuss ones). Linux sm8250.dtsi and the phone's own thermal-zones (cpu-1-N-usr):
+ * tsens0 7-10 are the tops of cpu4-7, 11-14 their bottoms, so the prime core (cpu7, group 2) is 10 and 14 and 13 is
+ * cpu6 (group 1): the table's cpu-1-3 (group 1) reads 13 here and cpu-1-6 (group 2) reads 10. tsens1 has sensors 0-8
+ * only: mdmss-2/-3 and camera-0 (9-11) have none, and mdmss-1 (8) is gpuss-1's.
+ */
+static const struct {
+	const char *zone;
+	uint16_t where;
+} sm8250_where[] = {
+	{ "cpu-1-3", 0x00d }, { "cpu-1-6", 0x00a }, { "mdmss-1", 0xffff }, { "mdmss-2", 0xffff }, { "mdmss-3", 0xffff },
+	{ "camera-0", 0xffff },
+};
 static bool thermal_caps_on;                    /* cpufreq raised a group: there are caps to set */
 
 /* what the sysctls show, kept by the service's thread and read by anyone */
@@ -274,6 +289,11 @@ hk_thermal_init(void)
 		char name[40] = "thermal_";
 		uint16_t table = (uint16_t)(hk_thermal_zones[z].block << 8 | hk_thermal_zones[z].sensor);
 
+		for (unsigned i = 0; instantnoodle_board() && i < sizeof(sm8250_where) / sizeof(sm8250_where[0]); i++) {
+			if (strcmp(hk_thermal_zones[z].name, sm8250_where[i].zone) == 0) {
+				table = sm8250_where[i].where;
+			}
+		}
 		strlcat(name, hk_thermal_zones[z].name, sizeof(name));
 		for (char *c = name; *c != 0; c++) {
 			*c = *c == '-' ? '_' : *c;

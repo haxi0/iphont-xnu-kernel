@@ -35,6 +35,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/hk_input.h>
 #include <sys/instantnoodle.h>
+#include <sys/hk_board.h>
 #include <sys/systm.h>
 
 extern void hk_tl(const char *format, ...) __printflike(1, 2);
@@ -246,6 +247,7 @@ io_supply_on(void)
 	uint32_t base = rpmh_address("ldoc2");
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
 	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
+	bool ok;
 
 	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
 	if (base == 0 || (base >> 16 & 0xf) != 4) {
@@ -254,7 +256,14 @@ io_supply_on(void)
 	}
 	printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
-	if (!rpmh_write(address, data, 3)) {
+	/* (TCS 0 is shared with other drivers: one request at a time, sys/hk_board.h) */
+	if (!hk_rpmh_claim(true)) {
+		printf("goodix: RPMh: another driver holds the command slots\n");
+		return false;
+	}
+	ok = rpmh_write(address, data, 3);
+	hk_rpmh_release();
+	if (!ok) {
 		return false;
 	}
 	printf("goodix: I/O supply on (1.8 V)\n");

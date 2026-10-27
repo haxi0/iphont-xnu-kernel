@@ -14,7 +14,9 @@
  *   ufshc      ufs: the UFS host controller ("ufs_mem")                                 0x01d84000
  *   spmi_core, spmi_cnfg, spmi_obsrvr   buttons: the PMIC arbiter                       0x0c440000 ...
  */
+#include <kern/clock.h>
 #include <libkern/libkern.h>
+#include <os/atomic_private.h>
 #include <pexpert/pexpert.h>
 #include <sys/hk_board.h>
 #include <sys/systm.h>
@@ -63,4 +65,36 @@ hk_board_report(void)
 	if (given == 0) {
 		printf("board: no board_ addresses given: the POCO X5 Pro's (SM7325) for every block\n");
 	}
+}
+
+/*
+ * RPMh's command slot set 0 of the application processor ("DRV 2", TCS 0 at rsc + 0xd00) is written by
+ * instantnoodle_touch.c (the supplies: touch, slider, Wi-Fi, Bluetooth), hk_adsp.c (the audio DSP's rails),
+ * hk_cpufreq.c (the memory's bandwidth vote) and hk_goodix.c. Each of them checks the slot set is idle and then
+ * fills it, so two at once could overwrite each other's commands. Linux has one writer, rpmh-rsc.c, which claims a
+ * slot set under drv->lock (claim_tcs_for_req) and waits until one is free (tcs_wait); this is that claim for the one
+ * slot set our drivers share. Held across a whole request, from the idle check to the completion's clear.
+ * A waiter sleeps 100 us at a time, at most a second; without `wait` (interrupts off, on the way back to the loader)
+ * one try: a request cut off by the other processors' stop leaves it held, and that path then does without.
+ */
+static uint32_t rpmh_tcs0_held;
+
+bool
+hk_rpmh_claim(bool wait)
+{
+	for (unsigned tries = 0;; tries++) {
+		if (os_atomic_cmpxchg(&rpmh_tcs0_held, 0, 1, acquire)) {
+			return true;
+		}
+		if (!wait || tries >= 10000) {
+			return false;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+}
+
+void
+hk_rpmh_release(void)
+{
+	os_atomic_store(&rpmh_tcs0_held, 0, release);
 }

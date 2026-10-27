@@ -25,6 +25,8 @@ the memory vote at its maximum for the whole run. Now `cpufreq_gov=1` (the defau
 - It takes over 45 s after boot (`gov_start=30` shortens that for tests), so the boot is as fast as before.
 - The thermal service's rows are ceilings (`hk_cpufreq_cap()`).
 
+RPMh's command slot set 0 of the application processor (DRV 2, TCS 0) is shared by the memory vote, the audio DSP's rails, the touch/slider/Wi-Fi/Bluetooth supplies (`instantnoodle_supply()`) and redwood's Goodix: each claims it for one request (`hk_rpmh_claim()`/`hk_rpmh_release()` in `hk_board.c`, Linux `rpmh-rsc.c`'s claim; one try with interrupts off). Before 2026-10-27 they could overwrite each other's commands.
+
 The memory's RPMh vote, from the same thread: `ddr_vote=` (16383) while the screen is lit and something is busy
 (a core over half busy or over half its rows, a touch, the GPU above its lowest level); `ddr_idle=` (1024, the
 firmware's middle range) after a second idle; `ddr_dark=` (1024) with the screen off; `ddr_sleep=` (0: no request,
@@ -91,6 +93,24 @@ tools/sleep-test/run.sh                               # QEMU: 4 sleeps, every co
 
 `tools/sleep-test/run.sh` uses the boot-arg `sleep_test=S` (`GenericARMPE::start`). It never ran in CI (CI no
 longer exists).
+
+### UI missing after a wake (fixed 2026-10-26)
+
+Owner's report: after a sleep, Control Center opened empty (blur only), status bar items or the whole bar vanished,
+apps opened as a blank white screen. Reproduced on the phone (RAM runs, a temporary scenario: screenshots of the
+home screen, Control Center, Settings and Clock before and after 3 x 20 s sleeps, two of them dark). Bisected with one
+boot each: `gpu_sleep=0` still broken; `syssleep=0` fine; `sleep_freeze=0` (new diagnostic boot-arg: mach time runs on
+through the sleep) fine; `ca_vbl=0` (CoreAnimation's own timer) fine. SpringBoard's layer tree (`com.hackios.layers`)
+was the same before and after: the clients had committed everything, the window server did not show it.
+
+Cause: QuartzCore reads the framebuffer's VSync times as `mach_continuous_time()`; we sent `mach_absolute_time()`,
+which stands still while the system sleeps, so after every sleep the window server's frame clock lagged its clients'
+by the total time slept and every animation's start lay in its future. Fix: `MiniIOMobileFramebuffer.cpp` `vsync()`
+sends continuous time. Verified: the scenario shows everything after the wake. Of the two times, only the second
+("presented") matters (sending only the first as continuous time did not cure it). `tools/t power` after the fix
+fails "frames after sleep" on p95 (34 ms against 17-18) in 2 of 2 runs, but a run without the fix shows the same
+slow gesture (Control Center closed after the wake: 51-53 fps, 38% of steps over 16.7 ms) and passed only by margin
+(p95 31.7 ms), so that slowdown predates the fix; it is not investigated.
 
 ### The power key and the other keys
 

@@ -30,6 +30,8 @@ thermald show                          # the same table, from the userland
 
 Boot arguments: on by default with `cpufreq=1`; `thermal=0` off; `thermal=2` watch and report without `cpufreq=1`.
 
+**OnePlus 8 (SM8250) sensor map** (`sm8250_where` in `hk_thermal.c`, 2026-10-27, built, unverified): the table is SM7325's. On SM8250 tsens0 7-10 are the tops of cpu4-7 and 11-14 their bottoms (Linux `sm8250.dtsi`, the phone's `cpu-1-N-usr` zones), so the prime core is 10 and 14: zone cpu-1-3 (group 1) reads 13 and cpu-1-6 (group 2) reads 10. tsens1 has sensors 0-8 only: mdmss-2/-3 and camera-0 read nothing, and mdmss-1 is off (it was gpuss-1's sensor 8 again). Before this, prime-core heat on sensor 10 slowed the big group instead.
+
 The governor's decisions are tested on the computer in 11 scenarios (`tools/thermal-test/run.sh`; there is no CI any more): heat-up,
 cool-down without see-saw, a single hot group, package heat, near-critical, a one-tick spike, a sustained emergency,
 silent sensors, a hot battery, a configuration with one group of cores. The kernel builds with it and boots in QEMU

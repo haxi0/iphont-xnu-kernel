@@ -70,6 +70,31 @@ void instantnoodle_wifi_config_write(uint32_t offset, uint32_t value, unsigned w
 bool instantnoodle_wifi_bar(unsigned bar, uint64_t *physical, uint64_t *size);
 void instantnoodle_wifi_quiesce(void);             /* the device in reset and the link down, from a panic's way back: no locks */
 
+/*
+ * The chip's supplies, shared by its Wi-Fi and Bluetooth halves (bsd/dev/instantnoodle_wifi.c): on while either user
+ * wants them; and the wait that keeps the two halves' enables 100 ms apart, before raising WLAN_EN or BT_EN.
+ */
+#define INSTANTNOODLE_QCA6390_WIFI      1u
+#define INSTANTNOODLE_QCA6390_BT        2u
+bool instantnoodle_qca6390_supplies(unsigned user, bool on);
+void instantnoodle_qca6390_enable_gap(void);
+
+/*
+ * The QCA6390's Bluetooth half and its UART, serial engine 6 (bsd/dev/instantnoodle_bt.c), for bsd/dev/hk_bt.c: power;
+ * the UART opened at 115200 8N1 RTS/CTS, its host-side rate, a blocking write (0 or an errno), a read of what came
+ * (waiting at most timeout_ms for the first byte), a flush of what came, close; the probe of bt_probe=1; counters.
+ */
+bool instantnoodle_bt_power(bool on);
+bool instantnoodle_bt_uart_open(void);
+bool instantnoodle_bt_uart_speed(uint32_t baud);
+int instantnoodle_bt_uart_write(const uint8_t *bytes, uint32_t n);
+uint32_t instantnoodle_bt_uart_read(uint8_t *buffer, uint32_t max, uint32_t timeout_ms);
+void instantnoodle_bt_uart_flush(void);
+void instantnoodle_bt_uart_close(void);
+void instantnoodle_bt_probe(void);
+void instantnoodle_bt_uart_counters(uint32_t *irqs, uint32_t *overruns, uint32_t *dropped, uint32_t *errors);
+void instantnoodle_bt_uart_state(const char *why);
+
 /* The speakers' two TFA9874 amplifiers (bsd/dev/instantnoodle_speaker.c): hk_speaker.c's hk_speaker_*() on this board */
 bool instantnoodle_speaker_prepare(const uint8_t *container, uint64_t size);
 bool instantnoodle_speaker_start(void);

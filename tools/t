@@ -67,6 +67,8 @@ LOCK = [f'{RW} button lock', f'{PT} waitdisplay off 5']      # as a user leaves 
 # (job lines, estimated seconds on the phone)
 CHECKS = {
     'boot': ([f'{RW} frames 20 90', f'{RW} idle 60 20', f'{RW} mark boot-ok'], 25),
+    'bluetooth': (['/hackios/bin/bt_scan'], 15),
+    'bluetooth-link': (['/hackios/bin/bt_scan --link'], 25),
     'pods': ([f'{RW} swipe 0.85 0.5 0.15 0.5 300 wait 1.2 swipe 0.85 0.5 0.15 0.5 300 wait 2.5 mark shot-library wait 2.5',
               f'{RW} swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1.5'], 12),
     'settle': ([f'{RW} uptime 34', f'{RW} idle 50 30'], 8),     # (put in before the first `frames`: the governor takes over at 30 s: gov_start)
@@ -184,6 +186,9 @@ def build_kernel():
 def userland_hash(jobs):
     h = hashlib.sha256()
     h.update(jobs.encode())
+    # what build.sh reads from the environment and changes the image with (BLUETOOTH=1: iOS's Bluetooth daemons; OSLOG)
+    for name in ('BLUETOOTH', 'OSLOG'):
+        h.update(f'{name}={os.environ.get(name, "")}\n'.encode())
     for base, _, files in sorted(os.walk('userland/src')):
         for f in sorted(files):
             with open(os.path.join(base, f), 'rb') as fh:
@@ -392,6 +397,18 @@ def analyze(names, log, state, out):
             with open(path, 'w') as f:
                 f.write('\n'.join(dict.fromkeys(l[l.find('t-amp '):] for l in amp)) + '\n')
             say(f'  kernel scheduler snapshots: {path} (tools/sched-test/amp.py {path})')
+    if 'bluetooth' in names:
+        # Live log copies overlap. A line number is not an independent discovery result.
+        results = list(dict.fromkeys(re.findall(r'bt-scan: native discovery [^\n]+', text)))
+        passed = [r for r in results if 'discovery PASS;' in r]
+        check('bluetooth', len(passed) >= names.count('bluetooth') and not any('discovery FAIL;' in r for r in results) and 'Bluetooth error - restarting' not in text,
+              '; '.join(results) if results else 'no native CoreBluetooth result')
+    if 'bluetooth-link' in names:
+        results = list(dict.fromkeys(re.findall(r'bt-scan: native GATT [^\n]+', text)))
+        passed = [r for r in results if 'GATT PASS;' in r]
+        check('bluetooth-link', len(passed) >= names.count('bluetooth-link') and
+              not any('GATT FAIL;' in r for r in results) and 'Bluetooth error - restarting' not in text,
+              '; '.join(results) if results else 'no native GATT result')
     if 'idle' in names:
         m = re.findall(r'power_test: panel (\w+).*?awake (\d+) s', text)
         rows = re.findall(r'cpufreq: over the last \d+ ticks the groups ran at rows ([^;]*);', text)

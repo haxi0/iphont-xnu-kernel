@@ -98,6 +98,7 @@ static uint64_t power_display_offs;
 static uint32_t sleep_enabled;          /* boot-arg syssleep, by default on with board=instantnoodle */
 static uint32_t gpu_sleep_enabled = 1;  /* boot-arg gpu_sleep=0: the GPU block stays powered through a sleep */
 static uint64_t sleep_max;              /* boot-arg sleep_max: seconds; 0, none */
+static uint32_t sleep_freeze = 1;       /* boot-arg sleep_freeze=0 (diagnostic): mach_absolute_time() runs on through a sleep */
 static uint64_t sleep_count, sleep_seconds_total, sleep_wake_at;  /* sleep_wake_at: calendar seconds, 0 none */
 static char sleep_last[128] = "never slept";
 static uint64_t sleep_timer;            /* sysctl kern.hackios.sleep_timer: the next sleep's own wake, seconds (once) */
@@ -192,6 +193,7 @@ hk_power_sleep_supported(void)
 		PE_parse_boot_argn("syssleep", &sleep_enabled, sizeof(sleep_enabled));
 		PE_parse_boot_argn("sleep_max", &sleep_max, sizeof(sleep_max));
 		PE_parse_boot_argn("gpu_sleep", &gpu_sleep_enabled, sizeof(gpu_sleep_enabled));
+		PE_parse_boot_argn("sleep_freeze", &sleep_freeze, sizeof(sleep_freeze));
 	}
 	return sleep_enabled != 0;
 }
@@ -389,7 +391,7 @@ hk_power_sleep(void)
 	}
 	now = ml_get_hwclock();
 	__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_ENABLE);  /* as the kernel keeps it; its next deadline is set next */
-	ml_sleep_timebase_thaw(frozen);
+	ml_sleep_timebase_thaw(sleep_freeze ? frozen : frozen + (now - began));
 	gic_v3_sleep_exit(wake_intid);
 	loader_live_beat();
 	absolutetime_to_nanoseconds(now - began, &ns);

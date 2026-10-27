@@ -403,10 +403,18 @@ regs_write(uint8_t reg, const uint8_t *values, unsigned count)
 #define A7_DETCTRL              0x5f            /* [5] protection: no action, [0] a measurement goes (clears when done) */
 #define A7_ADCTEST              0x66            /* [6] battery voltage compensation by the chip */
 #define A7_GAIN                 0x80            /* OnePlus's driver: aw8697_haptic_set_gain(0x80) */
+#define A7_TRIM_LRA             0x5b            /* [5:0] the f0 trim, two's complement (OnePlus's AW8697_REG_TRIM_LRA) */
 #define A7_LOOP_WAVEFORM        10              /* what OnePlus's driver repeats for a vibration of some length */
 /*
  * The waveform file for its motor: OnePlus's driver picks one of five by the f0 the factory measured (166 to
  * 174 Hz), which is not known here; 170 Hz is the motor's nominal (AW8697_HAPTIC_F0_PRE).
+ *
+ * The f0 trim (boot-arg haptic_trim=N, the phone's own /mnt/vendor/persist/engineermode/f0_cali_data, a decimal
+ * number; in the profile as slider_cal is): OnePlus's driver writes it into TRIM_LRA (aw8697_haptic_upload_lra(),
+ * at every stop), which moves the motor's resonance onto the 170 Hz the waveforms are made for. It is what its
+ * aw8697_haptic_f0_calibration() computed from the f0 measured without trim: 10000 (f0 - 170) / (25 f0) steps,
+ * -32..31 (this phone: f0_date "175 ...", f0_cali_data 11 = 10000 * 5 / (25 * 175)). Without it the chip's reset
+ * value stays and the motor is driven off its resonance (weaker, buzzier).
  */
 #define A7_WAVEFORMS            "aw8697_haptic_170.bin"
 
@@ -655,6 +663,7 @@ static bool
 configure_aw8697(void)
 {
 	uint8_t det = 1, stale = 0;
+	uint32_t trim = 0;
 
 	/* (the flags latched before anybody looked: under-voltage from its power-up, 0x31 as the phone came) */
 	if (!get(AW_SYSINT, &stale)) {
@@ -669,6 +678,15 @@ configure_aw8697(void)
 	    !put_bits(A7_DETCTRL, 0x20, 0x20) || !put_bits(A7_PWMPRC, 0x80, 0x00) || !put_bits(A7_PRLVL, 0x80, 0x00) ||
 	    !put_bits(A7_BST_AUTO, 0x04, 0x00)) {
 		return false;
+	}
+	if (PE_parse_boot_argn("haptic_trim", &trim, sizeof(trim))) {
+		if (trim > 0x3f) {
+			say("haptic: haptic_trim=%u is not a 6-bit trim: not written\n", trim);
+		} else if (!put(A7_TRIM_LRA, (uint8_t)trim)) {
+			return false;
+		} else {
+			say("haptic: the factory's f0 trim (%u) in TRIM_LRA\n", trim);
+		}
 	}
 	if (!put_bits(A7_SYSCTRL, 0x20, 0x20) || !get(A7_DETCTRL, &det) || !poke(A7_DETCTRL, det | 0x01)) {
 		return false;

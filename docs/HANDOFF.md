@@ -4,7 +4,106 @@ Short, actionable, and dated. It does **not** replace [TODO.md](TODO.md) (roadma
 it says where the work stands *today*. **Update this file after every substantial session** (rules in [../AGENTS.md](../AGENTS.md)); keep it under ~150 lines and move
 anything that has aged into the right permanent page.
 
-**Last updated: 2026-10-26 ~04:55 MSK** by the scheduler session (sections 2, 3, 4, 7 for the scheduler; the rest as the documentation session left it at ~03:30). **Checked state** = what I ran/read on that date; **historical** = taken from earlier session notes and flagged as such.
+**Last updated: 2026-10-27 02:40 MSK** for the driver audit fixes below (before that 01:15 MSK, the Bluetooth audio transport). Earlier state: ~04:55 MSK by the scheduler session (sections 2, 3, 4, 7 for the scheduler; the rest as the documentation session left it at ~03:30). **Checked state** = what I ran/read on that date; **historical** = taken from earlier session notes and flagged as such.
+
+## Driver audit fixes — 2026-10-27 ~02:40-02:55 MSK (built; partly verified in RAM runs on the phone)
+
+Audit of the OnePlus drivers against OnePlus's kernel (OnePlusOSS sm8250 R11) and mainline Linux; fixes ported from them as data
+(GPL code is not copied verbatim; wpa_supplicant's logic is BSD). Kernel builds clean (`out/kernel-build.log`, the usual symbolset
+errors only), `tools/mk-ath11k.sh` builds, `tools/wpa-test/run.sh` 267 + 218 checks pass (new: PTK renewal case). Edited in
+`xnu-src` and copied to `xnu/files` file by file (no `xnu/export.sh`). Uncommitted. Nothing flashed, no phone run yet.
+- RPMh TCS 0 shared claim `hk_rpmh_claim/release` (`hk_board.c`), used by `instantnoodle_touch.c`, `hk_adsp.c`, `hk_cpufreq.c`, `hk_goodix.c` ([power.md](subsystems/power.md)).
+- Wi-Fi PTK renewal + KRACK guards (`wifi/lx/src/lx_wpa.[ch]`, `lx_80211.c`, `tools/wpa-test`) ([wifi.md](subsystems/wifi.md#the-station-shared)).
+- SM8250 thermal sensor map (`hk_thermal.c`) ([thermal.md](subsystems/thermal.md)).
+- Touch: vendor status-event handling, chip reset, charger mode (`instantnoodle_touch.c`, hook in `instantnoodle_battery.c`).
+- AW8697 factory f0 trim `haptic_trim=11` (`hk_haptic.c`, profile `common/devices/instantnoodle.conf`).
+- I2C serial engines (GENI FIFO, `instantnoodle_i2c.c`), opt-in `i2c_geni=1` (read-only probe) / `2` (use). Default unchanged.
+- Not done: panel sleep-in (Android's on-command already carries the PPS and was tried: [display.md](subsystems/display.md)); merging the
+  8 command-database parsers / DSP stack copies (T29).
+- **Phone runs (owner-approved, RAM only, 02:38-02:50 MSK):** `tools/t quick` `023834` boot PASS; `024422` PASS 7/7 (`haptic=5
+  haptic_trim=11 i2c_geni=1`); `024633`/`024827` (`--keep`, the latter `i2c_geni=2`) boot PASS, `pods` FAIL only because iOS's "Low
+  Battery 20%" alert covered the App Library (screenshot `t-024630-library.png`; battery 19-20 %, charging). Seen: TRIM_LRA `0x0b` read back;
+  touch charger mode 2; touch/gauge/slider engines have FIFO and work in FIFO mode with 0 errors (touch read 2082 -> 368 us); no RPMh claim
+  failures logged. Not exercised: audio DSP rails (`adsp=1`), Wi-Fi renewal, touch under a finger, touch error paths, thermal throttling.
+- **Found (pre-existing):** a run's log no longer brings the kernel's message buffer back: the loader's `oem log` recomposes without it
+  after the return (`compose_logs(NULL, 0)`), so plain kernel `printf` lines are lost (also why "IOLog lines no longer reach phone logs").
+  Work-around used: touch, I2C and battery print through `say()` to the loader's log as `hk_buttons.c` does. Fix belongs in `xnuloader`
+  (needs a loader reload, which the owner deferred).
+- **Next ([TODO T37](TODO.md#t37-driver-audit-follow-ups-2026-10-27--drivers--partial--p2)):** the owner will run `i2c_geni=2` with the touch screen later (then make it the default); `adsp=1 sound=4` once to try the
+  amplifiers' bus on its engine (quiet hours: `sound_amps=0`).
+
+## Post-wake UI fix — 2026-10-26 23:50 MSK (Claude session that owns sleep/power; parallel to Bluetooth)
+
+- Owner report: after sleep, Control Center empty, status bar items/bar gone, apps blank. **Fixed and verified on the phone
+  (RAM runs only, nothing flashed):** `MiniIOMobileFramebuffer.cpp` `vsync()` now sends `mach_continuous_time()`; QuartzCore's
+  frame clock lagged by all the time slept. Diagnosis and A/B in [power.md](subsystems/power.md#ui-missing-after-a-wake-fixed-2026-10-26).
+  New diagnostic boot-arg `sleep_freeze=0` (`hk_power.c`). Both files exported to `xnu/files` by copy (not `xnu/export.sh`); uncommitted.
+- Not in the installed build (T03 needs the owner's OK). Pre-existing: Control Center close after a wake is slow (KNOWN_ISSUES K10).
+- Found, not fixed: `IOLog` lines (HKGPU, MiniIOSurface...) no longer reach phone logs (they did on 2026-10-25); `printf` does.
+- Repro used `tools/t` through a temporary wrapper outside the repo; `tools/t` itself untouched. Phone left in the loader.
+
+## Bluetooth audio transport — 2026-10-27 01:15 MSK (latest)
+
+Owner-supervised RAM runs `005834`, `010727` (nothing flashed; phone back in loader). **A2DP heard** (lock sound, record chime).
+**HFP/SCO UART stall fixed** in `hk_bt.c` (uncommitted, exported by copy to `xnu/files`): legacy SCO set-up sent as Enhanced with
+HCI data path (`bt_sco_hci`), SCO paced to the chip's own packets (`bt_sco_pace`); `010727`: 3 voice links, 0 drops, no restart.
+**Voice Memos through buds: owner-verified working in `012839`** (record + playback). Its crash in `011859` was CoreAudio's
+uncaught `thread_policy_set realtime failed` (KERN_INVALID_ARGUMENT); `xnu-src/.../osfmk/kern/thread_policy.c` now cuts an
+over-50-ms computation (`rt_clamp`, logged) -- not exported to `xnu/hackios.patch` yet, and not proven necessary (no cut logged in 012839).
+`010727`'s other failure (buds answering after 3 s, 1809) did not recur. Details: [bluetooth.md](subsystems/bluetooth.md#bluetooth-audio-fixed-at-the-transport--2026-10-27-0115).
+Also changed: `userland/src/sound_test.c` (`bluetooth-level`, max 0.1), new `userland/rc.jobs.btaudio`, `tools/bt/check.py` (SCO fixtures; 8/8 PASS).
+
+## Recording diagnosis — 2026-10-27 00:36 MSK
+
+Owner reports Voice Memos crash, silent lock sound, brief black screen then recovery; buds disconnected.
+`002629` shows Voice Memos selects CMF HFP input/output at 00:27:33; VirtualStream reports client-format
+error 'what' for 16-bit/8 kHz/mono. Standard HCI Setup Synchronous Connection completes status 0. Audio
+server PID changes 40 → 239 around 00:27:56. No usable crash stack in that run; do not assert root cause.
+Lock sound remains deliberately muted by `sound_amps=0`; black-screen cause is unproven. Sleep agent owns it.
+Silent RAM isolation `003355-run.log.live.*` (exec 22955) enabled `exctrace=1 applog=1`, no buds. Existing
+`record_test 2` selects MicrophoneBuiltIn, records 96000 non-silent samples/two seconds successfully; Voice
+Memos launches without a captured exception. Test ended normally after 73 s; phone returned to loader.
+No source fix justified yet. Next physical gate: re-pair buds and repeat Voice Memos Record under exception
+tracing, preserving HFP/SCO and audio-server logs. Quiet-tone approval persists, but no new tone played.
+Work stopped for that gate. No sleep/power edits, flash, pairing-privilege changes or persistent recording.
+
+## Bluetooth RAM audio test — 2026-10-27 00:28 MSK (ended)
+
+Owner authorized RAM restart and quiet playback. Shared phone lock was free; used current kernel including
+Claude's sleep/display fixes without changing their files. Run `002629-run.log.live.*`, exec session 57319:
+`bt=1 bt_trace=1 adsp=1 sound=4 mic=4 sound_amps=0`, native BT HAL bundle present, DSP/mic/controller up.
+Settings shows CMF Buds Pro 2 Connected. Diagnostic selected BluetoothA2DPOutput/CMF Buds Pro 2, volume 0.30;
+played 2 s at 1% sample peak, AudioQueueStart 0, 96000/96000 frames accepted. Native AVDTP START accepted,
+OPEN → STREAMING at 00:27:20; no Bluetooth restart observed. **Heard output awaits owner confirmation.**
+No microphone/bond/sleep-reconnect proof. No new driver edit, flash, loader replacement or automatic pairing confirmation.
+Manual window ends after the queued 120-second post-tone hold (max run 420 seconds); preserve logs on return.
+
+## Bluetooth audio diagnosis — 2026-10-26 22:30 MSK (historical)
+
+- Owner paired CMF Buds Pro 2 in native Settings. `221539-run.log.live.*` + screenshot: Connected; HCI Simple
+  Pairing/Authentication Complete status 0; Encryption Change 0/enabled 1; AAC selected; AVDTP CONFIG/OPEN
+  accepted, media channel OI_OK/OPEN. Owner reports no heard sounds and Voice Memos recording fails.
+- **Found actual audio gap:** build overlay exposes only HKAudio; original BTAudioHALPlugin.driver was excluded
+  by select-system.py. bluetoothd publishes audio devices but CoreAudio has no Bluetooth device plug-in.
+  Fixed selection + opt-in packaging; original unmodified bundle extracted locally from rootfs.dmg, never added to git.
+- Previous test boot also omitted `adsp=1 sound=4 mic=4` and forced `sound_amps=0`; built-in silence/recording failure
+  cannot diagnose Bluetooth hardware from that boot. Do not infer Voice Memos selected the buds' microphone.
+- Owner authorized **quiet** audio. Added `sound_test bluetooth-tone 180`: activates Playback, waits for exactly
+  CMF Buds Pro 2/BluetoothA2DPOutput, then plays 2 seconds at 1% sample peak; other routes/timeouts play nothing.
+  Host gate fixtures PASS (not framework proof); HAL selection/staging/original-byte identity and H4/NVM/UUID checks PASS.
+- Native userland build with HAL plug-in, diagnostic tone, timeout bounds and opt-out cleanup PASS; no new
+  hardware boot yet. Final host checks PASS. Playback still unverified.
+  Further transport blocker may appear: native plug-in contains AudioSkywalkPipe/AudioRingBuffer; inspect runtime logs.
+- Current loader is old (`./iphont agent`: no mailbox), cannot exec into running iOS. Existing manual run ended after
+  638 seconds and returned to loader; no agent tone was played. Next test needs a RAM boot/re-pair and mediaserverd logs.
+- **Coordination:** owner says another Claude agent owns deep/system sleep. Leave sleep/power code to that agent;
+  use the shared phone lock for every run; record Bluetooth retention/reconnect dependencies without changing its work.
+  No loader replacement, flashing, private pairing privileges, key export, or parallel transport authorized.
+- Next owner action is re-pairing the buds in the corrected RAM test. Stop at that physical gate; quiet-tone approval
+  persists. Diagnostic recipe: `adsp=1 sound=4 mic=4 sound_amps=0 bt=1 bt_trace=1`; native HAL route is the test gate.
+  Preserve ignored userland sources and uncommitted drivers; no commit/push requested. Earlier notes are historical.
+
+Earlier implementation details: [Bluetooth subsystem](subsystems/bluetooth.md#archived-implementation-handoff-historical-2026-10-26-2142).
 
 ## 1. State of the project (checked 2026-10-26)
 

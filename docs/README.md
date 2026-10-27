@@ -33,6 +33,7 @@ Start with the root [README](../README.md) for the overview and the QEMU quick s
 | [audio.md](subsystems/audio.md) | DSP, speakers, guard, microphone |
 | [input-peripherals.md](subsystems/input-peripherals.md) | touch, keys, slider, haptics, torch, battery, cameras |
 | [wifi.md](subsystems/wifi.md) | ath11k on a compatibility layer, Apple80211, QCA6390 and WCN6750 |
+| [bluetooth.md](subsystems/bluetooth.md) | QCA6390 UART, firmware, native iOS integration and verification limits |
 | [storage.md](subsystems/storage.md) | images, UFS through the loader, partitions, `/private/var`, APFS, HFS+ |
 | [userland.md](subsystems/userland.md) | iOS integration: init, jobs, injected libraries, DENY list |
 

@@ -8,6 +8,7 @@
   *   MiniAppleKeyStore.cpp          AppleKeyStore: the keybag of a device without a passcode
  *   MiniAppleARMBacklight.cpp      AppleARMBacklight: the service brightness requests go to
  *   MiniIONetworkStack.cpp         IONetworkStack: what configd's interface namer waits for
+ *   HKBluetooth.cpp                the "bluetooth" service bluetoothd and BlueTool look up (bt=1)
  */
 #ifndef _IOKIT_MINIDRIVERS_H
 #define _IOKIT_MINIDRIVERS_H
@@ -19,5 +20,6 @@ void MiniIOMobileFramebufferStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);
 void MiniAppleARMBacklightStart(void);
 void MiniIONetworkStackStart(void);
+void HKBluetoothStart(void);
 
 #endif /* _IOKIT_MINIDRIVERS_H */

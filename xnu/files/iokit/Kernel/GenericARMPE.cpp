@@ -406,6 +406,7 @@ GenericARMPE::start(IOService * provider)
 	MiniAppleKeyStoreStart();
 	MiniAppleARMBacklightStart();
 	MiniIONetworkStackStart();
+	HKBluetoothStart();
 	return true;
 }
 

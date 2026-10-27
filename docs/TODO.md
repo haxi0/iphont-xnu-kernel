@@ -21,7 +21,7 @@ Order inside each section is by priority. Update an item when you change its sta
 | T02 | Wi-Fi radio through system sleep | Built, Unverified | P0 |
 | T03 | Install the current build / keep installed bundle current | Partial | P1 |
 | T04 | Motion, light and proximity sensors (screen rotation, auto-brightness) | Not Started | P1 |
-| T05 | Bluetooth | Not Started | P1 |
+| T05 | Bluetooth | In Progress | P1 |
 | T06 | Cellular modem, telephony, SMS | Not Started | P1 |
 | T07 | OnePlus 8 cameras | Not Started | P1 |
 | T08 | Headphones / USB-C audio | Not Started | P1 |
@@ -96,10 +96,23 @@ Order inside each section is by priority. Update an item when you change its sta
 - **Next:** run `adsp=1` and read `kern.hackios.adsp_services` for service 400 (the previous plan's first question; result not recorded).
 - **Refs:** K07.
 
-### T05 Bluetooth — Connectivity · Not Started · P1
-- **Facts:** same chip as Wi-Fi (QCA6390 on OnePlus 8; WCN6750 on redwood). `bluetooth`, `BTServer` are in the userland DENY list. No driver, no HCI transport.
-- **Next:** HCI over the QCA6390's UART/MHI path (Linux `hci_qca`/ath11k combo); a `bluetoothd` stand-in or IOKit `IOBluetooth` stack is a large unknown.
-- **Refs:** K05.
+### T05 Bluetooth — Connectivity · In Progress · P1
+- **Verified on phone:** QCA6390 UART, firmware/NVM and HCI; native CoreBluetooth service-filtered discovery before/after sleep;
+  initial native BLE connection and 22-byte GATT write/readback. Later supervised `221539` verifies CMF Buds Pro 2
+  classic pairing, authentication/encryption and AAC A2DP channel negotiation through native Settings. Playback unverified.
+- **Fixed:** optional unsupported init step, Broadcom capabilities/multi-advertising, and mixed legacy/extended LE commands.
+  HCI capability masks and replies remain truthful. Malformed NVM rejection is host-tested; latest kernel also brings up the controller on the phone.
+- **Files:** `instantnoodle_bt.c`, `hk_bt.c`, `HKBluetooth.cpp`; userland `btboot.c`, `inject_bt.c`, `bt_scan.m`; `tools/bt/check.py`, `tools/t`.
+- **Audio gap:** original BTAudioHALPlugin.driver was excluded/hidden by HKAudio-only overlay; selection/packaging fixed and built.
+  Corrected image routes the quiet tone to A2DP and enters STREAMING (`002629`); heard output unconfirmed.
+  Voice Memos selects HFP, encounters format error, and audio server restarts; exact fatal stack still needed.
+  No-buds `003355` records two seconds through the built-in mic and opens Voice Memos without a captured exception.
+- **Owner step:** supervised Settings pairing succeeded. Quiet test ran with approval; next required action is re-pairing/tapping Record under exception tracing.
+  Earlier CLI post-wake MITM failure (4815/705) is distinct from the now-verified native classic pairing flow.
+- **Remaining:** BLE pairing-session validation, general foreground BLE app discovery,
+  reliable reconnect, audio, bond persistence, coexistence. Audio needs a headset and an approved audible test.
+- **Refs:** [subsystems/bluetooth.md](subsystems/bluetooth.md), [research/bluetooth-ios.md](research/bluetooth-ios.md), K05.
+  Opt-in `bt=1` / `BLUETOOTH=1`; nothing flashed. `213836` run: 10/11 (post-wake GATT failed); host parsers/guards PASS.
 
 ### T06 Cellular modem, telephony and SMS — Connectivity · Not Started · P1
 - **Facts:** the modem (MSS) is not started (`qcom,mss@4080000`); CommCenter (`-noncellular` variant) answers but dies on missing `AppleIPAppender` (SIGSEGV) and
@@ -181,6 +194,14 @@ Not done: 802.11r (iOS is told FT is absent), TKIP pairwise, roaming, WPA3 other
 AKM 6, RSNE/RSNXE downgrade check, WPA3 transition mode. Auto-join across reboots needs a persistent `/private/var` run (`var_store=1 ufs_write=1`, or installed boot) — the
 Keychain itself works. Files: `wifi/lx/src/lx_wpa.c`, `lx_sae.c`, `lx_80211.c`, `hk_sta.c`. Refs: [wifi.md](subsystems/wifi.md); K05.
 
+### T37 Driver audit follow-ups (2026-10-27) — Drivers · Partial · P2
+From the audit against OnePlus's sm8250 kernel and mainline (HANDOFF "Driver audit fixes"). Open:
+- `i2c_geni=2` (I2C serial engines, FIFO mode; `instantnoodle_i2c.c`) verified at boot on touch/gauge/slider; **next:** a manual run with a finger
+  on the screen (`i2c_geni=2 touch_lat=1`), then make it the default; try the amplifiers' bus once with `adsp=1 sound=4 sound_amps=0`.
+- Not yet seen on the phone: touch error paths (ESD, queue full, own restart), the audio DSP's RPMh claim (`adsp=1`), Wi-Fi PTK renewal (needs an
+  AP with `wpa_ptk_rekey`), thermal throttling with the SM8250 map (T33), whether the haptic trim feels better.
+- Merging the duplicated command-database parsers / bit-banged I2C / DSP stack: T29. Kernel log loss after a run: K25 (loader).
+
 ### T19 Fast charging (Warp / USB PD/PPS) — Power · Not Started · P2
 OnePlus's fast-charge MCU (I2C `0x26`) protocol and firmware unknown; max here is the normal charger's 2000 mA (when T01 verifies the ICL). Redwood reads the charger but does not drive PD/PPS. Refs: K08.
 
@@ -224,7 +245,7 @@ it is given. Documented honestly as stand-ins ([kernel-standins.md](research/ker
 
 ### T29 Remove stand-ins and copies — Maintenance · Partial · P3
 `hk_wlfw.c` ("A STAND-IN, TO BE THROWN AWAY when ath11k's own qmi.c runs here" — it does now with `wifi_lx`); `hk_adsp.c` is a copy of `hk_wifi.c`'s approach ("a copy, not a shared library, for now");
-`hk_haptic_pretend()` test stand-in; `hk_sparse.c`/`apfs_check` bring-up aids; `hk_hfs` fetched at build time.
+`hk_haptic_pretend()` test stand-in; the RPMh command-database parser is copied in 8 files (`hk_adsp`, `hk_cpufreq`, `hk_speaker`, `hk_adreno`, `instantnoodle_touch`, `hk_camera`, `hk_goodix`, `hk_wifi`) and bit-banged I2C in 4 (`instantnoodle_i2c`, `hk_haptic`, `hk_speaker`, `hk_camera`): merge into one each (the TCS 0 race they caused is fixed by `hk_rpmh_claim()`, 2026-10-27); `hk_sparse.c`/`apfs_check` bring-up aids; `hk_hfs` fetched at build time.
 
 ### T30 Redwood re-verification and parity — Redwood · Not Started · P3
 The owner said not to run POCO checks. Redwood lacks `gpu_pt`, DCVS, fence IRQ, system sleep, interrupt-driven touch; dual boot is verified only in QEMU. Needs an explicit request.

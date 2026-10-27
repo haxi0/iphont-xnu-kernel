@@ -42,6 +42,29 @@
 #include <sys/reboot.h>
 #include <sys/systm.h>
 
+/*
+ * Every line to the loader's log as well, as hk_buttons.c does: a kernel printf reaches only the kernel's message
+ * buffer, which no longer comes back with a run's log.
+ */
+extern void loader_log_putc(char c);
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[300];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return printf("%s", line);
+}
+#define printf say
+
 
 #define GAUGE_ADDR              0x55
 #define DEVICE_TYPE_BQ27411     0x0421
@@ -62,6 +85,7 @@
 #define BATTERY_LOW_PERCENT     10
 
 extern int reboot_kernel(int howto, char *message);
+extern void instantnoodle_touch_charger(bool plugged);
 static uint32_t empty_readings, shutdown_on = 1, empty_mv = BATTERY_EMPTY_MV;
 static volatile int battery_last_percent = -1, battery_last_external = -1;
 
@@ -283,6 +307,7 @@ sample(struct hk_battery_state *b, int *flags_out, uint8_t *charger_state)
 	} else {
 		b->external = ma > 0;                   /* the charger cannot be asked: taking charge says it is there */
 	}
+	instantnoodle_touch_charger(b->external != 0);   /* (the touch chip's noise filter for a charger) */
 	if (hk_spmi_read(PM8150B_CHGR, CHGR_STATUS_1, &chgr, 1) == 0) {
 		chgr &= 7;
 	}

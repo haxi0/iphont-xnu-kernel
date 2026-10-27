@@ -2713,6 +2713,13 @@ IOMobileFramebufferUserClient::armVSync(void)
 /*
  * One refresh: tell the client, which gets three 64-bit numbers as six 32-bit halves --
  * the time of this refresh, the same again (the time it was presented), and a counter.
+ *
+ * The times are mach_continuous_time(), which goes on while the system sleeps: QuartzCore takes them in that
+ * clock (CA_FORCE_TIMER, inject.c; the second, the presented time, is its frame clock). Given mach_absolute_time(),
+ * which stands still in a sleep (bsd/dev/hk_power.c), the window server's frame clock fell behind its clients' by
+ * all the time slept, and whatever came on the screen with an animation after a wake -- Control Center's modules,
+ * an application starting, the status bar's text -- stayed invisible until the clock caught up (the owner's report
+ * 2026-10-26; ca_vbl=0 or sleep_freeze=0 cured it).
  */
 void
 IOMobileFramebufferUserClient::vsync(void)
@@ -2723,7 +2730,7 @@ IOMobileFramebufferUserClient::vsync(void)
 	bool send = false;
 
 	IOLockLock(fLock);
-	now = fVSyncTime;
+	now = fVSyncTime + (mach_continuous_time() - mach_absolute_time());
 	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
 		fVSyncRunning = false;
 	} else if (gPanelOff) {

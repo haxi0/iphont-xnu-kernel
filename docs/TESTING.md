@@ -98,3 +98,56 @@ Before: a planned 28 min baseline (stopped at 14), a planned 9 min regression th
 ## iphont agent checks
 
 `nix-shell --run './iphont test host'` runs Python tests and a compiled C fixture using the actual loader command implementation; it never uses the phone. `iphont kernel-test KERNEL` runs a private QEMU instance with a sleeping process-1 fixture and `iphont=1 iphont_selftest=1`; it checks seven native XNU probes, event records, denied control, and orderly timed return. It tests neither USB nor the iOS daemon. `iphont test device` runs read-only live smoke checks, without booting or flashing. The owner deferred loading the new RAM loader on 2026-10-26; agent hardware/control tests remain pending. See [TOOLKIT.md](TOOLKIT.md).
+
+## Bluetooth on instantnoodle (opt-in, RAM-only)
+
+Host regression: `nix-shell --run 'python3 tools/bt/check.py'` verifies the 20F66 bluetoothd UUID/init-table guards
+and exercises the actual H4 parser under address/undefined sanitizers. It does not prove hardware operation.
+
+With local `fw-bt/htbtfw20.tlv` and `fw-bt/htnv20.bin`, use:
+
+```sh
+# Isolate firmware/controller discovery from iOS.
+T_BOOTARGS='bt=1 bt_test=1 bt_trace=1 sound_amps=0' tools/t --keep boot
+# Native CoreBluetooth discovery, then repeat after one sleep/wake.
+BLUETOOTH=1 OSLOG='com.apple.backboardd com.apple.bluetoothd' \
+  T_BOOTARGS='bt=1 bt_trace=1 sound_amps=0' tools/t --keep boot bluetooth sleep1 bluetooth
+```
+
+The `bluetooth` check scans the controlled peer service UUID and requires CoreBluetooth discovery callbacks and no daemon restart in the captured log.
+General boot PASS alone proves no Bluetooth functionality. An empty scan can mean no nearby advertisers;
+inspect HCI status and probe state before drawing conclusions. No permission overrides are installed.
+If a permission/pairing prompt requires the owner, stop and record the exact required action.
+Keep HCI traces local: they can contain addresses, advertisements and security material.
+
+
+`bluetooth-link` runs `bt_scan --link`: scan only service `86DBFDC4-50F4-4D5C-BD34-9672E9EF58F2`,
+connect, discover characteristic `86DBFDC4-50F4-4D5C-BD34-9672E9EF58F3`, read it, write a per-run value,
+and read back identical bytes. This is a real unpaired BLE GATT transfer test, not a pairing/audio test.
+It never connects to arbitrary nearby devices.
+
+A controlled Linux host peer can use the installed `bluetoothctl` GATT server. Record adapter state first;
+keep the session open during the phone run. Disable its default agent, keep pairing disabled, power on,
+then enter `menu gatt`, `register-service <service UUID>` (answer yes for primary),
+`register-characteristic <characteristic UUID> read,write` (initial value: 32 space-separated `0x00` bytes; BlueZ uses that length as write capacity),
+and `register-application`. In `menu advertise`, set `uuids <service UUID>` and `name HKBT-test`,
+then return and `advertise peripheral`. Wait for registration success before running the phone.
+Afterward disable advertising, unregister the application, exit, and restore the recorded adapter power/state.
+No existing paired peer is used or removed. Host GATT values and advertisements are temporary test content.
+
+`bt_scan --all` retains the exploratory unfiltered scan. This CLI has no foreground application session;
+20F66 reports FG:0 and delivers no unfiltered results. Explicit service scans do receive callbacks.
+Apple documents explicit service UUIDs for background scans; foreground app discovery still needs a separate test.
+
+
+For native Bluetooth audio, `BLUETOOTH=1` must package the original
+`System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver` alongside HKAudio. Existing local extractions can restore
+only this bundle with `nix-shell --run '7z x -y -oios165/rootfs ios165/rootfs.dmg System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver'`.
+Do not run a destructive full re-extraction just for this bundle. Keep extracted Apple files ignored.
+`tools/bt/check.py` validates selection and, for a staged Bluetooth image, presence/original-byte identity of its HAL plug-in.
+
+The approved low-volume probe is `sound_test bluetooth-tone 180 route`: exact buds A2DP route required, two seconds,
+1% sample peak, no tone on other routes or timeout. Host route fixtures do not validate the real framework.
+Use `adsp=1 sound=4 mic=4 sound_amps=0` for built-in backend/mic diagnostics with speakers muted; the earlier tools/t
+Bluetooth boot did not enable those paths. Enable mediaserverd logs. Re-pair after a new RAM boot; capture actual route,
+A2DP start/media traffic and heard output separately. Another agent owns sleep work; honor the shared run lock.

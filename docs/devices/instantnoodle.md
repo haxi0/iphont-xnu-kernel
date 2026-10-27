@@ -18,7 +18,7 @@ What has been **seen working on the phone itself** (the kernel's log of a run sa
 |---|---|---|---|
 | Boot to SpringBoard, 8 cores, prime core 2.84 GHz | works (RAM, installed) | `cpus=8 cpufreq=1 bootcpu=7` | [cpu.md](../subsystems/cpu.md) |
 | Display, 90 Hz, no tearing | works | default with `board=instantnoodle` | [display.md](../subsystems/display.md); ~2% of swaps a refresh late |
-| Touch (S6SY761), interrupt-driven | works | default (`touch_irq=0` polls) | [input-peripherals.md](../subsystems/input-peripherals.md) |
+| Touch (S6SY761), interrupt-driven | works; I2C on its serial engine with `i2c_geni=2` (verified at boot 2026-10-27, not yet default) | default (`touch_irq=0` polls) | [input-peripherals.md](../subsystems/input-peripherals.md) |
 | Power/volume keys, alert slider | works (keys' interrupts and dark-wait not run) | default | input-peripherals.md, [power.md](../subsystems/power.md) |
 | Battery level/voltage/current/charging | works | default | power.md |
 | Speakers (TFA9874), iOS sounds, volume keys | works, heard 2026-10-24 | `adsp=1 sound=4 sound_amps=1 sound_below=96`, `fw-audio` | [audio.md](../subsystems/audio.md) |
@@ -32,7 +32,8 @@ What has been **seen working on the phone itself** (the kernel's log of a run sa
 | Boot from flash, boot menu, boot guard, `/private/var` on HFS+ | works (installed 2026-10-24) | `common/flash/install-xl.sh` | [storage.md](../subsystems/storage.md), INSTALL.md |
 | Custom boot logo | works | `userland/mkbootlogo.py` | research/ios-userland.md §7 |
 | Metal driver | experimental, off by default | `metal=1`/`2` | gpu.md |
-| Not done | headphones/USB-C audio, cameras, sensors, Bluetooth, cellular, location, fast charging (Warp), SoC low-power states, auto-brightness | | [../TODO.md](../TODO.md), [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md) |
+| Bluetooth (QCA6390) | partial: native BLE discovery and initial GATT transfer verified; pairing/reconnection unfinished | `bt=1`, `BLUETOOTH=1`, `fw-bt` | [bluetooth.md](../subsystems/bluetooth.md) |
+| Not done | headphones/USB-C audio, cameras, sensors, cellular, location, fast charging (Warp), SoC low-power states, auto-brightness | | [../TODO.md](../TODO.md), [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md) |
 
 ## Setting up (RAM-only run)
 

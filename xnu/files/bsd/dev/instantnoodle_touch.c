@@ -28,8 +28,32 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/instantnoodle.h>
+#include <sys/hk_board.h>
 #include <sys/hk_input.h>
 #include <sys/systm.h>
+
+/*
+ * Every line to the loader's log as well, as hk_buttons.c does: a kernel printf reaches only the kernel's message
+ * buffer, which no longer comes back with a run's log.
+ */
+extern void loader_log_putc(char c);
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[300];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return printf("%s", line);
+}
+#define printf say
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -93,6 +117,9 @@ static uint64_t irq_time;
 static volatile bool touch_dark_wanted;
 static bool touch_dark;
 static uint32_t touch_darks;
+/* a cable in (1) or not (0), -1 not known: as told (instantnoodle_touch_charger()), and as the chip was told last */
+static volatile int charger_wanted = -1;
+static int charger_set = -1;
 /* touch_irq=0: the old 10 ms polling, for recovery (the interrupt path: verified on the phone 2026-10-23) */
 static uint32_t trace_latency, use_irq = 1;
 
@@ -120,13 +147,13 @@ wait_report(void)
 	for (;;) {
 		uint64_t at, deadline;
 
-		if (touch_dark_wanted != touch_dark) {
-			return 0;               /* (the screen went off or came on: the loop does the rest) */
+		if (touch_dark_wanted != touch_dark || (!touch_dark && charger_wanted != charger_set)) {
+			return 0;               /* (the screen went off or came on, or the cable: the loop does the rest) */
 		}
 		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
 		assert_wait_deadline((event_t)&irq_time, THREAD_UNINT, touch_dark ? 0 : deadline);
 		at = __atomic_exchange_n(&irq_time, 0, __ATOMIC_ACQUIRE);
-		if (touch_dark_wanted != touch_dark ||
+		if (touch_dark_wanted != touch_dark || (!touch_dark && charger_wanted != charger_set) ||
 		    (!touch_dark && (at != 0 || !instantnoodle_gpio_level(PIN_IRQ)))) {
 			clear_wait(current_thread(), THREAD_AWAKENED);
 			return at;
@@ -146,6 +173,21 @@ instantnoodle_touch_display(bool on)
 }
 
 static struct instantnoodle_i2c bus = { .name = "se13", .sda = PIN(36), .scl = PIN(37) };
+
+/*
+ * Whether a cable is in (instantnoodle_battery.c tells): the chip is told, as OnePlus's touch core does on a charger's
+ * change and after every reset (operate_mode_switch(), MODE_CHARGE), so that its noise filter suits a charger's noise.
+ */
+void instantnoodle_touch_charger(bool plugged);
+
+void
+instantnoodle_touch_charger(bool plugged)
+{
+	if (charger_wanted != (int)plugged) {
+		charger_wanted = plugged;
+		thread_wakeup((event_t)&irq_time);
+	}
+}
 
 static int
 ts_write(const uint8_t *tx, unsigned n)
@@ -319,7 +361,11 @@ rpmh_send(const char *what, const uint32_t *address, const uint32_t *data, unsig
 	bool done;
 
 	lck_mtx_lock(&supply_lock);
-	done = rpmh_mapped() && rpmh_write(address, data, count);
+	done = rpmh_mapped() && hk_rpmh_claim(true);
+	if (done) {
+		done = rpmh_write(address, data, count);
+		hk_rpmh_release();
+	}
 	lck_mtx_unlock(&supply_lock);
 	if (!done) {
 		printf("touch: RPMh: %s: no answer\n", what);
@@ -428,6 +474,11 @@ instantnoodle_bcm_vote(const char *name, uint32_t x, uint32_t y)
 #define CMD_BOOT_STATUS         0x55
 #define CMD_READ_EVENT          0x60
 #define CMD_READ_ALL            0x61
+#define CMD_CLEAR_EVENT_STACK   0x62
+#define CMD_SET_CHARGER_MODE    0x32            /* OnePlus's sec_enable_charge_mode(): 2 a cable in, 1 none */
+#define EVENT_ERR               0x01
+#define ERR_QUEUE_FULL          0x01
+#define ERR_ESD                 0x02
 #define EVENT_LEN               8
 #define EVENT_INFO              0x02
 #define EVENT_VENDOR            0x07
@@ -471,18 +522,39 @@ scale(uint32_t v, uint32_t size)
 	return v * 65535u / (size - 1);
 }
 
-static void
+/*
+ * What a status event asks for, as OnePlus's driver reads them (sec_trigger_reason(), sec_drivers_s6sy761.c) and its
+ * touch core answers (touchpanel_common_driver.c): the chip's own restart (boot complete, 0x20: its watchdog) wants
+ * sense on and the modes again; a full event queue, every finger let go; ESD, a reset of the chip.
+ */
+enum { ASK_NOTHING, ASK_SENSE_ON, ASK_RELEASE, ASK_RESET };
+static unsigned esd_resets, auto_resets;
+
+static int
 handle_event(const uint8_t *ev)
 {
 	unsigned id, state;
 	uint32_t x, y;
 
+	if (ev[0] != 0 && (ev[0] & 3) == 1) {
+		unsigned stype = ev[0] >> 2 & 0xf;
+
+		if (stype == EVENT_INFO && ev[1] == ACK_BOOT_COMPLETE && ev[2] == 0x20) {
+			return ASK_SENSE_ON;
+		}
+		if (stype == EVENT_ERR && ev[1] == ERR_QUEUE_FULL) {
+			return ASK_RELEASE;
+		}
+		if (stype == EVENT_ERR && ev[1] == ERR_ESD) {
+			return ASK_RESET;
+		}
+	}
 	if (ev[0] == 0 || (ev[0] & 3) != 0) {
-		return;                                 /* status, information or vendor events */
+		return ASK_NOTHING;                     /* other status, information or vendor events */
 	}
 	id = (ev[0] >> 2 & 0xf);
 	if (id == 0 || id > MAX_FINGERS) {
-		return;
+		return ASK_NOTHING;
 	}
 	id--;
 	state = ev[0] >> 6;
@@ -508,10 +580,11 @@ handle_event(const uint8_t *ev)
 		}
 		break;
 	}
+	return ASK_NOTHING;
 }
 
 static int
-poll_events(void)
+poll_events(int *ask)
 {
 	uint8_t ev[EVENT_LEN], stack[(EVENT_COUNT - 1) * EVENT_LEN];
 	unsigned left;
@@ -525,6 +598,9 @@ poll_events(void)
 	}
 	left = ev[7] & 0x3f;
 	if (left >= EVENT_COUNT) {
+		uint8_t clear = CMD_CLEAR_EVENT_STACK;
+
+		ts_write(&clear, 1);                    /* (OnePlus's driver: the stack cleared) */
 		return EOVERFLOW;
 	}
 	if (left) {
@@ -533,10 +609,12 @@ poll_events(void)
 			return err;
 		}
 	}
-	handle_event(ev);
+	*ask = handle_event(ev);
 	if (left) {
 		for (unsigned i = 0; i < left; i++) {
-			handle_event(&stack[i * EVENT_LEN]);
+			int a = handle_event(&stack[i * EVENT_LEN]);
+
+			*ask = a > *ask ? a : *ask;
 		}
 	}
 	return 0;
@@ -551,6 +629,37 @@ release_all(void)
 			hk_touch_post(HK_TOUCH_UP, i, finger[i].x, finger[i].y);
 		}
 	}
+}
+
+static void
+charger_apply(void)
+{
+	int want = charger_wanted;
+	uint8_t cmd[2] = { CMD_SET_CHARGER_MODE, want == 1 ? 2 : 1 };
+
+	if (want >= 0 && ts_write(cmd, 2) == 0) {
+		charger_set = want;
+		printf("touch: the chip told the cable is %s (charger mode %u)\n", want ? "in" : "out", cmd[1]);
+	} else {
+		charger_set = want;                     /* (once a change: it is said again at the next restart) */
+	}
+}
+
+/* OnePlus's sec_reset(): the reset pin low 5 ms, then high, the boot-complete event, sense on; then the modes again */
+static void
+chip_reset(const uint8_t *func, unsigned func_length)
+{
+	uint8_t sense = CMD_SENSE_ON;
+
+	instantnoodle_gpio_output(PIN_RESET, false, INSTANTNOODLE_PULL_UP, 8);
+	sleep_ms(5);
+	instantnoodle_gpio_output(PIN_RESET, true, INSTANTNOODLE_PULL_UP, 8);
+	sleep_ms(140);
+	instantnoodle_i2c_recover(&bus);
+	(void)wait_boot_complete();
+	ts_write(func, func_length);
+	ts_write(&sense, 1);
+	charger_set = -1;
 }
 
 static void
@@ -612,7 +721,7 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 		uint64_t detected = use_irq || touch_dark ? wait_report() : mach_absolute_time();
 		uint64_t began = mach_absolute_time(), done, ns;
 		unsigned before = events;
-		int err;
+		int err, ask = ASK_NOTHING;
 
 		if (touch_dark_wanted && !touch_dark) {
 			release_all();
@@ -648,6 +757,9 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 		if (touch_dark) {
 			continue;
 		}
+		if (charger_wanted != charger_set) {
+			charger_apply();
+		}
 
 		if (use_irq && detected != 0 && !(rd(irq_pin + IRQ_STATUS) & 1) && instantnoodle_gpio_level(PIN_IRQ)) {
 			unowned++;
@@ -661,7 +773,19 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 			gic_v3_spi_detach(TLMM_IRQ);
 			use_irq = 0;
 		}
-		err = poll_events();
+		err = poll_events(&ask);
+		if (ask == ASK_SENSE_ON) {
+			release_all();
+			ts_write(&sense, 1);
+			charger_set = -1;               /* (the modes again: the loop's next turn) */
+			printf("touch: the chip restarted by itself (%u times): sense on again\n", ++auto_resets);
+		} else if (ask == ASK_RELEASE) {
+			release_all();
+		} else if (ask == ASK_RESET) {
+			release_all();
+			chip_reset(func, 3);
+			printf("touch: ESD reported by the chip: reset (%u times)\n", ++esd_resets);
+		}
 		done = mach_absolute_time();
 		if (trace_latency && (events != before || err)) {
 			hk_tl("tl: t irq %llu worker %llu done %llu events %u error %d\n",
@@ -673,8 +797,12 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 		previous = began;
 		if (err != 0) {
 			if (++errors == 10) {
+				/* OnePlus's driver: reads failing, a reset of the chip and its modes again (sec_trigger_reason) */
 				release_all();
 				instantnoodle_i2c_recover(&bus);
+				chip_reset(func, 3);
+				errors = 0;
+				printf("touch: ten failed reads: the chip reset\n");
 			}
 		} else {
 			errors = 0;

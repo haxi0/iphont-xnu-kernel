@@ -247,5 +247,6 @@ hk_input_init(void)
 	hk_net_init();
 	hk_adreno_init();
 	hk_wifi_init();
+	hk_bt_init();             /* the OnePlus 8's Bluetooth (bt=1) */
 	hk_adsp_init();
 }

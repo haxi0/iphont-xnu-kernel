@@ -668,7 +668,7 @@ sha256_kind(const struct lx_wpa *wpa)
 }
 
 static void
-mic_of(const struct lx_wpa *wpa, const uint8_t *message, unsigned length, uint8_t mic[16])
+mic_with(const struct lx_wpa *wpa, const uint8_t *kck, const uint8_t *message, unsigned length, uint8_t mic[16])
 {
 	const uint8_t zeros[16] = { 0 };
 	const uint8_t *pieces[3] = { message, zeros, message + AT_MIC + 16 };
@@ -676,11 +676,31 @@ mic_of(const struct lx_wpa *wpa, const uint8_t *message, unsigned length, uint8_
 	uint8_t digest[20];
 
 	if (sha256_kind(wpa)) {
-		lx_wpa_cmac(wpa->kck, pieces, lengths, 3, mic);
+		lx_wpa_cmac(kck, pieces, lengths, 3, mic);
 		return;
 	}
-	hmac_sha1(wpa->kck, 16, pieces, lengths, 3, digest);
+	hmac_sha1(kck, 16, pieces, lengths, 3, digest);
 	memcpy(mic, digest, 16);
+}
+
+static void
+mic_of(const struct lx_wpa *wpa, const uint8_t *message, unsigned length, uint8_t mic[16])
+{
+	mic_with(wpa, wpa->kck, message, length, mic);
+}
+
+/* Whether `message`'s MIC is the one `kck` gives (compared in constant time) */
+static int
+mic_right(const struct lx_wpa *wpa, const uint8_t *kck, const uint8_t *message, unsigned length)
+{
+	uint8_t mic[16];
+	unsigned difference = 0;
+
+	mic_with(wpa, kck, message, length, mic);
+	for (unsigned i = 0; i < 16; i++) {
+		difference |= mic[i] ^ message[AT_MIC + i];
+	}
+	return (difference == 0);
 }
 
 /* The keys of the handshake and the pairwise key, from the PMK, both addresses and both nonces. */
@@ -699,9 +719,16 @@ derive(struct lx_wpa *wpa)
 	} else {
 		prf(wpa->pmk, 32, "Pairwise key expansion", data, sizeof(data), keys, sizeof(keys));
 	}
-	memcpy(wpa->kck, keys, 16);
-	memcpy(wpa->kek, keys + 16, 16);
-	memcpy(wpa->pairwise, keys + 32, 16);
+	/* (into the TPTK; the keys in use only at the first handshake, before there are any: wpa_supplicant_process_1_of_4) */
+	memcpy(wpa->t_kck, keys, 16);
+	memcpy(wpa->t_kek, keys + 16, 16);
+	memcpy(wpa->t_pairwise, keys + 32, 16);
+	wpa->have_tptk = 1;
+	if (!wpa->have_keys) {
+		memcpy(wpa->kck, keys, 16);
+		memcpy(wpa->kek, keys + 16, 16);
+		memcpy(wpa->pairwise, keys + 32, 16);
+	}
 	memset(keys, 0, sizeof(keys));
 	wpa->have_keys = 1;
 }
@@ -794,7 +821,7 @@ lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length
     const char **why)
 {
 	uint8_t mic[16], data[MESSAGE_MOST];
-	unsigned info, body, data_length, difference = 0;
+	unsigned info, body, data_length;
 	const char *nothing;
 
 	why = why != NULL ? why : &nothing;
@@ -826,12 +853,20 @@ lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length
 		return (LX_WPA_BAD);
 	}
 
-	/* message 1: the access point's nonce, unsigned */
+	/* message 1: the access point's nonce, unsigned; message 2 is signed with the new handshake's keys */
 	if ((info & (INFO_PAIRWISE | INFO_ACK | INFO_MIC)) == (INFO_PAIRWISE | INFO_ACK)) {
+		if (wpa->renew_nonce) {
+			/* a new handshake after one whose keys are in use: a new nonce of ours (once, not for a message 1 sent again) */
+			memcpy(wpa->own_nonce, wpa->next_nonce, 32);
+			memset(wpa->next_nonce, 0, 32);
+			wpa->renew_nonce = 0;
+		}
 		memcpy(wpa->peer_nonce, message + AT_NONCE, 32);
 		derive(wpa);
 		answer(wpa, message, version_of(wpa) | INFO_PAIRWISE | INFO_MIC, wpa->own_nonce, wpa->rsn, wpa->rsn_length, reply,
 		    reply_length);
+		mic_with(wpa, wpa->t_kck, reply, *reply_length, mic);
+		memcpy(reply + AT_MIC, mic, 16);
 		return (LX_WPA_ANSWER);
 	}
 
@@ -843,11 +878,20 @@ lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length
 		*why = "it is signed, and there has been no message 1 to make the keys from";
 		return (LX_WPA_BAD);
 	}
-	mic_of(wpa, message, length, mic);
-	for (unsigned i = 0; i < 16; i++) {
-		difference |= mic[i] ^ message[AT_MIC + i];
-	}
-	if (difference != 0) {
+	/*
+	 * Message 3 is checked against the TPTK first, and the TPTK becomes the keys in use when it is right; anything else
+	 * (a group message, a message 3 of the handshake already done) against the keys in use (wpa_supplicant:
+	 * wpa_supplicant_verify_eapol_key_mic).
+	 */
+	if ((info & INFO_PAIRWISE) && wpa->have_tptk && mic_right(wpa, wpa->t_kck, message, length)) {
+		memcpy(wpa->kck, wpa->t_kck, 16);
+		memcpy(wpa->kek, wpa->t_kek, 16);
+		memcpy(wpa->pairwise, wpa->t_pairwise, 16);
+		memset(wpa->t_kck, 0, 16);
+		memset(wpa->t_kek, 0, 16);
+		memset(wpa->t_pairwise, 0, 16);
+		wpa->have_tptk = 0;
+	} else if (!mic_right(wpa, wpa->kck, message, length)) {
 		*why = "its signature is not right (a wrong passphrase gives this)";
 		return (LX_WPA_BAD);
 	}

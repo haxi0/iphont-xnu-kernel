@@ -12,6 +12,7 @@ behaviour only. Add to these pages when you learn something (see [../../AGENTS.m
 | [hardware-qualcomm.md](hardware-qualcomm.md) | what crashes the phone, SMEM/SMP2P/GLINK/QRTR/AOP/TZ, SMMU, PMIC arbiter, pins, display/GPU register facts, bring-up method |
 | [boot-chain-and-recovery.md](boot-chain-and-recovery.md) | XBL/ABL/UEFI/loader, XNUP container, memory, stock ABL quirks, OnePlus 8 recovery, UEFI port notes |
 | [failed-approaches.md](failed-approaches.md) | dead ends and costly mistakes, one line each |
+| [bluetooth-ios.md](bluetooth-ios.md) | QCA6390 UART/firmware and native iOS command-family/vendor integration findings |
 | [checks.md](checks.md) | "how our own checks lie": eleven measurement pitfalls |
 | [../air.md](../air.md), [../air-report.md](../air-report.md) | **Metal/AIR → NIR shader frontend research** (userland repository): 5,000-line lab notebook and the generated corpus report. Research, not shipped functionality |
 

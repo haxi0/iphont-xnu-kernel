@@ -54,6 +54,13 @@ struct handshake {
 	const unsigned char *g1; size_t g1_length;
 	const unsigned char *g2; size_t g2_length;
 	const unsigned char *m3_wrong; size_t m3_wrong_length;
+	const unsigned char *snonce2; size_t snonce2_length;
+	const unsigned char *tk2; size_t tk2_length;
+	const unsigned char *r1; size_t r1_length;
+	const unsigned char *r2; size_t r2_length;
+	const unsigned char *g3; size_t g3_length;
+	const unsigned char *r3; size_t r3_length;
+	const unsigned char *r4; size_t r4_length;
 	unsigned group_index;
 };
 
@@ -194,6 +201,25 @@ whole(void)
 		    (int)n);
 		check(memcmp(wpa.group, h->group2, 16) == 0 && wpa.group_index == h->group_index % 3 + 1,
 		    "the new group key and its number are the reference's", (int)n);
+
+		/*
+		 * The access point renews the pairwise key (a second handshake): our new nonce from next_nonce, message 2
+		 * signed with the new keys, the keys in use kept (a group message signed with them still taken) until
+		 * message 3 is signed with the new ones; then the new pairwise key, and message 3 again refused.
+		 */
+		memcpy(wpa.next_nonce, h->snonce2, 32);
+		wpa.renew_nonce = 1;
+		check(lx_wpa_message(&wpa, h->r1, (unsigned)h->r1_length, reply, &length, &why) == LX_WPA_ANSWER &&
+		    length == h->r2_length && memcmp(reply, h->r2, length) == 0 && wpa.renew_nonce == 0,
+		    "a renewal's message 2 is the reference's, with the new nonce", (int)n);
+		check(memcmp(wpa.pairwise, h->tk, 16) == 0, "a renewal's message 1 leaves the pairwise key in use", (int)n);
+		check(lx_wpa_message(&wpa, h->g3, (unsigned)h->g3_length, reply, &length, &why) == LX_WPA_GROUP,
+		    "between a renewal's message 1 and 3 a group message signed with the keys in use is taken", (int)n);
+		check(lx_wpa_message(&wpa, h->r3, (unsigned)h->r3_length, reply, &length, &why) == LX_WPA_KEYS &&
+		    length == h->r4_length && memcmp(reply, h->r4, length) == 0, "a renewal's message 4 is the reference's", (int)n);
+		check(memcmp(wpa.pairwise, h->tk2, 16) == 0, "after a renewal's message 3 the new pairwise key", (int)n);
+		check(lx_wpa_message(&wpa, h->r3, (unsigned)h->r3_length, reply, &length, &why) == LX_WPA_BAD,
+		    "a renewal's message 3 played again is refused", (int)n);
 
 		/* a network that wants another kind of key management says so in the descriptor's version */
 		memcpy(spoiled, h->m1, h->m1_length);

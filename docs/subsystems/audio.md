@@ -150,3 +150,16 @@ BUNDLE`), `RC_JOBS=rc.jobs.speakers|alerts|volume`.
 `xnu/files/bsd/dev/hk_adsp.c`, `hk_sound.c`, `hk_audio.c`, `hk_guard.c`, `hk_speaker.c`, `instantnoodle_speaker.c`, `hk_mic.c`,
 `hk_virtio_sound.c` (QEMU); `xnu/files/bsd/sys/hk_audio.h`; userland repo: `userland/src/audio_plugin.c`, `sound_test.c`;
 tools `tools/sound.py`. Firmware: `fw-audio/` (never in the repository).
+
+## Bluetooth test caveat — 2026-10-26 22:31
+
+CMF Buds Pro 2 classic pairing/authentication/encryption and AAC A2DP negotiation are hardware-verified;
+owner hears no sound and reports Voice Memos recording failure. The Bluetooth test boot `221539` omitted
+`adsp=1 sound=4 mic=4` and forced `sound_amps=0`, so it did not enable the previously verified built-in paths.
+That test does not establish a built-in audio regression or identify which recording input Voice Memos selected.
+
+Found and fixed a separate packaging omission: the HKAudio-only HAL overlay hid the original BTAudioHALPlugin.driver,
+and the extraction selector omitted it. `BLUETOOTH=1` now retains that unmodified plug-in alongside HKAudio.
+Userland build and host packaging/gate checks pass; audible output and buds microphone still need a phone test.
+See [bluetooth.md](bluetooth.md#audio-gap-found-after-pairing--2026-10-26-2230) for the bounded quiet-tone probe.
+System/deep-sleep work belongs to the other Claude agent; this fix changes no sleep/power implementation.

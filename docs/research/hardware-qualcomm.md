@@ -80,10 +80,16 @@ SM8250's GPU block is at the same addresses as SC7280's. Differences handled in 
   RPMh names for the touch supplies are `ldoc1`/`ldoa13`, slider `ldoc10`.
 
 ## 7. Pins and buses, OnePlus 8 (TLMM south tile `0x0f500000`, pin registers `0x1000 * gpio`)
-Touch I2C (SE13) gpio36/37, reset 38, report 39, supplies LDO PM8150A L1 / PM8150 L13; slider (SE5) gpio4/5; battery gauge (SE16)
-gpio48/49 `0x55`; speakers (SE15) gpio44/45, resets 91/99; PCIe: WLAN_EN 20, PERST 79, CLKREQ 80 (func 1), WAKE 81; microphone codec reset
-gpio32 (driven as GPIO). The engine FIFO path (GPI DMA) is disabled on these phones, so I2C is bit-banged with clock stretching
-(`instantnoodle_i2c.c`; TLMM CFG: [1:0] pull, [5:2] function, [8:6] drive strength in 2 mA steps, [9] output enable).
+Touch I2C (SE13) gpio36/37, reset 38, report 39, supplies LDO PM8150A L1 / PM8150 L13; slider gpio4/5 (i2c@984000: QUP 0 SE 1,
+function qup1; the code calls it "se5"); battery gauge (SE16) gpio48/49 `0x55`; speakers (SE15) gpio44/45, resets 91/99; PCIe: WLAN_EN 20,
+PERST 79, CLKREQ 80 (func 1), WAKE 81; microphone codec reset gpio32 (driven as GPIO). I2C is bit-banged with clock stretching
+(`instantnoodle_i2c.c`; TLMM CFG: [1:0] pull, [5:2] function, [8:6] drive strength in 2 mA steps, [9] output enable) because "the engine's
+FIFO path is disabled (GPI DMA only)" -- **source:** that was measured on the OnePlus 7 Pro's (SM8150) touch engine in `ios-instantnoodle`,
+**not on this phone**; **observed** here: QUP 0 SE 6 (Bluetooth UART) has `GENI_IF_DISABLE_RO` 0 (`logs/061256-run.log.live`). **Observed** 2026-10-27 (`024633`, `i2c_geni=1`): touch QUP 1 SE 5, gauge QUP 2 SE 2 and slider QUP 0 SE 1 all have protocol 3 (I2C
+loaded), `if_disable 0` (FIFO there), 16-word TX FIFO, clocks in DFS with level 0 = 19.2 MHz; `i2c_geni=2` drives them (`024827`). Engines, GCC votes and SE interrupts (gcc-sm8250.c, the live tree): touch
+QUP 1 SE 5 `0xa94000` (vote 0x52008 bits 18-21, 27; SPI 358), gauge QUP 2 SE 2 `0x888000` (0x52010 bits 0-3, 6; SPI 584, 100 kHz),
+speakers QUP 2 SE 1 `0x884000` (0x52010 bits 0-3, 5; SPI 583), slider QUP 0 SE 1 `0x984000` (0x52008 bits 6-9, 11; SPI 602, 400 kHz).
+Every engine register needs its clocks voted on first (an unclocked read is a NoC CrashDump).
 Redwood: touch SPI SE13; haptics SE9 gpio36/37, reset 35; speakers SE3 gpio12/13; cameras CCI0 gpio69-72, CCI1 gpio73-76, MCLK gpio64-67.
 
 ## 8. Audio/LPASS

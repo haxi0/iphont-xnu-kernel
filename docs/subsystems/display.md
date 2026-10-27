@@ -66,7 +66,11 @@ too small). See [../research/hardware-qualcomm.md](../research/hardware-qualcomm
   (`displayMinRefreshInterval` in 2^-32 s, `displayRefreshStepMachTime` in mach time), not from `TimingElements`.
   Without it an iPhone X is 60 Hz everywhere. The window server's frame clock is our VSync notification
   (`ca_vbl`, automatic when the panel is faster than 60), fired at the panel's TE as the tear check's read-pointer
-  interrupt reports it. `ca_fps` (automatic; `ca_fps=0` off) gives SpringBoard's animations and display links a
+  interrupt reports it. The notification's times are `mach_continuous_time()` (QuartzCore's frame clock is the second
+  one, the "presented" time): in `mach_absolute_time()`, which stops in a system sleep, the window server's clock fell
+  behind its clients' by all the time slept, so everything that appears with an animation (Control Center's modules,
+  a starting app, the status bar's text) stayed invisible after a wake (fixed 2026-10-26, verified on the phone; see
+  [power.md](power.md#ui-missing-after-a-wake-fixed-2026-10-26)). `ca_fps` (automatic; `ca_fps=0` off) gives SpringBoard's animations and display links a
   30..90 range with a high-frame-rate reason, as a ProMotion iPhone's get; without it the busy-second median was
   74 fps instead of 87.
 - **The tear.** The window server alternates two surfaces (3 and 4) and draws the next frame as soon as
@@ -150,6 +154,11 @@ static. Neither sleep-out plus display-on nor Android's whole on-command brought
 picture parameters are not what the firmware set the display engine up with. Android resets and repowers the
 panel to recover; here the firmware's setup has to stay, so only 0x28/0x29 are used. Only a phone reset
 recovers it.
+
+Research 2026-10-27 (source: the phone's live device tree): Android's ANA6705 on-command already carries the DSC picture
+parameters in Samsung's own form -- `9d 01` (compression on) and an 88-byte `9e` packet (version 1.1, 8 bpc, 8 bpp, 2400 x 1080,
+slices 540 x 48) -- before sleep-out (`11`); so "the PPS was not resent" is not why the picture did not come back. What differs
+must be the display engine's DSC set-up against those parameters (not compared yet: the MDP's DSC registers against `9e`).
 
 **Frame pushes.** One push that does not finish in 100 ms no longer drops the display into the firmware's
 autorefresh for the rest of the run (CPU-copied frames, tearing, no GPU scaling). That happens only after 3 failures

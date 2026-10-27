@@ -110,6 +110,21 @@ Rules of thumb: a bare `./xl enter` or a bad arg can hang a phone; **never pass 
 | `battery` | redwood: 1 Qualcomm UEFI charger state shared by the loader; instantnoodle: 0 turns the gauge off. |
 | `battery_shared_pa` | Physical address of the loader's charger page. |
 
+### `bsd/dev/hk_bt.c`, `instantnoodle_bt.c`
+
+| Boot-arg | Meaning |
+|---|---|
+| `bt=1` | Opt-in QCA6390 Bluetooth on instantnoodle; other boards remain unchanged. Native jobs also need `BLUETOOTH=1` when building userland. |
+| `bt_test=1` | Before client handoff, compare legacy/extended command selection, read capabilities, scan BLE for four seconds, and run classic inquiry. Diagnostic only. |
+| `bt_probe=1` | Log UART/pin/clock state during startup. |
+| `bt_trace=1` | Log HCI commands/events; 2 also logs ACL/SCO headers (`}`: SCO as the pacing really sends it). Logs can contain device identifiers; keep local. |
+| `bt_sco_hci=0` | Send iOS's legacy Setup/Accept Synchronous Connection unchanged (default: as Enhanced with the HCI data path). |
+| `rt_clamp=0` | (`osfmk/kern/thread_policy.c`) Refuse real-time requests with computation over 50 ms, as stock (default: cut to 50 ms and log `thread_policy:`). |
+| `bt_sco_pace=0` | Send iOS's SCO data as it comes (default: chip-sized packets, at most 2 ahead of the chip's; avoids the CTS stall). |
+
+Read `kern.hackios.bt` for firmware, power, client, UART, IBS and SCO pacing counters. `kern.hackios.bt_trace` changes trace level live.
+See [subsystems/bluetooth.md](subsystems/bluetooth.md) for tested scope and firmware requirements.
+
 ### `bsd/dev/hk_buttons.c`
 
 | Boot-arg | Meaning |
@@ -182,6 +197,7 @@ Rules of thumb: a bare `./xl enter` or a bad arg can hang a phone; **never pass 
 |---|---|
 | `touch_flip` | redwood touch axis flip. |
 | `touch_lat` | 1: log latency lines for every touch sample. |
+| `i2c_geni` | OnePlus 8 I2C buses (touch, gauge, amplifiers, slider): 0 (default) pins by hand; 1 also logs each bus's serial engine once (protocol, FIFO interface, clocks; read only, GCC clock votes only); 2 the engine itself in FIFO mode (Linux `i2c-qcom-geni.c`) where its FIFO interface exists, else by hand. **Verified on the phone 2026-10-27** (`024827`): touch, gauge and slider engines have FIFO (`if_disable 0`), boot-time reads 0 errors, touch 8-byte read 2082 -> 368 us, slider 1802 -> 210 us, gauge 1878 -> 1009 us (100 kHz). Touch under a real finger and the amplifiers' bus (needs `adsp=1 sound=4`) not yet run. |
 | `touch_poll_us` | redwood: interrupt-line poll period. |
 | `touch_rate` | redwood touch rate. |
 | `touch_spi_hz` | redwood: touch SPI clock. |
@@ -192,6 +208,7 @@ Rules of thumb: a bare `./xl enter` or a bad arg can hang a phone; **never pass 
 |---|---|
 | `haptic` | 1..4 probe/play, 5 = for iOS. |
 | `haptic_effect` | Effect number for haptic=4. |
+| `haptic_trim` | OnePlus 8: the AW8697's factory f0 trim (`/mnt/vendor/persist/engineermode/f0_cali_data`, decimal, 0..63) written into TRIM_LRA (0x5b) as OnePlus's driver does; in the profile (`11` for this phone). Absent: the chip's reset value. |
 
 ### `bsd/dev/hk_mic.c`
 
@@ -218,6 +235,7 @@ Rules of thumb: a bare `./xl enter` or a bad arg can hang a phone; **never pass 
 |---|---|
 | `gpu_sleep` | 0 keeps the GPU powered through system sleep. |
 | `sleep_max` | Cap every system sleep to S seconds (timed runs need it). |
+| `sleep_freeze` | 0 (diagnostic): `mach_absolute_time()` runs on through a system sleep instead of standing still as an iPhone's. Bisects clock-related wake bugs; `power_test sleep` then reports "did not stand still". |
 | `syssleep` | 0 refuses system sleep (default on with board=instantnoodle, off elsewhere). |
 
 ### `bsd/dev/hk_sound.c`
